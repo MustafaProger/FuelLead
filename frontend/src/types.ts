@@ -1,4 +1,12 @@
-export type CompanyStatus = "new" | "checked" | "ready";
+export type CompanyStatus =
+  | "new"
+  | "checked"
+  | "ready"
+  | "sent"
+  | "answered"
+  | "interested"
+  | "rejected"
+  | "error";
 
 export interface EmailAddress {
   id: number;
@@ -86,4 +94,55 @@ export interface Filters {
   category: string;
   discoveredOn: string;
   search: string;
+}
+
+export interface DashboardMetrics {
+  total: number;
+  with_email: number;
+  ready: number;
+  sent_emails: number;
+  interested: number;
+}
+
+export interface DailyDiscovery {
+  date: string;
+  count: number;
+}
+
+export interface DashboardResponse {
+  metrics: DashboardMetrics;
+  status_counts: Record<CompanyStatus, number>;
+  daily_discoveries: DailyDiscovery[];
+  recent_companies: Company[];
+}
+
+export interface TemplateVariable {
+  key: string;
+  token: string;
+  label: string;
+}
+
+export interface EmailTemplate {
+  id: number;
+  name: string;
+  subject_template: string;
+  body_template: string;
+  updated_at: string;
+  variables: TemplateVariable[];
+}
+
+export interface EmailPreview {
+  company_id: number;
+  company_name: string;
+  recipient: string;
+  subject: string;
+  body: string;
+}
+
+export interface EmailSendResult {
+  message_id: string;
+  company_id: number;
+  recipient: string;
+  status: "sent";
+  sent_at: string;
 }

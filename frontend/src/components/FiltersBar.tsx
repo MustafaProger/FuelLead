@@ -11,6 +11,7 @@ const statusTabs: Array<{ value: "" | CompanyStatus; label: string }> = [
   { value: "new", label: "Новые" },
   { value: "checked", label: "Проверенные" },
   { value: "ready", label: "Готовые" },
+  { value: "sent", label: "Отправленные" },
 ];
 
 export function FiltersBar({ filters, onChange }: FiltersBarProps) {
@@ -90,4 +91,3 @@ export function FiltersBar({ filters, onChange }: FiltersBarProps) {
     </section>
   );
 }
-

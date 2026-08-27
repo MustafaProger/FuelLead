@@ -2,6 +2,10 @@ import type {
   CompanyDetail,
   CompanyListResponse,
   CompanyStatus,
+  DashboardResponse,
+  EmailPreview,
+  EmailSendResult,
+  EmailTemplate,
   Filters,
   Health,
   SearchRun,
@@ -33,6 +37,7 @@ export function filtersToParams(filters: Filters): URLSearchParams {
 
 export const api = {
   health: () => request<Health>("/health"),
+  dashboard: () => request<DashboardResponse>("/dashboard"),
   companies: (filters: Filters, page: number, pageSize: number) => {
     const params = filtersToParams(filters);
     params.set("page", String(page));
@@ -51,6 +56,30 @@ export const api = {
       body: JSON.stringify({ okved_codes: okvedCodes, limit_per_code: limitPerCode }),
     }),
   searchRun: (id: number) => request<SearchRun>(`/search-runs/${id}`),
+  emailTemplate: () => request<EmailTemplate>("/email-template"),
+  saveEmailTemplate: (subjectTemplate: string, bodyTemplate: string) =>
+    request<EmailTemplate>("/email-template", {
+      method: "PUT",
+      body: JSON.stringify({ subject_template: subjectTemplate, body_template: bodyTemplate }),
+    }),
+  previewEmail: (
+    companyId: number,
+    subjectTemplate: string,
+    bodyTemplate: string,
+    recipient?: string,
+  ) => request<EmailPreview>("/email-template/preview", {
+    method: "POST",
+    body: JSON.stringify({
+      company_id: companyId,
+      subject_template: subjectTemplate,
+      body_template: bodyTemplate,
+      recipient: recipient || undefined,
+    }),
+  }),
+  sendEmail: (companyId: number, recipient: string, subject: string, body: string) =>
+    request<EmailSendResult>(`/companies/${companyId}/send-email`, {
+      method: "POST",
+      body: JSON.stringify({ recipient, subject, body }),
+    }),
   exportUrl: (filters: Filters) => `${API_BASE}/export.xlsx?${filtersToParams(filters)}`,
 };
-

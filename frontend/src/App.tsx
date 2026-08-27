@@ -1,9 +1,11 @@
-import { Database, Mail } from "lucide-react";
+import { Database, Download, Mail, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
+import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { CompanyTable } from "./components/CompanyTable";
+import { DashboardPage } from "./components/DashboardPage";
+import { EmailTemplatePage } from "./components/EmailTemplatePage";
 import { FiltersBar } from "./components/FiltersBar";
-import { Header } from "./components/Header";
 import { Notice } from "./components/Notice";
 import { StatsStrip } from "./components/StatsStrip";
 import type {
@@ -27,6 +29,11 @@ const defaultFilters: Filters = {
 const emptyStats: Stats = { total: 0, new: 0, with_email: 0, without_email: 0 };
 const PAGE_SIZE = 20;
 
+function pageFromHash(): AppPage {
+  const page = window.location.hash.replace("#", "");
+  return page === "companies" || page === "template" ? page : "dashboard";
+}
+
 function splitMessage(message: string) {
   const separator = message.indexOf(". ");
   if (separator === -1) return { title: message, description: undefined };
@@ -37,6 +44,7 @@ function splitMessage(message: string) {
 }
 
 export default function App() {
+  const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [health, setHealth] = useState<Health | null>(null);
   const [companies, setCompanies] = useState<Company[]>([]);
   const [stats, setStats] = useState<Stats>(emptyStats);
@@ -50,6 +58,12 @@ export default function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [searchRun, setSearchRun] = useState<SearchRun | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+
+  useEffect(() => {
+    const handleHashChange = () => setActivePage(pageFromHash());
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
 
   const loadCompanies = useCallback(async () => {
     setLoading(true);
@@ -156,83 +170,93 @@ export default function App() {
   };
 
   return (
-    <div className="app-shell">
-      <Header
+    <div className="workspace-shell">
+      <AppSidebar
+        activePage={activePage}
         mode={health?.mode || "demo"}
-        searching={Boolean(searching)}
-        exportUrl={exportUrl}
-        onSearch={handleSearch}
+        gmailConfigured={Boolean(health?.gmail_oauth_configured)}
       />
-      <main className="main-content">
-        <div className="page-intro">
-          <div>
-            <h1>Компании</h1>
-            <p>Потенциальные клиенты с повышенным расходом топлива</p>
-          </div>
-          <div className="system-meta" aria-label="Состояние интеграций">
-            <span><Database size={14} /> PostgreSQL</span>
-            <span className={health?.gmail_oauth_configured ? "integration-ready" : "integration-pending"}>
-              <Mail size={14} />
-              <span>
-                {health?.outreach_sender_email || "artel.office8@gmail.com"}
-                <small>{health?.gmail_oauth_configured ? "Gmail OAuth подключён" : "Gmail OAuth ожидает настройки"}</small>
+      <main className="workspace-main">
+        {activePage === "dashboard" ? (
+          <DashboardPage
+            exportUrl={exportUrl}
+            searching={Boolean(searching)}
+            refreshToken={refreshToken}
+            onSearch={handleSearch}
+          />
+        ) : null}
+
+        {activePage === "companies" ? (
+          <div className="content-page companies-page">
+            <header className="page-header">
+              <div>
+                <h1>Компании</h1>
+                <p>Потенциальные клиенты с повышенным расходом топлива</p>
+              </div>
+              <div className="page-actions">
+                <a className="button button--secondary" href={exportUrl} aria-label="Экспортировать компании в Excel">
+                  <Download size={17} /> Экспорт
+                </a>
+                <button className="button button--primary" type="button" onClick={handleSearch} disabled={Boolean(searching)}>
+                  {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
+                  {searching ? "Идёт поиск…" : "Найти компании"}
+                </button>
+              </div>
+            </header>
+            <div className="system-meta company-system-meta" aria-label="Состояние интеграций">
+              <span><Database size={14} /> PostgreSQL</span>
+              <span className={health?.gmail_oauth_configured ? "integration-ready" : "integration-pending"}>
+                <Mail size={14} />
+                <span>{health?.outreach_sender_email || "artel.office8@gmail.com"}<small>{health?.gmail_oauth_configured ? "Gmail OAuth подключён" : "Gmail OAuth ожидает настройки"}</small></span>
               </span>
-            </span>
+            </div>
+
+            {error ? <Notice tone="error" title="Не удалось выполнить действие" description={error} onClose={() => setError(null)} /> : null}
+            {searching ? (
+              <Notice
+                tone="progress"
+                title="Поиск компаний запущен"
+                description={searchRun?.candidates_found ? `Найдено кандидатов: ${searchRun.candidates_found}. Получаем карточки и контакты.` : "Проверяем целевые ОКВЭД и доступность данных в Checko."}
+              />
+            ) : null}
+            {searchRun && !searching ? (
+              searchRun.status === "completed" ? (
+                <Notice
+                  tone={searchRun.errors_count ? "warning" : "success"}
+                  title={searchRun.errors_count ? "Поиск завершён с предупреждениями" : "Поиск завершён"}
+                  description={`Добавлено ${searchRun.companies_created}, обновлено ${searchRun.companies_updated}${searchRun.errors_count ? `, ошибок провайдера: ${searchRun.errors_count}` : ""}.`}
+                  onClose={() => setSearchRun(null)}
+                />
+              ) : (
+                <Notice tone="error" title={searchResult?.title || "Поиск не выполнен"} description={searchResult?.description || "Checko не вернул компании."} onClose={() => setSearchRun(null)} />
+              )
+            ) : null}
+
+            <StatsStrip stats={stats} loading={loading && !companies.length} />
+            <FiltersBar filters={filters} onChange={handleFilters} />
+            <CompanyTable
+              companies={companies}
+              total={total}
+              page={page}
+              pageSize={PAGE_SIZE}
+              loading={loading}
+              expandedId={expandedId}
+              detail={detail}
+              detailLoading={detailLoading}
+              onToggle={handleToggle}
+              onStatusChange={handleStatusChange}
+              onPageChange={setPage}
+            />
           </div>
-        </div>
-
-        {error && (
-          <Notice
-            tone="error"
-            title="Не удалось выполнить действие"
-            description={error}
-            onClose={() => setError(null)}
-          />
-        )}
-
-        {searching ? (
-          <Notice
-            tone="progress"
-            title="Поиск компаний запущен"
-            description={searchRun?.candidates_found
-              ? `Найдено кандидатов: ${searchRun.candidates_found}. Получаем карточки и контакты.`
-              : "Проверяем целевые ОКВЭД и доступность данных в Checko."}
-          />
         ) : null}
 
-        {searchRun && !searching ? (
-          searchRun.status === "completed" ? (
-            <Notice
-              tone={searchRun.errors_count ? "warning" : "success"}
-              title={searchRun.errors_count ? "Поиск завершён с предупреждениями" : "Поиск завершён"}
-              description={`Добавлено ${searchRun.companies_created}, обновлено ${searchRun.companies_updated}${searchRun.errors_count ? `, ошибок провайдера: ${searchRun.errors_count}` : ""}.`}
-              onClose={() => setSearchRun(null)}
-            />
-          ) : (
-            <Notice
-              tone="error"
-              title={searchResult?.title || "Поиск не выполнен"}
-              description={searchResult?.description || "Checko не вернул компании."}
-              onClose={() => setSearchRun(null)}
-            />
-          )
+        {activePage === "template" ? (
+          <EmailTemplatePage
+            gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+            senderEmail={health?.outreach_sender_email || "artel.office8@gmail.com"}
+            onSent={() => setRefreshToken((value) => value + 1)}
+          />
         ) : null}
-
-        <StatsStrip stats={stats} loading={loading && !companies.length} />
-        <FiltersBar filters={filters} onChange={handleFilters} />
-        <CompanyTable
-          companies={companies}
-          total={total}
-          page={page}
-          pageSize={PAGE_SIZE}
-          loading={loading}
-          expandedId={expandedId}
-          detail={detail}
-          detailLoading={detailLoading}
-          onToggle={handleToggle}
-          onStatusChange={handleStatusChange}
-          onPageChange={setPage}
-        />
       </main>
     </div>
   );

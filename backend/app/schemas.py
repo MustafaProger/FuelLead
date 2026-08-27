@@ -3,7 +3,7 @@ from datetime import date
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import DEFAULT_OKVED_CODES
-from app.models import MVP_STATUSES
+from app.models import ALL_STATUSES
 
 
 class CompanyFilters(BaseModel):
@@ -20,8 +20,8 @@ class StatusUpdate(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, value: str) -> str:
-        if value not in MVP_STATUSES:
-            raise ValueError("MVP status must be one of: new, checked, ready")
+        if value not in ALL_STATUSES:
+            raise ValueError(f"Status must be one of: {', '.join(ALL_STATUSES)}")
         return value
 
 
@@ -37,3 +37,28 @@ class SearchRunCreate(BaseModel):
             raise ValueError("At least one OKVED code is required")
         return codes
 
+
+class EmailTemplateUpdate(BaseModel):
+    subject_template: str = Field(min_length=1, max_length=998)
+    body_template: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("subject_template", "body_template")
+    @classmethod
+    def strip_template(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Template field cannot be empty")
+        return value
+
+
+class EmailPreviewRequest(BaseModel):
+    company_id: int = Field(ge=1)
+    subject_template: str | None = Field(default=None, max_length=998)
+    body_template: str | None = Field(default=None, max_length=20_000)
+    recipient: str | None = Field(default=None, max_length=320)
+
+
+class EmailSendRequest(BaseModel):
+    recipient: str | None = Field(default=None, max_length=320)
+    subject: str | None = Field(default=None, max_length=998)
+    body: str | None = Field(default=None, max_length=20_000)

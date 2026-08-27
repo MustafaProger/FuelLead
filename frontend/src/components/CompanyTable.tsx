@@ -20,6 +20,11 @@ const statusLabels: Record<CompanyStatus, string> = {
   new: "Новая",
   checked: "Проверена",
   ready: "Готова",
+  sent: "Отправлено",
+  answered: "Ответили",
+  interested: "Интерес",
+  rejected: "Отказ",
+  error: "Ошибка",
 };
 
 function formatDiscovered(value: string) {
