@@ -81,6 +81,23 @@ Gmail API с OAuth 2.0:
    `GMAIL_REFRESH_TOKEN`. Не коммитьте и не присылайте их в чат.
 5. Проверьте `GET /api/health`: поле `gmail_oauth_configured` должно стать `true`.
 
+После изменения `.env` пересоздайте backend, чтобы контейнер получил новые значения:
+
+```bash
+docker compose up -d --force-recreate backend
+```
+
+Для одиночной проверки отправьте письмо самому отправителю:
+
+```bash
+docker compose exec backend python -m app.commands.send_gmail_test
+```
+
+При необходимости можно явно передать тестовый адрес через
+`--recipient test@example.com`. Это отправляет ровно одно письмо и не выбирает компании
+из базы. `GMAIL_ACCESS_TOKEN` сохранять не нужно: он короткоживущий, а backend получает
+свежий access token через refresh token перед отправкой.
+
 Backend содержит сервис отправки через Gmail API (`backend/app/services/gmail.py`).
 Пользовательская кнопка массовой отправки намеренно не активирована до согласования
 шаблона письма, лимитов и защиты от повторной отправки.
