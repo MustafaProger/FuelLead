@@ -6,9 +6,18 @@ import httpx
 
 
 class CheckoAPIError(RuntimeError):
-    def __init__(self, message: str, *, stop_discovery: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stop_discovery: bool = False,
+        key_unavailable: bool = False,
+        reason: str | None = None,
+    ):
         super().__init__(message)
         self.stop_discovery = stop_discovery
+        self.key_unavailable = key_unavailable
+        self.reason = reason
 
 
 @dataclass(slots=True)
@@ -26,6 +35,8 @@ class CompanyPayload:
     additional_okveds: list[OkvedItem] = field(default_factory=list)
     emails: list[str] = field(default_factory=list)
     is_active: bool = True
+    region_code: str | None = None
+    region_name: str | None = None
 
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -76,6 +87,15 @@ def parse_company_payload(data: dict[str, Any]) -> CompanyPayload:
     status_normalized = status_name.casefold().strip()
     is_active = "действ" in status_normalized and not status_normalized.startswith("не действ")
 
+    region_raw = data.get("Регион") or {}
+    region_code = None
+    region_name = None
+    if isinstance(region_raw, dict):
+        if region_raw.get("Код") is not None:
+            region_code = str(region_raw["Код"]).strip() or None
+        if region_raw.get("Наим") is not None:
+            region_name = str(region_raw["Наим"]).strip() or None
+
     return CompanyPayload(
         name=data.get("НаимСокр") or data.get("НаимПолн") or "Без наименования",
         inn=str(data.get("ИНН") or ""),
@@ -84,21 +104,26 @@ def parse_company_payload(data: dict[str, Any]) -> CompanyPayload:
         additional_okveds=list(additional_by_code.values()),
         emails=emails,
         is_active=is_active,
+        region_code=region_code,
+        region_name=region_name,
     )
 
 
 class CheckoClient:
     def __init__(
         self,
-        api_key: str,
+        api_keys: str | list[str] | tuple[str, ...],
         base_url: str,
         timeout_seconds: float = 30.0,
         *,
         transport: httpx.BaseTransport | None = None,
     ):
-        if not api_key.strip():
+        raw_keys = [api_keys] if isinstance(api_keys, str) else list(api_keys)
+        self.api_keys = tuple(dict.fromkeys(key.strip() for key in raw_keys if key.strip()))
+        if not self.api_keys:
             raise ValueError("Checko API key is required")
-        self.api_key = api_key
+        self.active_key_index = 0
+        self.unavailable_key_reasons: dict[int, str] = {}
         self.client = httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=timeout_seconds,
@@ -111,50 +136,104 @@ class CheckoClient:
     def __exit__(self, *_: object) -> None:
         self.client.close()
 
-    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    @property
+    def api_key_count(self) -> int:
+        return len(self.api_keys)
+
+    def _request(self, path: str, params: dict[str, Any], api_key: str) -> httpx.Response:
         try:
-            response = self.client.get(path, params={"key": self.api_key, **params})
+            return self.client.get(path, params={"key": api_key, **params})
         except httpx.TimeoutException as exc:
             raise CheckoAPIError("Checko не ответил вовремя. Повторите поиск позже.") from exc
         except httpx.RequestError as exc:
             raise CheckoAPIError("Не удалось связаться с Checko. Проверьте подключение и повторите поиск.") from exc
 
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
+    @staticmethod
+    def _response_error(response: httpx.Response, payload: dict[str, Any]) -> CheckoAPIError | None:
         meta = payload.get("meta") or {}
         provider_message = str(meta.get("message") or "").strip()
+        message_normalized = provider_message.casefold()
 
+        daily_limit = "суточн" in message_normalized and "лимит" in message_normalized
+        if daily_limit:
+            request_count = meta.get("today_request_count")
+            usage = f" Сегодня использовано {request_count} из 100 запросов." if request_count is not None else ""
+            return CheckoAPIError(
+                "Суточный лимит Checko исчерпан."
+                f"{usage} Поиск станет доступен после обновления лимита или пополнения баланса.",
+                stop_discovery=True,
+                key_unavailable=True,
+                reason="daily_limit",
+            )
+
+        if response.status_code in (401, 403):
+            return CheckoAPIError(
+                "Checko отклонил API-ключ. Проверьте ключ и доступ к методу поиска в личном кабинете Checko.",
+                stop_discovery=True,
+                key_unavailable=True,
+                reason="invalid_key",
+            )
+        if response.status_code == 429:
+            return CheckoAPIError(
+                "Checko временно ограничил частоту запросов. Повторите поиск позже.",
+                stop_discovery=True,
+                reason="rate_limit",
+            )
         if response.is_error:
-            if response.status_code == 403 and "суточн" in provider_message.casefold():
-                request_count = meta.get("today_request_count")
-                usage = f" Сегодня использовано {request_count} из 100 запросов." if request_count is not None else ""
-                raise CheckoAPIError(
-                    "Суточный лимит Checko исчерпан."
-                    f"{usage} Поиск станет доступен после обновления лимита или пополнения баланса.",
-                    stop_discovery=True,
-                )
-            if response.status_code in (401, 403):
-                raise CheckoAPIError(
-                    "Checko отклонил API-ключ. Проверьте ключ и доступ к методу поиска в личном кабинете Checko.",
-                    stop_discovery=True,
-                )
-            if response.status_code == 429:
-                raise CheckoAPIError(
-                    "Checko временно ограничил частоту запросов. Повторите поиск позже.",
-                    stop_discovery=True,
-                )
-            raise CheckoAPIError(provider_message or f"Checko вернул ошибку HTTP {response.status_code}.")
-
+            return CheckoAPIError(provider_message or f"Checko вернул ошибку HTTP {response.status_code}.")
         if meta.get("status") == "error":
-            raise CheckoAPIError(provider_message or "Checko не смог обработать запрос")
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            raise CheckoAPIError("Checko вернул ответ без данных")
-        return data
+            return CheckoAPIError(provider_message or "Checko не смог обработать запрос")
+        return None
 
-    def search_by_okved(self, code: str, limit: int = 10, page: int = 1) -> list[dict[str, Any]]:
+    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        for key_index in range(self.active_key_index, len(self.api_keys)):
+            response = self._request(path, params, self.api_keys[key_index])
+
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+
+            error = self._response_error(response, payload)
+            if error is not None:
+                if error.key_unavailable:
+                    self.unavailable_key_reasons[key_index] = error.reason or "unavailable"
+                    if key_index + 1 < len(self.api_keys):
+                        self.active_key_index = key_index + 1
+                        continue
+                if len(self.api_keys) == 1:
+                    raise error
+                if len(self.unavailable_key_reasons) == len(self.api_keys):
+                    all_daily_limits = all(
+                        reason == "daily_limit"
+                        for reason in self.unavailable_key_reasons.values()
+                    )
+                    message = (
+                        "Суточный лимит Checko исчерпан на всех настроенных API-ключах."
+                        if all_daily_limits
+                        else "Все настроенные API-ключи Checko недоступны. Проверьте лимиты и ключи."
+                    )
+                    raise CheckoAPIError(message, stop_discovery=True)
+                raise error
+
+            self.active_key_index = key_index
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise CheckoAPIError("Checko вернул ответ без данных")
+            return data
+
+        raise CheckoAPIError("Все настроенные API-ключи Checko недоступны.", stop_discovery=True)
+
+    def search_by_okved(
+        self,
+        code: str,
+        *,
+        region_code: str,
+        limit: int = 10,
+        page: int = 1,
+    ) -> list[dict[str, Any]]:
+        if not re.fullmatch(r"\d{2}", region_code):
+            raise ValueError("Checko region code must contain exactly two digits")
         data = self._get(
             "/search",
             {
@@ -163,6 +242,7 @@ class CheckoClient:
                 "query": code,
                 "active": "true",
                 "codes": "all",
+                "region": region_code,
                 "limit": min(max(limit, 1), 100),
                 "page": page,
             },

@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.config import DEFAULT_OKVED_CODES, Settings, get_settings
+from app.config import DEFAULT_OKVED_CODES, TARGET_REGION_CODES, Settings, get_settings
 from app.database import SessionLocal, create_database, get_db
 from app.export import build_xlsx
 from app.models import ActivityHistory, Company, MVP_STATUSES, SearchRun
@@ -59,8 +59,10 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "status": "ok",
         "app": settings.app_name,
         "checko_configured": settings.checko_configured,
+        "checko_api_key_count": len(settings.checko_api_keys),
         "mode": "checko" if settings.checko_configured else "demo",
         "default_okved_codes": DEFAULT_OKVED_CODES,
+        "target_region_codes": TARGET_REGION_CODES,
         "discovery_limit_per_code": settings.discovery_limit_per_code,
         "outreach_sender_email": settings.outreach_sender_email,
         "gmail_auth_mode": "oauth2",

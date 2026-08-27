@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.config import Settings
+from app.config import TARGET_REGION_CODES, Settings
 from app.database import SessionLocal
 from app.models import ActivityHistory, Company, CompanyEmail, CompanyOkved, SearchRun
 from app.services.checko import (
@@ -72,6 +72,10 @@ def classify_activity(payload: CompanyPayload) -> str:
             if any(item.code.startswith(prefix) for prefix in prefixes):
                 return category
     return "other"
+
+
+def is_target_region(payload: CompanyPayload) -> bool:
+    return payload.region_code in TARGET_REGION_CODES
 
 
 def add_history(
@@ -208,44 +212,58 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
             seen_inns: set[str] = set()
             provider_blocked = False
             with CheckoClient(
-                settings.checko_api_key,
+                settings.checko_api_keys,
                 settings.checko_base_url,
                 settings.checko_timeout_seconds,
             ) as client:
                 for code in run.requested_okved_codes:
-                    try:
-                        records = client.search_by_okved(code, limit=limit_per_code)
-                    except CheckoAPIError as exc:
-                        run.errors_count += 1
-                        run.error_message = str(exc)
-                        db.commit()
-                        if exc.stop_discovery:
-                            provider_blocked = True
-                            break
-                        continue
-
-                    for record in records:
-                        inn = str(record.get("ИНН") or "")
-                        if not inn or inn in seen_inns:
-                            continue
-                        seen_inns.add(inn)
-                        run.candidates_found += 1
+                    for region_code in TARGET_REGION_CODES:
                         try:
-                            payload = client.get_company(inn)
-                            if not payload.is_active:
-                                run.skipped_inactive += 1
-                                db.commit()
-                                continue
-                            with db.begin_nested():
-                                _, created = upsert_company(db, payload)
-                            _update_run_counter(db, run, created=created)
-                        except (CheckoAPIError, ValueError, SQLAlchemyError) as exc:
+                            records = client.search_by_okved(
+                                code,
+                                region_code=region_code,
+                                limit=limit_per_code,
+                            )
+                        except CheckoAPIError as exc:
                             run.errors_count += 1
                             run.error_message = str(exc)
                             db.commit()
-                            if isinstance(exc, CheckoAPIError) and exc.stop_discovery:
+                            if exc.stop_discovery:
                                 provider_blocked = True
                                 break
+                            continue
+
+                        for record in records:
+                            record_region = str(record.get("РегионКод") or "").strip()
+                            if record_region and record_region not in TARGET_REGION_CODES:
+                                continue
+                            inn = str(record.get("ИНН") or "")
+                            if not inn or inn in seen_inns:
+                                continue
+                            seen_inns.add(inn)
+                            run.candidates_found += 1
+                            try:
+                                payload = client.get_company(inn)
+                                if not payload.is_active:
+                                    run.skipped_inactive += 1
+                                    db.commit()
+                                    continue
+                                if not is_target_region(payload):
+                                    db.commit()
+                                    continue
+                                with db.begin_nested():
+                                    _, created = upsert_company(db, payload)
+                                _update_run_counter(db, run, created=created)
+                            except (CheckoAPIError, ValueError, SQLAlchemyError) as exc:
+                                run.errors_count += 1
+                                run.error_message = str(exc)
+                                db.commit()
+                                if isinstance(exc, CheckoAPIError) and exc.stop_discovery:
+                                    provider_blocked = True
+                                    break
+
+                        if provider_blocked:
+                            break
 
                     if provider_blocked:
                         break

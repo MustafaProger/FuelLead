@@ -21,6 +21,8 @@ DEFAULT_OKVED_CODES = [
     "52.21.2",
 ]
 
+TARGET_REGION_CODES = ("77", "50")
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -32,6 +34,7 @@ class Settings(BaseSettings):
     app_name: str = "FuelLead"
     database_url: str = "sqlite:///./fuellead.sqlite3"
     checko_api_key: str = ""
+    checko_api_key_fallbacks: str = ""
     checko_base_url: str = "https://api.checko.ru/v2"
     checko_timeout_seconds: float = 30.0
     app_timezone: str = "Europe/Moscow"
@@ -48,7 +51,12 @@ class Settings(BaseSettings):
 
     @property
     def checko_configured(self) -> bool:
-        return bool(self.checko_api_key.strip())
+        return bool(self.checko_api_keys)
+
+    @property
+    def checko_api_keys(self) -> tuple[str, ...]:
+        candidates = [self.checko_api_key, *self.checko_api_key_fallbacks.split(",")]
+        return tuple(dict.fromkeys(value.strip() for value in candidates if value.strip()))
 
     @property
     def gmail_oauth_configured(self) -> bool:

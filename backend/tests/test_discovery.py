@@ -5,6 +5,7 @@ from app.services.checko import CompanyPayload, OkvedItem
 from app.services.discovery import (
     classify_activity,
     fail_interrupted_search_runs,
+    is_target_region,
     sanitize_search_run_errors,
     upsert_company,
 )
@@ -29,6 +30,18 @@ def test_category_uses_additional_okved():
 
 def test_category_prefers_relevant_primary_okved():
     assert classify_activity(make_payload([])) == "construction"
+
+
+def test_target_region_accepts_only_moscow_and_moscow_oblast():
+    payload = make_payload([])
+    payload.region_code = "77"
+    assert is_target_region(payload) is True
+    payload.region_code = "50"
+    assert is_target_region(payload) is True
+    payload.region_code = "01"
+    assert is_target_region(payload) is False
+    payload.region_code = None
+    assert is_target_region(payload) is False
 
 
 def test_upsert_deduplicates_by_inn_and_email(db):
