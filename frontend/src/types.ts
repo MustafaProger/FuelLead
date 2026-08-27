@@ -62,6 +62,9 @@ export interface Health {
   mode: "checko" | "demo";
   default_okved_codes: string[];
   discovery_limit_per_code: number;
+  outreach_sender_email: string;
+  gmail_auth_mode: "oauth2";
+  gmail_oauth_configured: boolean;
 }
 
 export interface SearchRun {

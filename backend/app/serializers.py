@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from app.config import Settings
 from app.models import Company, SearchRun
+from app.services.checko import redact_sensitive_url
 
 
 def as_aware(value: datetime) -> datetime:
@@ -63,9 +64,8 @@ def search_run_to_dict(run: SearchRun) -> dict:
         "companies_updated": run.companies_updated,
         "skipped_inactive": run.skipped_inactive,
         "errors_count": run.errors_count,
-        "error_message": run.error_message,
+        "error_message": redact_sensitive_url(run.error_message) if run.error_message else None,
         "created_at": run.created_at.isoformat(),
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
-

@@ -15,7 +15,7 @@ from app.models import ActivityHistory, Company, MVP_STATUSES, SearchRun
 from app.queries import build_company_query
 from app.schemas import CompanyFilters, SearchRunCreate, StatusUpdate
 from app.serializers import company_to_dict, search_run_to_dict
-from app.services.discovery import fail_interrupted_search_runs, run_discovery
+from app.services.discovery import fail_interrupted_search_runs, run_discovery, sanitize_search_run_errors
 
 
 @asynccontextmanager
@@ -23,6 +23,7 @@ async def lifespan(_: FastAPI):
     create_database()
     with SessionLocal() as db:
         fail_interrupted_search_runs(db)
+        sanitize_search_run_errors(db)
     yield
 
 
@@ -61,6 +62,9 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "mode": "checko" if settings.checko_configured else "demo",
         "default_okved_codes": DEFAULT_OKVED_CODES,
         "discovery_limit_per_code": settings.discovery_limit_per_code,
+        "outreach_sender_email": settings.outreach_sender_email,
+        "gmail_auth_mode": "oauth2",
+        "gmail_oauth_configured": settings.gmail_oauth_configured,
     }
 
 

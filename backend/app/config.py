@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     checko_timeout_seconds: float = 30.0
     app_timezone: str = "Europe/Moscow"
     discovery_limit_per_code: int = Field(default=10, ge=1, le=100)
+    outreach_sender_email: str = "artel.office8@gmail.com"
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+    gmail_refresh_token: str = ""
+    gmail_timeout_seconds: float = 30.0
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -45,8 +50,14 @@ class Settings(BaseSettings):
     def checko_configured(self) -> bool:
         return bool(self.checko_api_key.strip())
 
+    @property
+    def gmail_oauth_configured(self) -> bool:
+        return all(
+            value.strip()
+            for value in (self.gmail_client_id, self.gmail_client_secret, self.gmail_refresh_token)
+        )
+
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

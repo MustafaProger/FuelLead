@@ -1,9 +1,10 @@
-import { AlertCircle, CheckCircle2, X } from "lucide-react";
+import { Database, Mail } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { CompanyTable } from "./components/CompanyTable";
 import { FiltersBar } from "./components/FiltersBar";
 import { Header } from "./components/Header";
+import { Notice } from "./components/Notice";
 import { StatsStrip } from "./components/StatsStrip";
 import type {
   Company,
@@ -25,6 +26,15 @@ const defaultFilters: Filters = {
 
 const emptyStats: Stats = { total: 0, new: 0, with_email: 0, without_email: 0 };
 const PAGE_SIZE = 20;
+
+function splitMessage(message: string) {
+  const separator = message.indexOf(". ");
+  if (separator === -1) return { title: message, description: undefined };
+  return {
+    title: message.slice(0, separator),
+    description: message.slice(separator + 2),
+  };
+}
 
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -94,6 +104,7 @@ export default function App() {
 
   const searching = searchRun?.status === "pending" || searchRun?.status === "running";
   const exportUrl = useMemo(() => api.exportUrl(filters), [filters]);
+  const searchResult = searchRun?.error_message ? splitMessage(searchRun.error_message) : null;
 
   const handleSearch = async () => {
     try {
@@ -158,28 +169,54 @@ export default function App() {
             <h1>Компании</h1>
             <p>Потенциальные клиенты с повышенным расходом топлива</p>
           </div>
-          <span className="last-sync">Данные сохраняются в PostgreSQL</span>
+          <div className="system-meta" aria-label="Состояние интеграций">
+            <span><Database size={14} /> PostgreSQL</span>
+            <span className={health?.gmail_oauth_configured ? "integration-ready" : "integration-pending"}>
+              <Mail size={14} />
+              <span>
+                {health?.outreach_sender_email || "artel.office8@gmail.com"}
+                <small>{health?.gmail_oauth_configured ? "Gmail OAuth подключён" : "Gmail OAuth ожидает настройки"}</small>
+              </span>
+            </span>
+          </div>
         </div>
 
         {error && (
-          <div className="notice notice--error" role="alert">
-            <AlertCircle size={18} />
-            <span>{error}</span>
-            <button type="button" onClick={() => setError(null)} aria-label="Закрыть"><X size={17} /></button>
-          </div>
+          <Notice
+            tone="error"
+            title="Не удалось выполнить действие"
+            description={error}
+            onClose={() => setError(null)}
+          />
         )}
 
-        {searchRun && !searching && (
-          <div className={`notice ${searchRun.status === "completed" ? "notice--success" : "notice--error"}`}>
-            {searchRun.status === "completed" ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
-            <span>
-              {searchRun.status === "completed"
-                ? `Поиск завершён: добавлено ${searchRun.companies_created}, обновлено ${searchRun.companies_updated}`
-                : searchRun.error_message || "Поиск завершился с ошибкой"}
-            </span>
-            <button type="button" onClick={() => setSearchRun(null)} aria-label="Закрыть"><X size={17} /></button>
-          </div>
-        )}
+        {searching ? (
+          <Notice
+            tone="progress"
+            title="Поиск компаний запущен"
+            description={searchRun?.candidates_found
+              ? `Найдено кандидатов: ${searchRun.candidates_found}. Получаем карточки и контакты.`
+              : "Проверяем целевые ОКВЭД и доступность данных в Checko."}
+          />
+        ) : null}
+
+        {searchRun && !searching ? (
+          searchRun.status === "completed" ? (
+            <Notice
+              tone={searchRun.errors_count ? "warning" : "success"}
+              title={searchRun.errors_count ? "Поиск завершён с предупреждениями" : "Поиск завершён"}
+              description={`Добавлено ${searchRun.companies_created}, обновлено ${searchRun.companies_updated}${searchRun.errors_count ? `, ошибок провайдера: ${searchRun.errors_count}` : ""}.`}
+              onClose={() => setSearchRun(null)}
+            />
+          ) : (
+            <Notice
+              tone="error"
+              title={searchResult?.title || "Поиск не выполнен"}
+              description={searchResult?.description || "Checko не вернул компании."}
+              onClose={() => setSearchRun(null)}
+            />
+          )
+        ) : null}
 
         <StatsStrip stats={stats} loading={loading && !companies.length} />
         <FiltersBar filters={filters} onChange={handleFilters} />

@@ -2,7 +2,12 @@ from sqlalchemy import func, select
 
 from app.models import ActivityHistory, Company, CompanyEmail, CompanyOkved, SearchRun
 from app.services.checko import CompanyPayload, OkvedItem
-from app.services.discovery import classify_activity, fail_interrupted_search_runs, upsert_company
+from app.services.discovery import (
+    classify_activity,
+    fail_interrupted_search_runs,
+    sanitize_search_run_errors,
+    upsert_company,
+)
 
 
 def make_payload(emails: list[str]) -> CompanyPayload:
@@ -76,3 +81,17 @@ def test_interrupted_search_runs_are_marked_failed(db):
     assert pending.error_message == "Поиск прерван перезапуском приложения"
     assert running.status == "failed"
     assert completed.status == "completed"
+
+
+def test_stored_search_errors_are_redacted(db):
+    run = SearchRun(
+        status="failed",
+        requested_okved_codes=["49.41"],
+        error_message="Client error for https://api.checko.ru/v2/search?key=secret-value&by=okved",
+    )
+    db.add(run)
+    db.commit()
+
+    assert sanitize_search_run_errors(db) == 1
+    assert "secret-value" not in run.error_message
+    assert "key=<redacted>" in run.error_message

@@ -26,11 +26,17 @@ export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
             <span className="mode-dot" aria-hidden="true" />
             {mode === "checko" ? "Checko подключён" : "Демо-режим"}
           </span>
-          <a className="button button--secondary" href={exportUrl}>
+          <a className="button button--secondary" href={exportUrl} aria-label="Экспортировать компании в Excel">
             <Download size={17} />
             <span>Экспорт в Excel</span>
           </a>
-          <button className="button button--primary" type="button" onClick={onSearch} disabled={searching}>
+          <button
+            className="button button--primary"
+            type="button"
+            onClick={onSearch}
+            disabled={searching}
+            aria-label={searching ? "Поиск компаний выполняется" : "Найти компании"}
+          >
             {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
             <span>{searching ? "Идёт поиск…" : "Найти компании"}</span>
           </button>
@@ -39,4 +45,3 @@ export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
     </header>
   );
 }
-

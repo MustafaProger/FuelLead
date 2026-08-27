@@ -1,4 +1,7 @@
-from app.services.checko import normalize_email, parse_company_payload
+import httpx
+import pytest
+
+from app.services.checko import CheckoAPIError, CheckoClient, normalize_email, parse_company_payload
 
 
 def test_parse_company_payload_reads_checko_russian_keys():
@@ -51,3 +54,32 @@ def test_parse_company_payload_deduplicates_additional_okveds():
 def test_email_normalization_rejects_invalid_values():
     assert normalize_email("MAILTO:Sales@Example.ru") == "sales@example.ru"
     assert normalize_email("no-at-sign") is None
+
+
+def test_daily_limit_error_is_friendly_and_does_not_expose_key():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["key"] == "super-secret-key"
+        return httpx.Response(
+            403,
+            json={
+                "meta": {
+                    "status": "error",
+                    "today_request_count": 100,
+                    "message": "Превышен суточный лимит запросов для бесплатного тарифа",
+                    "balance": 0.0,
+                }
+            },
+        )
+
+    with CheckoClient(
+        "super-secret-key",
+        "https://api.checko.ru/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(CheckoAPIError) as caught:
+            client.search_by_okved("49.41", limit=2)
+
+    assert caught.value.stop_discovery is True
+    assert "Суточный лимит Checko исчерпан" in str(caught.value)
+    assert "100 из 100" in str(caught.value)
+    assert "super-secret-key" not in str(caught.value)

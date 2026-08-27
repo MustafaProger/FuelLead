@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronLeft, ChevronRight, Mail } from "lucide-react";
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Mail } from "lucide-react";
 import type { Company, CompanyDetail, CompanyStatus } from "../types";
 import { CompanyDetails } from "./CompanyDetails";
 
@@ -99,11 +99,12 @@ function CompanyRow({
       <tr className={expanded ? "company-row company-row--expanded" : "company-row"}>
         <td data-label="Компания">
           <button className="company-name-button" type="button" onClick={() => onToggle(company.id)} aria-expanded={expanded}>
-            <span className={`row-chevron ${expanded ? "row-chevron--open" : ""}`}><ChevronDown size={17} /></span>
-            <span>
+            <span className="company-icon" aria-hidden="true"><Building2 size={18} /></span>
+            <span className="company-title">
               <strong>{company.name}</strong>
               <small>{company.activity_category === "other" ? "Другая деятельность" : categoryLabel(company.activity_category)}</small>
             </span>
+            <span className={`row-chevron ${expanded ? "row-chevron--open" : ""}`}><ChevronDown size={17} /></span>
           </button>
         </td>
         <td data-label="ИНН / ОГРН" className="requisites-cell">

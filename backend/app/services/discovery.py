@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -8,7 +7,13 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.database import SessionLocal
 from app.models import ActivityHistory, Company, CompanyEmail, CompanyOkved, SearchRun
-from app.services.checko import CheckoAPIError, CheckoClient, CompanyPayload, OkvedItem
+from app.services.checko import (
+    CheckoAPIError,
+    CheckoClient,
+    CompanyPayload,
+    OkvedItem,
+    redact_sensitive_url,
+)
 from app.services.demo_data import DEMO_COMPANIES
 
 
@@ -40,6 +45,21 @@ def fail_interrupted_search_runs(db: Session) -> int:
         run.completed_at = completed_at
     db.commit()
     return len(interrupted)
+
+
+def sanitize_search_run_errors(db: Session) -> int:
+    runs = list(
+        db.scalars(select(SearchRun).where(SearchRun.error_message.contains("key="))).all()
+    )
+    changed = 0
+    for run in runs:
+        sanitized = redact_sensitive_url(run.error_message or "")
+        if sanitized != run.error_message:
+            run.error_message = sanitized
+            changed += 1
+    if changed:
+        db.commit()
+    return changed
 
 
 def classify_activity(payload: CompanyPayload) -> str:
@@ -186,6 +206,7 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
         else:
             run.mode = "checko"
             seen_inns: set[str] = set()
+            provider_blocked = False
             with CheckoClient(
                 settings.checko_api_key,
                 settings.checko_base_url,
@@ -194,10 +215,13 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
                 for code in run.requested_okved_codes:
                     try:
                         records = client.search_by_okved(code, limit=limit_per_code)
-                    except (CheckoAPIError, httpx.HTTPError) as exc:
+                    except CheckoAPIError as exc:
                         run.errors_count += 1
                         run.error_message = str(exc)
                         db.commit()
+                        if exc.stop_discovery:
+                            provider_blocked = True
+                            break
                         continue
 
                     for record in records:
@@ -215,10 +239,16 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
                             with db.begin_nested():
                                 _, created = upsert_company(db, payload)
                             _update_run_counter(db, run, created=created)
-                        except (CheckoAPIError, httpx.HTTPError, ValueError, SQLAlchemyError) as exc:
+                        except (CheckoAPIError, ValueError, SQLAlchemyError) as exc:
                             run.errors_count += 1
                             run.error_message = str(exc)
                             db.commit()
+                            if isinstance(exc, CheckoAPIError) and exc.stop_discovery:
+                                provider_blocked = True
+                                break
+
+                    if provider_blocked:
+                        break
 
         run.status = "completed" if (run.companies_created + run.companies_updated) > 0 else "failed"
         if run.status == "failed" and not run.error_message:

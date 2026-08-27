@@ -6,7 +6,9 @@ import httpx
 
 
 class CheckoAPIError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, stop_discovery: bool = False):
+        super().__init__(message)
+        self.stop_discovery = stop_discovery
 
 
 @dataclass(slots=True)
@@ -27,6 +29,11 @@ class CompanyPayload:
 
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+SECRET_QUERY_PATTERN = re.compile(r"([?&]key=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def redact_sensitive_url(value: str) -> str:
+    return SECRET_QUERY_PATTERN.sub(r"\1<redacted>", value)
 
 
 def normalize_email(value: str) -> str | None:
@@ -81,11 +88,22 @@ def parse_company_payload(data: dict[str, Any]) -> CompanyPayload:
 
 
 class CheckoClient:
-    def __init__(self, api_key: str, base_url: str, timeout_seconds: float = 30.0):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        timeout_seconds: float = 30.0,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ):
         if not api_key.strip():
             raise ValueError("Checko API key is required")
         self.api_key = api_key
-        self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds)
+        self.client = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            timeout=timeout_seconds,
+            transport=transport,
+        )
 
     def __enter__(self) -> "CheckoClient":
         return self
@@ -94,15 +112,46 @@ class CheckoClient:
         self.client.close()
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.get(path, params={"key": self.api_key, **params})
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = self.client.get(path, params={"key": self.api_key, **params})
+        except httpx.TimeoutException as exc:
+            raise CheckoAPIError("Checko не ответил вовремя. Повторите поиск позже.") from exc
+        except httpx.RequestError as exc:
+            raise CheckoAPIError("Не удалось связаться с Checko. Проверьте подключение и повторите поиск.") from exc
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
         meta = payload.get("meta") or {}
+        provider_message = str(meta.get("message") or "").strip()
+
+        if response.is_error:
+            if response.status_code == 403 and "суточн" in provider_message.casefold():
+                request_count = meta.get("today_request_count")
+                usage = f" Сегодня использовано {request_count} из 100 запросов." if request_count is not None else ""
+                raise CheckoAPIError(
+                    "Суточный лимит Checko исчерпан."
+                    f"{usage} Поиск станет доступен после обновления лимита или пополнения баланса.",
+                    stop_discovery=True,
+                )
+            if response.status_code in (401, 403):
+                raise CheckoAPIError(
+                    "Checko отклонил API-ключ. Проверьте ключ и доступ к методу поиска в личном кабинете Checko.",
+                    stop_discovery=True,
+                )
+            if response.status_code == 429:
+                raise CheckoAPIError(
+                    "Checko временно ограничил частоту запросов. Повторите поиск позже.",
+                    stop_discovery=True,
+                )
+            raise CheckoAPIError(provider_message or f"Checko вернул ошибку HTTP {response.status_code}.")
+
         if meta.get("status") == "error":
-            raise CheckoAPIError(meta.get("message") or "Checko API returned an error")
+            raise CheckoAPIError(provider_message or "Checko не смог обработать запрос")
         data = payload.get("data")
         if not isinstance(data, dict):
-            raise CheckoAPIError("Checko API response does not contain a data object")
+            raise CheckoAPIError("Checko вернул ответ без данных")
         return data
 
     def search_by_okved(self, code: str, limit: int = 10, page: int = 1) -> list[dict[str, Any]]:
