@@ -1,0 +1,52 @@
+from functools import lru_cache
+from zoneinfo import ZoneInfo
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+DEFAULT_OKVED_CODES = [
+    "42.11",
+    "49.41",
+    "49.41.1",
+    "49.41.2",
+    "49.41.3",
+    "41.20",
+    "01",
+    "43.11",
+    "43.12",
+    "43.12.3",
+    "77.32",
+    "77.39.1",
+    "52.21.2",
+]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    app_name: str = "FuelLead"
+    database_url: str = "sqlite:///./fuellead.sqlite3"
+    checko_api_key: str = ""
+    checko_base_url: str = "https://api.checko.ru/v2"
+    checko_timeout_seconds: float = 30.0
+    app_timezone: str = "Europe/Moscow"
+    discovery_limit_per_code: int = Field(default=10, ge=1, le=100)
+
+    @property
+    def timezone(self) -> ZoneInfo:
+        return ZoneInfo(self.app_timezone)
+
+    @property
+    def checko_configured(self) -> bool:
+        return bool(self.checko_api_key.strip())
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
