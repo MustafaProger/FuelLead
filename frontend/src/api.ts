@@ -13,14 +13,33 @@ import type {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 
+export interface AuthSession {
+  authenticated: boolean;
+  email: string;
+}
+
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
     headers: { "Content-Type": "application/json", ...options?.headers },
     ...options,
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw new Error(body?.detail || `Ошибка запроса: ${response.status}`);
+    if (response.status === 401 && !path.startsWith("/auth/")) {
+      window.dispatchEvent(new Event("fuellead:unauthorized"));
+    }
+    throw new ApiError(body?.detail || `Ошибка запроса: ${response.status}`, response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -36,6 +55,12 @@ export function filtersToParams(filters: Filters): URLSearchParams {
 }
 
 export const api = {
+  authSession: () => request<AuthSession>("/auth/session"),
+  login: (email: string, password: string) => request<AuthSession>("/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  }),
+  logout: () => request<{ authenticated: false }>("/auth/logout", { method: "POST" }),
   health: () => request<Health>("/health"),
   dashboard: () => request<DashboardResponse>("/dashboard"),
   companies: (filters: Filters, page: number, pageSize: number) => {

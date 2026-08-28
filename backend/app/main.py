@@ -3,18 +3,20 @@ from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.auth import AUTH_COOKIE_NAME, create_session_token, credentials_match, session_email
 from app.config import DEFAULT_OKVED_CODES, TARGET_REGION_CODES, Settings, get_settings
 from app.database import SessionLocal, create_database, get_db
 from app.export import build_xlsx
 from app.models import ALL_STATUSES, ActivityHistory, Company, SearchRun
 from app.queries import build_company_query
 from app.schemas import (
+    AuthLoginRequest,
     CompanyFilters,
     EmailPreviewRequest,
     EmailSendRequest,
@@ -45,6 +47,21 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="FuelLead API", version="0.1.0", lifespan=lifespan)
 DASHBOARD_HISTORY_DAYS = 183
+
+
+@app.middleware("http")
+async def require_authentication(request: Request, call_next):
+    if request.method == "OPTIONS" or not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    if request.url.path == "/api/auth/login":
+        return await call_next(request)
+    email = session_email(request.cookies.get(AUTH_COOKIE_NAME), get_settings())
+    if email is None:
+        return JSONResponse(status_code=401, content={"detail": "Требуется авторизация"})
+    request.state.auth_email = email
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -52,6 +69,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.post("/api/auth/login")
+def login(
+    credentials: AuthLoginRequest,
+    response: Response,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    if not settings.auth_configured:
+        raise HTTPException(status_code=503, detail="Авторизация не настроена")
+    if not credentials_match(credentials.email, credentials.password, settings):
+        raise HTTPException(status_code=401, detail="Неверная почта или пароль")
+    token = create_session_token(settings.fuellead_auth_email.strip(), settings)
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=settings.fuellead_auth_cookie_days * 24 * 60 * 60,
+        httponly=True,
+        secure=settings.fuellead_auth_cookie_secure,
+        samesite="strict",
+        path="/",
+    )
+    return {"authenticated": True, "email": settings.fuellead_auth_email.strip()}
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request) -> dict:
+    return {"authenticated": True, "email": request.state.auth_email}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response) -> dict:
+    response.delete_cookie(key=AUTH_COOKIE_NAME, path="/", samesite="strict")
+    return {"authenticated": False}
 
 
 def filters_dependency(

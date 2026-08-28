@@ -6,6 +6,11 @@ from app.config import DEFAULT_OKVED_CODES
 from app.models import ALL_STATUSES
 
 
+class AuthLoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+
 class CompanyFilters(BaseModel):
     status: str | None = None
     has_email: bool | None = None

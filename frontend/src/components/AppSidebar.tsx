@@ -1,4 +1,4 @@
-import { Building2, CheckCircle2, Fuel, LayoutDashboard, Mail } from "lucide-react";
+import { Building2, CheckCircle2, Fuel, LayoutDashboard, LogOut, Mail } from "lucide-react";
 
 export type AppPage = "dashboard" | "companies" | "template";
 
@@ -6,6 +6,8 @@ interface AppSidebarProps {
   activePage: AppPage;
   mode: "checko" | "demo";
   gmailConfigured: boolean;
+  userEmail: string;
+  onLogout: () => void;
 }
 
 const navigation = [
@@ -14,7 +16,7 @@ const navigation = [
   { page: "template" as const, label: "Шаблон письма", icon: Mail },
 ];
 
-export function AppSidebar({ activePage, mode, gmailConfigured }: AppSidebarProps) {
+export function AppSidebar({ activePage, mode, gmailConfigured, userEmail, onLogout }: AppSidebarProps) {
   return (
     <aside className="workspace-sidebar">
       <div className="sidebar-brand">
@@ -48,6 +50,14 @@ export function AppSidebar({ activePage, mode, gmailConfigured }: AppSidebarProp
           <Mail size={17} />
           <span>{gmailConfigured ? "Gmail подключён" : "Gmail не настроен"}</span>
         </div>
+      </div>
+
+      <div className="sidebar-account">
+        <span className="sidebar-account-avatar" aria-hidden="true">{userEmail.slice(0, 1).toUpperCase()}</span>
+        <span className="sidebar-account-copy"><strong>В системе</strong><small>{userEmail}</small></span>
+        <button type="button" onClick={onLogout} aria-label="Выйти из FuelLead" title="Выйти">
+          <LogOut size={18} />
+        </button>
       </div>
     </aside>
   );

@@ -2,6 +2,7 @@ import { Database, Download, Mail, RefreshCw, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
+import { AuthPage } from "./components/AuthPage";
 import { CompanyTable } from "./components/CompanyTable";
 import { DashboardPage } from "./components/DashboardPage";
 import { EmailTemplatePage } from "./components/EmailTemplatePage";
@@ -43,7 +44,12 @@ function splitMessage(message: string) {
   };
 }
 
-export default function App() {
+interface WorkspaceProps {
+  userEmail: string;
+  onLogout: () => void;
+}
+
+function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [health, setHealth] = useState<Health | null>(null);
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -175,6 +181,8 @@ export default function App() {
         activePage={activePage}
         mode={health?.mode || "demo"}
         gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+        userEmail={userEmail}
+        onLogout={onLogout}
       />
       <main className="workspace-main">
         {activePage === "dashboard" ? (
@@ -260,4 +268,49 @@ export default function App() {
       </main>
     </div>
   );
+}
+
+export default function App() {
+  const [session, setSession] = useState<{ email: string } | null | undefined>(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.authSession()
+      .then((current) => {
+        if (!cancelled) setSession({ email: current.email });
+      })
+      .catch(() => {
+        if (!cancelled) setSession(null);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const handleUnauthorized = () => setSession(null);
+    window.addEventListener("fuellead:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("fuellead:unauthorized", handleUnauthorized);
+  }, []);
+
+  const handleLogout = async () => {
+    try {
+      await api.logout();
+    } finally {
+      setSession(null);
+    }
+  };
+
+  if (session === undefined) {
+    return (
+      <main className="auth-loading" aria-label="Проверяем доступ">
+        <span className="auth-brand-mark" aria-hidden="true"><RefreshCw className="spin" size={23} /></span>
+        <strong>FuelLead</strong>
+      </main>
+    );
+  }
+
+  if (session === null) {
+    return <AuthPage onAuthenticated={(current) => setSession({ email: current.email })} />;
+  }
+
+  return <Workspace userEmail={session.email} onLogout={handleLogout} />;
 }

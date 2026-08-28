@@ -26,7 +26,7 @@ TARGET_REGION_CODES = ("77", "50")
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=("../.env", ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     gmail_client_secret: str = ""
     gmail_refresh_token: str = ""
     gmail_timeout_seconds: float = 30.0
+    fuellead_auth_email: str = ""
+    fuellead_auth_password: str = ""
+    fuellead_auth_session_secret: str = ""
+    fuellead_auth_cookie_days: int = Field(default=3650, ge=1, le=3650)
+    fuellead_auth_cookie_secure: bool = False
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -63,6 +68,14 @@ class Settings(BaseSettings):
         return all(
             value.strip()
             for value in (self.gmail_client_id, self.gmail_client_secret, self.gmail_refresh_token)
+        )
+
+    @property
+    def auth_configured(self) -> bool:
+        return bool(
+            self.fuellead_auth_email.strip()
+            and self.fuellead_auth_password
+            and self.fuellead_auth_session_secret
         )
 
 
