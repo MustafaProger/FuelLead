@@ -11,14 +11,19 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { CompanyStatus, DashboardResponse } from "../types";
+import type { CompanyStatus, DashboardResponse, SearchRun } from "../types";
 import { Notice } from "./Notice";
+import { SearchRunNotice } from "./SearchRunNotice";
 
 interface DashboardPageProps {
   exportUrl: string;
+  searchError: string | null;
+  searchRun: SearchRun | null;
   searching: boolean;
   refreshToken: number;
   onSearch: () => void;
+  onCloseSearchError: () => void;
+  onCloseSearchRun: () => void;
 }
 
 const statusLabels: Record<CompanyStatus, string> = {
@@ -45,7 +50,16 @@ function formatShortDate(value: string) {
     .replace(" г.", "");
 }
 
-export function DashboardPage({ exportUrl, searching, refreshToken, onSearch }: DashboardPageProps) {
+export function DashboardPage({
+  exportUrl,
+  searchError,
+  searchRun,
+  searching,
+  refreshToken,
+  onSearch,
+  onCloseSearchError,
+  onCloseSearchRun,
+}: DashboardPageProps) {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -95,6 +109,12 @@ export function DashboardPage({ exportUrl, searching, refreshToken, onSearch }: 
       </header>
 
       {error ? <Notice tone="error" title="Не удалось загрузить дашборд" description={error} /> : null}
+      <SearchRunNotice
+        error={searchError}
+        run={searchRun}
+        onCloseError={onCloseSearchError}
+        onCloseRun={onCloseSearchRun}
+      />
 
       <section className="dashboard-metrics" aria-label="Ключевые показатели">
         <Metric icon={Building2} label="Всего компаний" value={data?.metrics.total} tone="orange" />

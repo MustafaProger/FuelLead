@@ -8,6 +8,7 @@ import { DashboardPage } from "./components/DashboardPage";
 import { EmailTemplatePage } from "./components/EmailTemplatePage";
 import { FiltersBar } from "./components/FiltersBar";
 import { Notice } from "./components/Notice";
+import { SearchRunNotice } from "./components/SearchRunNotice";
 import { StatsStrip } from "./components/StatsStrip";
 import type {
   Company,
@@ -35,15 +36,6 @@ function pageFromHash(): AppPage {
   return page === "companies" || page === "template" ? page : "dashboard";
 }
 
-function splitMessage(message: string) {
-  const separator = message.indexOf(". ");
-  if (separator === -1) return { title: message, description: undefined };
-  return {
-    title: message.slice(0, separator),
-    description: message.slice(separator + 2),
-  };
-}
-
 interface WorkspaceProps {
   userEmail: string;
   onLogout: () => void;
@@ -63,6 +55,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [detail, setDetail] = useState<CompanyDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [searchRun, setSearchRun] = useState<SearchRun | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
 
   useEffect(() => {
@@ -106,13 +99,14 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         const current = await api.searchRun(searchRun.id);
         if (cancelled) return;
         setSearchRun(current);
+        setSearchError(null);
         if (["pending", "running"].includes(current.status)) {
           timer = window.setTimeout(poll, 1200);
         } else {
           setRefreshToken((value) => value + 1);
         }
       } catch (requestError) {
-        if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Не удалось проверить поиск");
+        if (!cancelled) setSearchError(requestError instanceof Error ? requestError.message : "Не удалось проверить поиск");
       }
     };
     timer = window.setTimeout(poll, 800);
@@ -124,18 +118,17 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
 
   const searching = searchRun?.status === "pending" || searchRun?.status === "running";
   const exportUrl = useMemo(() => api.exportUrl(filters), [filters]);
-  const searchResult = searchRun?.error_message ? splitMessage(searchRun.error_message) : null;
 
   const handleSearch = async () => {
     try {
-      setError(null);
+      setSearchError(null);
       const run = await api.startSearch(
         health?.default_okved_codes || [],
         health?.discovery_limit_per_code || 10,
       );
       setSearchRun(run);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Не удалось запустить поиск");
+      setSearchError(requestError instanceof Error ? requestError.message : "Не удалось запустить поиск");
     }
   };
 
@@ -188,9 +181,13 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         {activePage === "dashboard" ? (
           <DashboardPage
             exportUrl={exportUrl}
+            searchError={searchError}
+            searchRun={searchRun}
             searching={Boolean(searching)}
             refreshToken={refreshToken}
             onSearch={handleSearch}
+            onCloseSearchError={() => setSearchError(null)}
+            onCloseSearchRun={() => setSearchRun(null)}
           />
         ) : null}
 
@@ -220,25 +217,12 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
             </div>
 
             {error ? <Notice tone="error" title="Не удалось выполнить действие" description={error} onClose={() => setError(null)} /> : null}
-            {searching ? (
-              <Notice
-                tone="progress"
-                title="Поиск компаний запущен"
-                description={searchRun?.candidates_found ? `Найдено кандидатов: ${searchRun.candidates_found}. Получаем карточки и контакты.` : "Проверяем целевые ОКВЭД и доступность данных в Checko."}
-              />
-            ) : null}
-            {searchRun && !searching ? (
-              searchRun.status === "completed" ? (
-                <Notice
-                  tone={searchRun.errors_count ? "warning" : "success"}
-                  title={searchRun.errors_count ? "Поиск завершён с предупреждениями" : "Поиск завершён"}
-                  description={`Добавлено ${searchRun.companies_created}, обновлено ${searchRun.companies_updated}${searchRun.errors_count ? `, ошибок провайдера: ${searchRun.errors_count}` : ""}.`}
-                  onClose={() => setSearchRun(null)}
-                />
-              ) : (
-                <Notice tone="error" title={searchResult?.title || "Поиск не выполнен"} description={searchResult?.description || "Checko не вернул компании."} onClose={() => setSearchRun(null)} />
-              )
-            ) : null}
+            <SearchRunNotice
+              error={searchError}
+              run={searchRun}
+              onCloseError={() => setSearchError(null)}
+              onCloseRun={() => setSearchRun(null)}
+            />
 
             <StatsStrip stats={stats} loading={loading && !companies.length} />
             <FiltersBar filters={filters} onChange={handleFilters} />
