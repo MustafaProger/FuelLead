@@ -135,6 +135,24 @@ class SearchRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class DiscoveryCursor(Base):
+    __tablename__ = "discovery_cursors"
+    __table_args__ = (
+        UniqueConstraint("okved_code", "region_code", name="uq_discovery_cursor_query"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    okved_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    region_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    next_page: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    next_record_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    page_size: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    completed_cycles: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
 class EmailTemplate(Base):
     __tablename__ = "email_templates"
 

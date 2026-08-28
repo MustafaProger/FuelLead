@@ -122,9 +122,37 @@ def test_client_switches_to_next_key_and_keeps_using_it():
         first = client.search_by_okved("49.41", region_code="50", limit=1)
         second = client.search_by_okved("42.11", region_code="50", limit=1)
 
-    assert first[0]["ИНН"] == "5001000000"
-    assert second[0]["ИНН"] == "5001000000"
+    assert first.records[0]["ИНН"] == "5001000000"
+    assert second.records[0]["ИНН"] == "5001000000"
     assert used_keys == ["exhausted-key", "backup-key", "backup-key"]
+
+
+def test_search_returns_pagination_metadata_and_forwards_page():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["limit"] == "2"
+        assert request.url.params["page"] == "3"
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"status": "ok"},
+                "data": {
+                    "СтрВсего": 8,
+                    "СтрТекущ": 3,
+                    "Записи": [{"ИНН": "7701000001"}],
+                },
+            },
+        )
+
+    with CheckoClient(
+        "key",
+        "https://api.checko.ru/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = client.search_by_okved("49.41", region_code="77", limit=2, page=3)
+
+    assert result.current_page == 3
+    assert result.total_pages == 8
+    assert result.records == [{"ИНН": "7701000001"}]
 
 
 def test_search_requires_two_digit_region_code():

@@ -6,12 +6,20 @@ from sqlalchemy.orm import Session
 
 from app.config import TARGET_REGION_CODES, Settings
 from app.database import SessionLocal
-from app.models import ActivityHistory, Company, CompanyEmail, CompanyOkved, SearchRun
+from app.models import (
+    ActivityHistory,
+    Company,
+    CompanyEmail,
+    CompanyOkved,
+    DiscoveryCursor,
+    SearchRun,
+)
 from app.services.checko import (
     CheckoAPIError,
     CheckoClient,
     CompanyPayload,
     OkvedItem,
+    SearchPage,
     redact_sensitive_url,
 )
 from app.services.demo_data import DEMO_COMPANIES
@@ -24,6 +32,7 @@ CATEGORY_RULES = [
     ("machinery", ("77.32", "77.39.1")),
     ("construction", ("41.20", "43.11", "43.12")),
 ]
+MAX_SEARCH_PAGES_PER_QUERY_RUN = 2
 
 
 def utcnow() -> datetime:
@@ -188,6 +197,189 @@ def _update_run_counter(db: Session, run: SearchRun, *, created: bool) -> None:
     db.commit()
 
 
+def _get_discovery_cursor(
+    db: Session,
+    *,
+    okved_code: str,
+    region_code: str,
+    page_size: int,
+) -> DiscoveryCursor:
+    cursor = db.scalar(
+        select(DiscoveryCursor).where(
+            DiscoveryCursor.okved_code == okved_code,
+            DiscoveryCursor.region_code == region_code,
+        )
+    )
+    if cursor is None:
+        cursor = DiscoveryCursor(
+            okved_code=okved_code,
+            region_code=region_code,
+            page_size=page_size,
+        )
+        db.add(cursor)
+        db.flush()
+        return cursor
+
+    if cursor.page_size != page_size:
+        absolute_offset = max(cursor.next_page - 1, 0) * cursor.page_size
+        absolute_offset += max(cursor.next_record_index, 0)
+        cursor.next_page = absolute_offset // page_size + 1
+        cursor.next_record_index = absolute_offset % page_size
+        cursor.page_size = page_size
+    return cursor
+
+
+def _advance_cursor_after_record(
+    cursor: DiscoveryCursor,
+    search_page: SearchPage,
+    next_record_index: int,
+) -> bool:
+    """Advance the cursor and return True when the result cycle wrapped to page one."""
+    if next_record_index < len(search_page.records):
+        cursor.next_page = search_page.current_page
+        cursor.next_record_index = next_record_index
+        return False
+
+    cursor.next_record_index = 0
+    if search_page.current_page < search_page.total_pages:
+        cursor.next_page = search_page.current_page + 1
+        return False
+
+    cursor.next_page = 1
+    cursor.completed_cycles += 1
+    return True
+
+
+def discover_new_companies(
+    db: Session,
+    run: SearchRun,
+    client: CheckoClient,
+    limit_per_code: int,
+) -> bool:
+    """Discover only unknown INNs while continuing through persistent Checko pages.
+
+    Returns True when the provider made further discovery impossible for this run.
+    """
+    known_inns = set(db.scalars(select(Company.inn)).all())
+    seen_inns: set[str] = set()
+
+    for code in run.requested_okved_codes:
+        for region_code in TARGET_REGION_CODES:
+            cursor = _get_discovery_cursor(
+                db,
+                okved_code=code,
+                region_code=region_code,
+                page_size=limit_per_code,
+            )
+            candidate_attempts = 0
+            pages_scanned = 0
+
+            while (
+                candidate_attempts < limit_per_code
+                and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN
+            ):
+                requested_page = cursor.next_page
+                try:
+                    search_page = client.search_by_okved(
+                        code,
+                        region_code=region_code,
+                        limit=limit_per_code,
+                        page=requested_page,
+                    )
+                except CheckoAPIError as exc:
+                    run.errors_count += 1
+                    run.error_message = str(exc)
+                    db.commit()
+                    if exc.stop_discovery:
+                        return True
+                    break
+
+                pages_scanned += 1
+                if search_page.current_page != requested_page:
+                    cursor.next_page = search_page.current_page
+                    cursor.next_record_index = 0
+
+                start_index = min(cursor.next_record_index, len(search_page.records))
+                wrapped_cycle = (
+                    _advance_cursor_after_record(cursor, search_page, start_index)
+                    if start_index == len(search_page.records) and search_page.records
+                    else False
+                )
+                retry_current_record = False
+
+                for record_index in range(start_index, len(search_page.records)):
+                    record = search_page.records[record_index]
+                    record_region = str(record.get("РегионКод") or "").strip()
+                    inn = str(record.get("ИНН") or "").strip()
+
+                    if record_region and record_region not in TARGET_REGION_CODES:
+                        wrapped_cycle = _advance_cursor_after_record(
+                            cursor, search_page, record_index + 1
+                        )
+                        continue
+                    if not inn or inn in known_inns or inn in seen_inns:
+                        wrapped_cycle = _advance_cursor_after_record(
+                            cursor, search_page, record_index + 1
+                        )
+                        continue
+
+                    seen_inns.add(inn)
+                    run.candidates_found += 1
+                    candidate_attempts += 1
+                    try:
+                        payload = client.get_company(inn)
+                        if not payload.is_active:
+                            run.skipped_inactive += 1
+                        elif is_target_region(payload):
+                            with db.begin_nested():
+                                _, created = upsert_company(db, payload)
+                            _advance_cursor_after_record(cursor, search_page, record_index + 1)
+                            if created:
+                                known_inns.add(inn)
+                            _update_run_counter(db, run, created=created)
+                            wrapped_cycle = cursor.next_page == 1 and cursor.next_record_index == 0
+                            if candidate_attempts >= limit_per_code:
+                                break
+                            continue
+                    except CheckoAPIError as exc:
+                        run.errors_count += 1
+                        run.error_message = str(exc)
+                        db.commit()
+                        retry_current_record = True
+                        if exc.stop_discovery:
+                            return True
+                        break
+                    except SQLAlchemyError as exc:
+                        run.errors_count += 1
+                        run.error_message = str(exc)
+                        db.commit()
+                        retry_current_record = True
+                        break
+                    except ValueError as exc:
+                        run.errors_count += 1
+                        run.error_message = str(exc)
+
+                    wrapped_cycle = _advance_cursor_after_record(
+                        cursor, search_page, record_index + 1
+                    )
+                    db.commit()
+                    if candidate_attempts >= limit_per_code:
+                        break
+
+                if retry_current_record:
+                    break
+                if not search_page.records:
+                    cursor.next_page = 1
+                    cursor.next_record_index = 0
+                    db.commit()
+                    break
+                db.commit()
+                if candidate_attempts >= limit_per_code or wrapped_cycle:
+                    break
+
+    return False
+
+
 def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
     db = SessionLocal()
     run = db.get(SearchRun, run_id)
@@ -209,68 +401,15 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
                 _update_run_counter(db, run, created=created)
         else:
             run.mode = "checko"
-            seen_inns: set[str] = set()
-            provider_blocked = False
             with CheckoClient(
                 settings.checko_api_keys,
                 settings.checko_base_url,
                 settings.checko_timeout_seconds,
             ) as client:
-                for code in run.requested_okved_codes:
-                    for region_code in TARGET_REGION_CODES:
-                        try:
-                            records = client.search_by_okved(
-                                code,
-                                region_code=region_code,
-                                limit=limit_per_code,
-                            )
-                        except CheckoAPIError as exc:
-                            run.errors_count += 1
-                            run.error_message = str(exc)
-                            db.commit()
-                            if exc.stop_discovery:
-                                provider_blocked = True
-                                break
-                            continue
+                discover_new_companies(db, run, client, limit_per_code)
 
-                        for record in records:
-                            record_region = str(record.get("РегионКод") or "").strip()
-                            if record_region and record_region not in TARGET_REGION_CODES:
-                                continue
-                            inn = str(record.get("ИНН") or "")
-                            if not inn or inn in seen_inns:
-                                continue
-                            seen_inns.add(inn)
-                            run.candidates_found += 1
-                            try:
-                                payload = client.get_company(inn)
-                                if not payload.is_active:
-                                    run.skipped_inactive += 1
-                                    db.commit()
-                                    continue
-                                if not is_target_region(payload):
-                                    db.commit()
-                                    continue
-                                with db.begin_nested():
-                                    _, created = upsert_company(db, payload)
-                                _update_run_counter(db, run, created=created)
-                            except (CheckoAPIError, ValueError, SQLAlchemyError) as exc:
-                                run.errors_count += 1
-                                run.error_message = str(exc)
-                                db.commit()
-                                if isinstance(exc, CheckoAPIError) and exc.stop_discovery:
-                                    provider_blocked = True
-                                    break
-
-                        if provider_blocked:
-                            break
-
-                    if provider_blocked:
-                        break
-
-        run.status = "completed" if (run.companies_created + run.companies_updated) > 0 else "failed"
-        if run.status == "failed" and not run.error_message:
-            run.error_message = "Поиск не вернул компаний"
+        has_processed_companies = (run.companies_created + run.companies_updated) > 0
+        run.status = "completed" if has_processed_companies or run.errors_count == 0 else "failed"
     except Exception as exc:  # keep the background task observable via the run record
         db.rollback()
         run = db.get(SearchRun, run_id)

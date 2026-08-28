@@ -1,9 +1,18 @@
 from sqlalchemy import func, select
+from sqlalchemy.orm import sessionmaker
 
-from app.models import ActivityHistory, Company, CompanyEmail, CompanyOkved, SearchRun
-from app.services.checko import CompanyPayload, OkvedItem
+from app.models import (
+    ActivityHistory,
+    Company,
+    CompanyEmail,
+    CompanyOkved,
+    DiscoveryCursor,
+    SearchRun,
+)
+from app.services.checko import CompanyPayload, OkvedItem, SearchPage
 from app.services.discovery import (
     classify_activity,
+    discover_new_companies,
     fail_interrupted_search_runs,
     is_target_region,
     sanitize_search_run_errors,
@@ -20,6 +29,41 @@ def make_payload(emails: list[str]) -> CompanyPayload:
         additional_okveds=[OkvedItem("49.41.2", "Грузовые перевозки")],
         emails=emails,
     )
+
+
+class FakePaginatedCheckoClient:
+    def __init__(self, inns: list[str]):
+        self.inns = inns
+        self.search_calls: list[tuple[str, str, int, int]] = []
+        self.company_calls: list[str] = []
+
+    def search_by_okved(
+        self,
+        code: str,
+        *,
+        region_code: str,
+        limit: int,
+        page: int,
+    ) -> SearchPage:
+        self.search_calls.append((code, region_code, limit, page))
+        if region_code == "50":
+            return SearchPage(records=[], current_page=1, total_pages=1)
+        start = (page - 1) * limit
+        page_inns = self.inns[start : start + limit]
+        total_pages = max((len(self.inns) + limit - 1) // limit, 1)
+        return SearchPage(
+            records=[{"ИНН": inn, "РегионКод": "77"} for inn in page_inns],
+            current_page=page,
+            total_pages=total_pages,
+        )
+
+    def get_company(self, inn: str) -> CompanyPayload:
+        self.company_calls.append(inn)
+        payload = make_payload([])
+        payload.inn = inn
+        payload.name = f'ООО "КОМПАНИЯ {inn}"'
+        payload.region_code = "77"
+        return payload
 
 
 def test_category_uses_additional_okved():
@@ -108,3 +152,53 @@ def test_stored_search_errors_are_redacted(db):
     assert sanitize_search_run_errors(db) == 1
     assert "secret-value" not in run.error_message
     assert "key=<redacted>" in run.error_message
+
+
+def test_five_consecutive_searches_create_five_different_companies(db):
+    inns = [f"770100000{index}" for index in range(1, 6)]
+    client = FakePaginatedCheckoClient(inns)
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+
+    created_per_run = []
+    for _ in range(5):
+        with session_factory() as run_db:
+            run = SearchRun(status="running", requested_okved_codes=["49.41"])
+            run_db.add(run)
+            run_db.commit()
+
+            assert discover_new_companies(run_db, run, client, limit_per_code=1) is False
+            created_per_run.append(run.companies_created)
+
+    db.expire_all()
+    assert created_per_run == [1, 1, 1, 1, 1]
+    assert db.scalar(select(func.count(Company.id))) == 5
+    assert client.company_calls == inns
+    assert [call[3] for call in client.search_calls if call[1] == "77"] == [1, 2, 3, 4, 5]
+
+    cursor = db.scalar(
+        select(DiscoveryCursor).where(
+            DiscoveryCursor.okved_code == "49.41",
+            DiscoveryCursor.region_code == "77",
+        )
+    )
+    assert cursor.next_page == 1
+    assert cursor.completed_cycles == 1
+
+
+def test_known_inn_is_skipped_before_company_request_and_next_page_is_used(db):
+    known_payload = make_payload([])
+    known_payload.inn = "7701000001"
+    upsert_company(db, known_payload)
+    db.commit()
+
+    client = FakePaginatedCheckoClient(["7701000001", "7701000002"])
+    run = SearchRun(status="running", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+
+    assert discover_new_companies(db, run, client, limit_per_code=1) is False
+
+    assert run.companies_created == 1
+    assert run.companies_updated == 0
+    assert client.company_calls == ["7701000002"]
+    assert [call[3] for call in client.search_calls if call[1] == "77"] == [1, 2]

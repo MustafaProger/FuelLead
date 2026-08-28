@@ -39,6 +39,13 @@ class CompanyPayload:
     region_name: str | None = None
 
 
+@dataclass(slots=True)
+class SearchPage:
+    records: list[dict[str, Any]]
+    current_page: int
+    total_pages: int
+
+
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 SECRET_QUERY_PATTERN = re.compile(r"([?&]key=)[^&\s'\"]+", re.IGNORECASE)
 
@@ -231,7 +238,7 @@ class CheckoClient:
         region_code: str,
         limit: int = 10,
         page: int = 1,
-    ) -> list[dict[str, Any]]:
+    ) -> SearchPage:
         if not re.fullmatch(r"\d{2}", region_code):
             raise ValueError("Checko region code must contain exactly two digits")
         data = self._get(
@@ -248,7 +255,19 @@ class CheckoClient:
             },
         )
         records = data.get("Записи") or []
-        return [item for item in records if isinstance(item, dict)]
+        try:
+            current_page = max(int(data.get("СтрТекущ") or page), 1)
+        except (TypeError, ValueError):
+            current_page = max(page, 1)
+        try:
+            total_pages = max(int(data.get("СтрВсего") or current_page), 1)
+        except (TypeError, ValueError):
+            total_pages = current_page
+        return SearchPage(
+            records=[item for item in records if isinstance(item, dict)],
+            current_page=current_page,
+            total_pages=total_pages,
+        )
 
     def get_company(self, inn: str) -> CompanyPayload:
         return parse_company_payload(self._get("/company", {"inn": inn}))
