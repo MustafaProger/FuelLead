@@ -2,6 +2,7 @@ import type {
   CompanyDetail,
   CompanyListResponse,
   CompanyStatus,
+  ContactType,
   DashboardResponse,
   EmailPreview,
   EmailSendResult,
@@ -75,6 +76,20 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ status }),
     }),
+  addContact: (id: number, contactType: ContactType, value: string) =>
+    request<CompanyDetail>(`/companies/${id}/contacts`, {
+      method: "POST",
+      body: JSON.stringify({ contact_type: contactType, value }),
+    }),
+  deleteContact: (id: number, contactId: number) =>
+    request<CompanyDetail>(`/companies/${id}/contacts/${contactId}`, {
+      method: "DELETE",
+    }),
+  deleteCompany: (id: number) =>
+    request<{ deleted: true; excluded_from_discovery: true; id: number; inn: string; name: string }>(
+      `/companies/${id}`,
+      { method: "DELETE" },
+    ),
   startSearch: (okvedCodes: string[], limitPerCode = 10) =>
     request<SearchRun>("/search-runs", {
       method: "POST",

@@ -3,7 +3,7 @@ from datetime import date
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import DEFAULT_OKVED_CODES
-from app.models import ALL_STATUSES
+from app.models import ALL_STATUSES, CONTACT_TYPES
 
 
 class AuthLoginRequest(BaseModel):
@@ -28,6 +28,19 @@ class StatusUpdate(BaseModel):
         if value not in ALL_STATUSES:
             raise ValueError(f"Status must be one of: {', '.join(ALL_STATUSES)}")
         return value
+
+
+class ContactCreate(BaseModel):
+    contact_type: str
+    value: str = Field(min_length=1, max_length=320)
+
+    @field_validator("contact_type")
+    @classmethod
+    def validate_contact_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in CONTACT_TYPES:
+            raise ValueError(f"Contact type must be one of: {', '.join(CONTACT_TYPES)}")
+        return normalized
 
 
 class SearchRunCreate(BaseModel):

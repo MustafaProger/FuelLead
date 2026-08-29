@@ -17,6 +17,9 @@ HEADERS = [
     "Additional OKVED codes",
     "Email",
     "Email source",
+    "Phone",
+    "WhatsApp",
+    "Telegram",
     "Discovery date",
     "Discovery time",
     "Status",
@@ -28,7 +31,8 @@ def build_xlsx(companies: list[Company], settings: Settings) -> bytes:
     sheet = workbook.active
     sheet.title = "FuelLead"
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:J{max(len(companies) + 1, 2)}"
+    last_column = get_column_letter(len(HEADERS))
+    sheet.auto_filter.ref = f"A1:{last_column}{max(len(companies) + 1, 2)}"
 
     sheet.append(HEADERS)
     for cell in sheet[1]:
@@ -47,6 +51,12 @@ def build_xlsx(companies: list[Company], settings: Settings) -> bytes:
         )
         emails = "\n".join(item.email for item in company.emails)
         sources = "\n".join(sorted({item.source for item in company.emails}))
+        contacts_by_type = {
+            contact_type: "\n".join(
+                item.value for item in company.contacts if item.contact_type == contact_type
+            )
+            for contact_type in ("phone", "whatsapp", "telegram")
+        }
         sheet.append(
             [
                 company.name,
@@ -56,13 +66,16 @@ def build_xlsx(companies: list[Company], settings: Settings) -> bytes:
                 additional,
                 emails,
                 sources,
+                contacts_by_type["phone"],
+                contacts_by_type["whatsapp"],
+                contacts_by_type["telegram"],
                 discovered.date().isoformat(),
                 discovered.strftime("%H:%M"),
                 company.status,
             ]
         )
 
-    widths = [34, 14, 17, 44, 56, 34, 24, 16, 12, 14]
+    widths = [34, 14, 17, 44, 56, 34, 24, 20, 20, 20, 16, 12, 14]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
     for row in sheet.iter_rows(min_row=2):
@@ -72,4 +85,3 @@ def build_xlsx(companies: list[Company], settings: Settings) -> bytes:
     stream = BytesIO()
     workbook.save(stream)
     return stream.getvalue()
-

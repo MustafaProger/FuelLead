@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from app.config import Settings
 from app.models import Company, SearchRun
 from app.services.checko import redact_sensitive_url
+from app.services.contacts import contact_href
 
 
 def as_aware(value: datetime) -> datetime:
@@ -30,6 +31,16 @@ def company_to_dict(company: Company, settings: Settings, *, detailed: bool = Fa
             }
             for email in company.emails
         ],
+        "contacts": [
+            {
+                "id": contact.id,
+                "contact_type": contact.contact_type,
+                "value": contact.value,
+                "source": contact.source,
+                "href": contact_href(contact.contact_type, contact.value),
+            }
+            for contact in sorted(company.contacts, key=lambda item: (item.contact_type, item.id))
+        ],
         "first_discovered_at": as_aware(company.first_discovered_at).astimezone(settings.timezone).isoformat(),
         "last_checked_at": as_aware(company.last_checked_at).astimezone(settings.timezone).isoformat(),
         "last_updated_at": as_aware(company.last_updated_at).astimezone(settings.timezone).isoformat(),
@@ -48,7 +59,11 @@ def company_to_dict(company: Company, settings: Settings, *, detailed: bool = Fa
                 "to_status": event.to_status,
                 "created_at": as_aware(event.created_at).astimezone(settings.timezone).isoformat(),
             }
-            for event in company.history
+            for event in sorted(
+                company.history,
+                key=lambda item: (as_aware(item.created_at), item.id or 0),
+                reverse=True,
+            )
         ]
     return payload
 

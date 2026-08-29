@@ -14,6 +14,7 @@ import type {
   Company,
   CompanyDetail,
   CompanyStatus,
+  ContactType,
   Filters,
   Health,
   SearchRun,
@@ -168,6 +169,31 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
     }
   };
 
+  const applyCompanyUpdate = (updated: CompanyDetail) => {
+    setCompanies((items) => items.map((company) => company.id === updated.id ? updated : company));
+    setDetail(updated);
+  };
+
+  const handleContactAdd = async (companyId: number, contactType: ContactType, value: string) => {
+    applyCompanyUpdate(await api.addContact(companyId, contactType, value));
+  };
+
+  const handleContactDelete = async (companyId: number, contactId: number) => {
+    applyCompanyUpdate(await api.deleteContact(companyId, contactId));
+  };
+
+  const handleCompanyDelete = async (company: CompanyDetail) => {
+    await api.deleteCompany(company.id);
+    setCompanies((items) => items.filter((item) => item.id !== company.id));
+    setExpandedId(null);
+    setDetail(null);
+    if (companies.length === 1 && page > 1) {
+      setPage((current) => current - 1);
+    } else {
+      setRefreshToken((value) => value + 1);
+    }
+  };
+
   return (
     <div className="workspace-shell">
       <AppSidebar
@@ -237,6 +263,9 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
               detailLoading={detailLoading}
               onToggle={handleToggle}
               onStatusChange={handleStatusChange}
+              onContactAdd={handleContactAdd}
+              onContactDelete={handleContactDelete}
+              onCompanyDelete={handleCompanyDelete}
               onPageChange={setPage}
             />
           </div>

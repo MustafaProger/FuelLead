@@ -1,12 +1,15 @@
 from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
+from app.config import Settings
 from app.models import (
     ActivityHistory,
     Company,
+    CompanyContact,
     CompanyEmail,
     CompanyOkved,
     DiscoveryCursor,
+    ExcludedCompany,
     SearchRun,
 )
 from app.services.checko import CompanyPayload, OkvedItem, SearchPage
@@ -15,9 +18,11 @@ from app.services.discovery import (
     discover_new_companies,
     fail_interrupted_search_runs,
     is_target_region,
+    run_discovery,
     sanitize_search_run_errors,
     upsert_company,
 )
+from app.services.demo_data import DEMO_COMPANIES
 
 
 def make_payload(emails: list[str]) -> CompanyPayload:
@@ -123,6 +128,22 @@ def test_upsert_deduplicates_repeated_additional_okveds(db):
     assert okved.name == "Строительство дорог"
 
 
+def test_upsert_adds_provider_phones_without_duplicates(db):
+    payload = make_payload([])
+    payload.phone_numbers = ["+74951234567", "+74951234567"]
+
+    upsert_company(db, payload)
+    db.commit()
+    upsert_company(db, payload)
+    db.commit()
+
+    contact = db.scalar(select(CompanyContact))
+    assert db.scalar(select(func.count(CompanyContact.id))) == 1
+    assert contact.contact_type == "phone"
+    assert contact.value == "+74951234567"
+    assert contact.source == "Checko API"
+
+
 def test_interrupted_search_runs_are_marked_failed(db):
     pending = SearchRun(status="pending", requested_okved_codes=["42.11"])
     running = SearchRun(status="running", requested_okved_codes=["49.41"])
@@ -202,3 +223,34 @@ def test_known_inn_is_skipped_before_company_request_and_next_page_is_used(db):
     assert run.companies_updated == 0
     assert client.company_calls == ["7701000002"]
     assert [call[3] for call in client.search_calls if call[1] == "77"] == [1, 2]
+
+
+def test_excluded_inn_is_skipped_before_company_request(db):
+    db.add(ExcludedCompany(inn="7701000001", name='ООО "УДАЛЕНА"'))
+    run = SearchRun(status="running", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    client = FakePaginatedCheckoClient(["7701000001"])
+
+    assert discover_new_companies(db, run, client, limit_per_code=1) is False
+
+    assert run.companies_created == 0
+    assert client.company_calls == []
+
+
+def test_demo_discovery_also_skips_excluded_inn(db, monkeypatch):
+    excluded_inn = DEMO_COMPANIES[0].inn
+    db.add(ExcludedCompany(inn=excluded_inn, name=DEMO_COMPANIES[0].name))
+    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
+
+    run_discovery(run.id, Settings(_env_file=None, checko_api_key=""), limit_per_code=1)
+
+    db.expire_all()
+    stored_run = db.get(SearchRun, run.id)
+    assert stored_run.status == "completed"
+    assert stored_run.companies_created == 1
+    assert db.scalar(select(Company.inn)) != excluded_inn

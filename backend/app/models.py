@@ -32,6 +32,7 @@ ALL_STATUSES = (
     "error",
 )
 MVP_STATUSES = ("new", "checked", "ready")
+CONTACT_TYPES = ("phone", "whatsapp", "telegram")
 
 
 class Company(Base):
@@ -66,6 +67,9 @@ class Company(Base):
     emails: Mapped[list["CompanyEmail"]] = relationship(
         back_populates="company", cascade="all, delete-orphan", lazy="selectin"
     )
+    contacts: Mapped[list["CompanyContact"]] = relationship(
+        back_populates="company", cascade="all, delete-orphan", lazy="selectin"
+    )
     additional_okveds: Mapped[list["CompanyOkved"]] = relationship(
         back_populates="company", cascade="all, delete-orphan", lazy="selectin"
     )
@@ -88,6 +92,41 @@ class CompanyEmail(Base):
     first_discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     company: Mapped[Company] = relationship(back_populates="emails")
+
+
+class CompanyContact(Base):
+    __tablename__ = "company_contacts"
+    __table_args__ = (
+        UniqueConstraint("company_id", "contact_type", "value", name="uq_company_contact"),
+        CheckConstraint(
+            "contact_type IN ('phone','whatsapp','telegram')",
+            name="ck_company_contacts_type",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    company_id: Mapped[int] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), index=True
+    )
+    contact_type: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    value: Mapped[str] = mapped_column(String(320), nullable=False)
+    source: Mapped[str] = mapped_column(String(100), default="Вручную", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    company: Mapped[Company] = relationship(back_populates="contacts")
+
+
+class ExcludedCompany(Base):
+    __tablename__ = "excluded_companies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inn: Mapped[str] = mapped_column(String(12), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(400), nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class CompanyOkved(Base):

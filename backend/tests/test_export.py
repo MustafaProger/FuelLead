@@ -4,6 +4,7 @@ from openpyxl import load_workbook
 
 from app.config import Settings
 from app.export import build_xlsx
+from app.models import CompanyContact
 from app.services.checko import CompanyPayload, OkvedItem
 from app.services.discovery import upsert_company
 
@@ -21,6 +22,14 @@ def test_xlsx_export_contains_company_and_multiple_emails(db):
         ),
     )
     db.commit()
+    company.contacts.extend(
+        [
+            CompanyContact(contact_type="phone", value="+74951234567", source="Checko API"),
+            CompanyContact(contact_type="whatsapp", value="+79991234567", source="Вручную"),
+            CompanyContact(contact_type="telegram", value="@export_company", source="Вручную"),
+        ]
+    )
+    db.commit()
 
     content = build_xlsx([company], Settings())
     workbook = load_workbook(BytesIO(content))
@@ -30,4 +39,6 @@ def test_xlsx_export_contains_company_and_multiple_emails(db):
     assert sheet["B2"].value == "7707654321"
     assert "one@example.ru" in sheet["F2"].value
     assert "two@example.ru" in sheet["F2"].value
-
+    assert sheet["H2"].value == "+74951234567"
+    assert sheet["I2"].value == "+79991234567"
+    assert sheet["J2"].value == "@export_company"

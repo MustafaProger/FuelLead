@@ -34,6 +34,7 @@ class CompanyPayload:
     primary_okved: OkvedItem | None
     additional_okveds: list[OkvedItem] = field(default_factory=list)
     emails: list[str] = field(default_factory=list)
+    phone_numbers: list[str] = field(default_factory=list)
     is_active: bool = True
     region_code: str | None = None
     region_name: str | None = None
@@ -88,6 +89,18 @@ def parse_company_payload(data: dict[str, Any]) -> CompanyPayload:
             if isinstance(value, str) and (normalized := normalize_email(value))
         }
     )
+    raw_phones = contacts.get("Тел") or [] if isinstance(contacts, dict) else []
+    if isinstance(raw_phones, str):
+        raw_phones = [raw_phones]
+    from app.services.contacts import normalize_phone
+
+    phone_numbers = sorted(
+        {
+            normalized
+            for value in raw_phones
+            if isinstance(value, str) and (normalized := normalize_phone(value))
+        }
+    )
 
     status_raw = data.get("Статус") or ""
     status_name = status_raw.get("Наим", "") if isinstance(status_raw, dict) else str(status_raw)
@@ -110,6 +123,7 @@ def parse_company_payload(data: dict[str, Any]) -> CompanyPayload:
         primary_okved=primary,
         additional_okveds=list(additional_by_code.values()),
         emails=emails,
+        phone_numbers=phone_numbers,
         is_active=is_active,
         region_code=region_code,
         region_name=region_name,

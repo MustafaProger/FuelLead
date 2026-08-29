@@ -13,11 +13,19 @@ from app.auth import AUTH_COOKIE_NAME, create_session_token, credentials_match, 
 from app.config import DEFAULT_OKVED_CODES, TARGET_REGION_CODES, Settings, get_settings
 from app.database import SessionLocal, create_database, get_db
 from app.export import build_xlsx
-from app.models import ALL_STATUSES, ActivityHistory, Company, SearchRun
+from app.models import (
+    ALL_STATUSES,
+    ActivityHistory,
+    Company,
+    CompanyContact,
+    ExcludedCompany,
+    SearchRun,
+)
 from app.queries import build_company_query
 from app.schemas import (
     AuthLoginRequest,
     CompanyFilters,
+    ContactCreate,
     EmailPreviewRequest,
     EmailSendRequest,
     EmailTemplateUpdate,
@@ -26,6 +34,7 @@ from app.schemas import (
 )
 from app.serializers import as_aware, company_to_dict, search_run_to_dict
 from app.services.checko import normalize_email
+from app.services.contacts import CONTACT_TYPE_LABELS, normalize_contact_value
 from app.services.discovery import fail_interrupted_search_runs, run_discovery, sanitize_search_run_errors
 from app.services.email_templates import (
     company_template_values,
@@ -263,6 +272,102 @@ def update_company_status(
         )
         db.commit()
     return company_to_dict(company, settings, detailed=True)
+
+
+@app.post("/api/companies/{company_id}/contacts", status_code=201)
+def add_company_contact(
+    company_id: int,
+    contact: ContactCreate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Компания не найдена")
+    try:
+        normalized = normalize_contact_value(contact.contact_type, contact.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if any(
+        item.contact_type == contact.contact_type and item.value == normalized
+        for item in company.contacts
+    ):
+        raise HTTPException(status_code=409, detail="Такой контакт уже добавлен")
+
+    company.contacts.append(
+        CompanyContact(
+            contact_type=contact.contact_type,
+            value=normalized,
+            source="Вручную",
+        )
+    )
+    company.last_updated_at = datetime.now(timezone.utc)
+    db.add(
+        ActivityHistory(
+            company=company,
+            event_type="contact_added",
+            description=f"{CONTACT_TYPE_LABELS[contact.contact_type]} {normalized} добавлен вручную",
+            event_data={"contact_type": contact.contact_type, "value": normalized},
+        )
+    )
+    db.commit()
+    return company_to_dict(company, settings, detailed=True)
+
+
+@app.delete("/api/companies/{company_id}/contacts/{contact_id}")
+def delete_company_contact(
+    company_id: int,
+    contact_id: int,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Компания не найдена")
+    contact = next((item for item in company.contacts if item.id == contact_id), None)
+    if contact is None:
+        raise HTTPException(status_code=404, detail="Контакт не найден")
+    if contact.source != "Вручную":
+        raise HTTPException(
+            status_code=422,
+            detail="Контакт из Checko обновляется автоматически и не удаляется вручную",
+        )
+
+    label = CONTACT_TYPE_LABELS[contact.contact_type]
+    value = contact.value
+    company.contacts.remove(contact)
+    company.last_updated_at = datetime.now(timezone.utc)
+    db.add(
+        ActivityHistory(
+            company=company,
+            event_type="contact_deleted",
+            description=f"{label} {value} удалён",
+            event_data={"contact_type": contact.contact_type, "value": value},
+        )
+    )
+    db.commit()
+    return company_to_dict(company, settings, detailed=True)
+
+
+@app.delete("/api/companies/{company_id}")
+def delete_company(
+    company_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Компания не найдена")
+
+    excluded = db.scalar(select(ExcludedCompany).where(ExcludedCompany.inn == company.inn))
+    if excluded is None:
+        db.add(ExcludedCompany(inn=company.inn, name=company.name))
+    else:
+        excluded.name = company.name
+        excluded.deleted_at = datetime.now(timezone.utc)
+    deleted = {"id": company.id, "inn": company.inn, "name": company.name}
+    db.delete(company)
+    db.commit()
+    return {"deleted": True, "excluded_from_discovery": True, **deleted}
 
 
 def _company_recipient(company: Company, requested_recipient: str | None) -> str:

@@ -14,6 +14,16 @@ export interface EmailAddress {
   source: string;
 }
 
+export type ContactType = "phone" | "whatsapp" | "telegram";
+
+export interface CompanyContact {
+  id: number;
+  contact_type: ContactType;
+  value: string;
+  source: string;
+  href: string;
+}
+
 export interface Okved {
   code: string | null;
   name: string | null;
@@ -29,6 +39,7 @@ export interface Company {
   is_active: boolean;
   status: CompanyStatus;
   emails: EmailAddress[];
+  contacts: CompanyContact[];
   first_discovered_at: string;
   last_checked_at: string;
   last_updated_at: string;

@@ -9,9 +9,11 @@ from app.database import SessionLocal
 from app.models import (
     ActivityHistory,
     Company,
+    CompanyContact,
     CompanyEmail,
     CompanyOkved,
     DiscoveryCursor,
+    ExcludedCompany,
     SearchRun,
 )
 from app.services.checko import (
@@ -185,6 +187,28 @@ def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko A
             existing_emails.add(normalized)
             company.last_updated_at = now
 
+    existing_phones = {
+        item.value for item in company.contacts if item.contact_type == "phone"
+    }
+    for phone_number in payload.phone_numbers:
+        if phone_number not in existing_phones:
+            company.contacts.append(
+                CompanyContact(
+                    contact_type="phone",
+                    value=phone_number,
+                    source=source,
+                )
+            )
+            add_history(
+                db,
+                company,
+                "contact_discovered",
+                f"Телефон {phone_number} обнаружен",
+                event_data={"contact_type": "phone", "value": phone_number},
+            )
+            existing_phones.add(phone_number)
+            company.last_updated_at = now
+
     db.flush()
     return company, created
 
@@ -261,6 +285,7 @@ def discover_new_companies(
     Returns True when the provider made further discovery impossible for this run.
     """
     known_inns = set(db.scalars(select(Company.inn)).all())
+    known_inns.update(db.scalars(select(ExcludedCompany.inn)).all())
     seen_inns: set[str] = set()
 
     for code in run.requested_okved_codes:
@@ -394,7 +419,10 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
     try:
         if not settings.checko_configured:
             run.mode = "demo"
-            demo_items = DEMO_COMPANIES[:limit_per_code]
+            excluded_inns = set(db.scalars(select(ExcludedCompany.inn)).all())
+            demo_items = [
+                payload for payload in DEMO_COMPANIES if payload.inn not in excluded_inns
+            ][:limit_per_code]
             run.candidates_found = len(demo_items)
             for payload in demo_items:
                 _, created = upsert_company(db, payload, source="Демонстрационные данные")

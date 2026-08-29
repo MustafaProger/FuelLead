@@ -1,5 +1,5 @@
-import { Building2, ChevronDown, ChevronLeft, ChevronRight, Mail } from "lucide-react";
-import type { Company, CompanyDetail, CompanyStatus } from "../types";
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Mail, MessageCircle, Phone, Send } from "lucide-react";
+import type { Company, CompanyDetail, CompanyStatus, ContactType } from "../types";
 import { CompanyDetails } from "./CompanyDetails";
 
 interface CompanyTableProps {
@@ -13,6 +13,9 @@ interface CompanyTableProps {
   detailLoading: boolean;
   onToggle: (id: number) => void;
   onStatusChange: (id: number, status: CompanyStatus) => void;
+  onContactAdd: (companyId: number, contactType: ContactType, value: string) => Promise<void>;
+  onContactDelete: (companyId: number, contactId: number) => Promise<void>;
+  onCompanyDelete: (company: CompanyDetail) => Promise<void>;
   onPageChange: (page: number) => void;
 }
 
@@ -59,7 +62,7 @@ export function CompanyTable(props: CompanyTableProps) {
               <th>Компания</th>
               <th>ИНН / ОГРН</th>
               <th>Основной ОКВЭД</th>
-              <th>Email</th>
+              <th>Связь</th>
               <th>Обнаружена</th>
               <th>Статус</th>
             </tr>
@@ -97,6 +100,9 @@ function CompanyRow({
   detailLoading,
   onToggle,
   onStatusChange,
+  onContactAdd,
+  onContactDelete,
+  onCompanyDelete,
 }: CompanyTableProps & { company: Company }) {
   const expanded = expandedId === company.id;
   return (
@@ -120,13 +126,25 @@ function CompanyRow({
           <strong>{company.primary_okved.code || "—"}</strong>
           <span>{company.primary_okved.name || "Не указан"}</span>
         </td>
-        <td data-label="Email" className="email-cell">
+        <td data-label="Связь" className="email-cell contact-summary-cell">
           {company.emails.length ? company.emails.map((email) => (
             <span key={email.id}>
-              <a href={`mailto:${email.email}`}>{email.email}</a>
+              <a href={`mailto:${email.email}`}><Mail size={12} /> {email.email}</a>
               <small>{email.source}</small>
             </span>
-          )) : <span className="not-found">Не найден</span>}
+          )) : null}
+          {company.contacts.map((contact) => (
+            <span key={contact.id}>
+              <a href={contact.href} target={contact.contact_type === "phone" ? undefined : "_blank"} rel="noreferrer">
+                {contact.contact_type === "phone" ? <Phone size={12} /> : null}
+                {contact.contact_type === "whatsapp" ? <MessageCircle size={12} /> : null}
+                {contact.contact_type === "telegram" ? <Send size={12} /> : null}
+                {contact.value}
+              </a>
+              <small>{contact.contact_type === "phone" ? "Телефон" : contact.contact_type === "whatsapp" ? "WhatsApp" : "Telegram"}</small>
+            </span>
+          ))}
+          {!company.emails.length && !company.contacts.length ? <span className="not-found">Не найдено</span> : null}
         </td>
         <td data-label="Обнаружена" className="date-cell">{formatDiscovered(company.first_discovered_at)}</td>
         <td data-label="Статус">
@@ -143,7 +161,13 @@ function CompanyRow({
       {expanded && (
         <tr className="details-row">
           <td colSpan={6}>
-            <CompanyDetails detail={detail?.id === company.id ? detail : null} loading={detailLoading} />
+            <CompanyDetails
+              detail={detail?.id === company.id ? detail : null}
+              loading={detailLoading}
+              onContactAdd={onContactAdd}
+              onContactDelete={onContactDelete}
+              onCompanyDelete={onCompanyDelete}
+            />
           </td>
         </tr>
       )}

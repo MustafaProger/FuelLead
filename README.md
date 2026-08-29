@@ -7,7 +7,9 @@
 - поиск организаций через Checko API по основным и дополнительным ОКВЭД (`codes=all`);
 - проверка действующего статуса компании;
 - получение названия, ИНН, ОГРН, основного и дополнительных ОКВЭД;
-- получение нуля, одного или нескольких email из `Контакты → Емэйл`;
+- получение email и телефонов из `Контакты → Емэйл` / `Контакты → Тел`;
+- ручное добавление телефона, WhatsApp и Telegram в карточке компании;
+- удаление компании с сохранением ИНН во внутреннем стоп-листе, чтобы поиск не вернул её обратно;
 - PostgreSQL как основная база, подключение только через переменные окружения;
 - дедупликация компаний по ИНН и email внутри компании;
 - продолжение поиска со следующей страницы Checko для каждой пары «ОКВЭД + регион»;
@@ -199,6 +201,9 @@ npm run build
 - `GET /api/companies` — список, статистика и фильтры;
 - `GET /api/companies/{id}` — карточка, дополнительные ОКВЭД и история;
 - `PATCH /api/companies/{id}/status` — смена статуса;
+- `POST /api/companies/{id}/contacts` — добавление телефона, WhatsApp или Telegram;
+- `DELETE /api/companies/{id}/contacts/{contact_id}` — удаление ручного контакта;
+- `DELETE /api/companies/{id}` — удаление компании и добавление ИНН в стоп-лист;
 - `GET /api/dashboard` — показатели, воронка, активность и последние компании;
 - `GET /api/email-template` — текущий основной шаблон и список переменных;
 - `PUT /api/email-template` — сохранение основного шаблона;
@@ -219,5 +224,6 @@ FuelLead/
 └── README.md
 ```
 
-Таблицы базы: `companies`, `company_emails`, `company_okveds`, `activity_history`,
-`search_runs`, `discovery_cursors`, `email_templates`.
+Таблицы базы: `companies`, `company_emails`, `company_contacts`, `company_okveds`,
+`activity_history`, `excluded_companies`, `search_runs`, `discovery_cursors`,
+`email_templates`.

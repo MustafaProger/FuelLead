@@ -14,7 +14,10 @@ def test_parse_company_payload_reads_checko_russian_keys():
             "Регион": {"Код": "77", "Наим": "Москва"},
             "ОКВЭД": {"Код": "49.41", "Наим": "Грузовой автотранспорт"},
             "ОКВЭДДоп": [{"Код": "77.32", "Наим": "Аренда строительных машин"}],
-            "Контакты": {"Емэйл": [" INFO@Test.ru ", "info@test.ru", "bad address"]},
+            "Контакты": {
+                "Емэйл": [" INFO@Test.ru ", "info@test.ru", "bad address"],
+                "Тел": ["+7 (495) 123-45-67", "8 495 123-45-67", "короткий 123"],
+            },
         }
     )
 
@@ -23,6 +26,7 @@ def test_parse_company_payload_reads_checko_russian_keys():
     assert payload.primary_okved.code == "49.41"
     assert payload.additional_okveds[0].code == "77.32"
     assert payload.emails == ["info@test.ru"]
+    assert payload.phone_numbers == ["+74951234567"]
     assert payload.region_code == "77"
     assert payload.region_name == "Москва"
 
