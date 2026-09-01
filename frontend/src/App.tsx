@@ -1,5 +1,5 @@
-import { Database, Download, Mail, RefreshCw, Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Database, Mail, RefreshCw, Search, Send } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { AuthPage } from "./components/AuthPage";
@@ -8,6 +8,7 @@ import { DashboardPage } from "./components/DashboardPage";
 import { EmailTemplatePage } from "./components/EmailTemplatePage";
 import { FiltersBar } from "./components/FiltersBar";
 import { Notice } from "./components/Notice";
+import { OutreachDialog } from "./components/OutreachDialog";
 import { SearchRunNotice } from "./components/SearchRunNotice";
 import { StatsStrip } from "./components/StatsStrip";
 import type {
@@ -58,7 +59,11 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [searchRun, setSearchRun] = useState<SearchRun | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [sendingEmailId, setSendingEmailId] = useState<number | null>(null);
+  const [emailSuccess, setEmailSuccess] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [outreachOpen, setOutreachOpen] = useState(false);
+  const [outreachFilters, setOutreachFilters] = useState<Filters>(defaultFilters);
 
   useEffect(() => {
     const handleHashChange = () => setActivePage(pageFromHash());
@@ -119,7 +124,15 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   }, [searchRun?.id, searchRun?.status]);
 
   const searching = searchRun?.status === "pending" || searchRun?.status === "running";
-  const exportUrl = useMemo(() => api.exportUrl(filters), [filters]);
+
+  const openOutreach = (selectionFilters: Filters) => {
+    setOutreachFilters(selectionFilters);
+    setOutreachOpen(true);
+  };
+
+  const handleOutreachChanged = useCallback(() => {
+    setRefreshToken((value) => value + 1);
+  }, []);
 
   const handleSearch = async () => {
     try {
@@ -195,6 +208,23 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
     }
   };
 
+  const handleSendEmail = async (company: Company) => {
+    setSendingEmailId(company.id);
+    setEmailSuccess(null);
+    setError(null);
+    try {
+      const result = await api.sendTemplateEmail(company.id);
+      setCompanies((items) => items.map((item) => item.id === company.id ? { ...item, status: "sent" } : item));
+      if (detail?.id === company.id) setDetail({ ...detail, status: "sent" });
+      setEmailSuccess(`Отправлено писем: ${result.sent_count}. Адреса: ${result.recipients.join(", ")}`);
+      setRefreshToken((value) => value + 1);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Не удалось отправить письмо");
+    } finally {
+      setSendingEmailId(null);
+    }
+  };
+
   return (
     <div className="workspace-shell">
       <AppSidebar
@@ -207,12 +237,12 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
       <main className="workspace-main">
         {activePage === "dashboard" ? (
           <DashboardPage
-            exportUrl={exportUrl}
             searchError={searchError}
             searchRun={searchRun}
             searching={Boolean(searching)}
             refreshToken={refreshToken}
             onSearch={handleSearch}
+            onOpenOutreach={() => openOutreach(defaultFilters)}
             onCloseSearchError={() => setSearchError(null)}
             onCloseSearchRun={() => setSearchRun(null)}
           />
@@ -226,9 +256,9 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
                 <p>Потенциальные клиенты с повышенным расходом топлива</p>
               </div>
               <div className="page-actions">
-                <a className="button button--secondary" href={exportUrl} aria-label="Экспортировать компании в Excel">
-                  <Download size={17} /> Экспорт
-                </a>
+                <button className="button button--secondary" type="button" onClick={() => openOutreach(filters)} aria-label="Открыть безопасную отправку писем">
+                  <Send size={17} /> Отправить письма
+                </button>
                 <button className="button button--primary" type="button" onClick={handleSearch} disabled={Boolean(searching)}>
                   {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
                   {searching ? "Идёт поиск…" : "Найти компании"}
@@ -244,6 +274,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
             </div>
 
             {error ? <Notice tone="error" title="Не удалось выполнить действие" description={error} onClose={() => setError(null)} /> : null}
+            {emailSuccess ? <Notice tone="success" title="Письмо отправлено" description={emailSuccess} onClose={() => setEmailSuccess(null)} /> : null}
             <SearchRunNotice
               error={searchError}
               run={searchRun}
@@ -267,6 +298,9 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
               onContactAdd={handleContactAdd}
               onContactDelete={handleContactDelete}
               onCompanyDelete={handleCompanyDelete}
+              gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+              sendingEmailId={sendingEmailId}
+              onSendEmail={handleSendEmail}
               onPageChange={setPage}
             />
           </div>
@@ -280,6 +314,13 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
           />
         ) : null}
       </main>
+      <OutreachDialog
+        open={outreachOpen}
+        filters={outreachFilters}
+        gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+        onClose={() => setOutreachOpen(false)}
+        onChanged={handleOutreachChanged}
+      />
     </div>
   );
 }

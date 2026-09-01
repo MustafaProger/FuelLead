@@ -53,6 +53,16 @@ class Settings(BaseSettings):
     gmail_client_secret: str = ""
     gmail_refresh_token: str = ""
     gmail_timeout_seconds: float = 30.0
+    outreach_campaign_size: int = Field(default=20, ge=1, le=100)
+    outreach_daily_limit: int = Field(default=20, ge=1, le=100)
+    outreach_hourly_limit: int = Field(default=5, ge=1, le=20)
+    outreach_min_interval_seconds: int = Field(default=300, ge=60, le=86_400)
+    outreach_max_per_domain_per_day: int = Field(default=2, ge=1, le=20)
+    outreach_worker_poll_seconds: int = Field(default=30, ge=5, le=300)
+    outreach_opt_out_text: str = (
+        "Если предложение неактуально, ответьте «Не писать», "
+        "и мы исключим адрес из дальнейших обращений."
+    )
     fuellead_auth_email: str = ""
     fuellead_auth_password: str = ""
     fuellead_auth_session_secret: str = ""
@@ -88,6 +98,10 @@ class Settings(BaseSettings):
             value.strip()
             for value in (self.gmail_client_id, self.gmail_client_secret, self.gmail_refresh_token)
         )
+
+    @property
+    def outreach_batch_limit(self) -> int:
+        return min(self.outreach_campaign_size, self.outreach_daily_limit)
 
     @property
     def auth_configured(self) -> bool:

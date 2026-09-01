@@ -1,14 +1,14 @@
-import { Download, Fuel, RefreshCw, Search } from "lucide-react";
+import { Fuel, RefreshCw, Search, Send } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
 interface HeaderProps {
   mode: DiscoveryProvider;
   searching: boolean;
-  exportUrl: string;
+  onOpenOutreach: () => void;
   onSearch: () => void;
 }
 
-export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
+export function Header({ mode, searching, onOpenOutreach, onSearch }: HeaderProps) {
   const providerLabel = mode === "combined"
     ? "Checko → API-ФНС подключены"
     : mode === "api_fns"
@@ -34,10 +34,10 @@ export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
             <span className="mode-dot" aria-hidden="true" />
             {providerLabel}
           </span>
-          <a className="button button--secondary" href={exportUrl} aria-label="Экспортировать компании в Excel">
-            <Download size={17} />
-            <span>Экспорт в Excel</span>
-          </a>
+          <button className="button button--secondary" type="button" onClick={onOpenOutreach} aria-label="Открыть безопасную отправку писем">
+            <Send size={17} />
+            <span>Отправить письма</span>
+          </button>
           <button
             className="button button--primary"
             type="button"

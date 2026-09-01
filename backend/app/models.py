@@ -33,6 +33,8 @@ ALL_STATUSES = (
 )
 MVP_STATUSES = ("new", "checked", "ready")
 CONTACT_TYPES = ("phone", "whatsapp", "telegram")
+OUTREACH_CAMPAIGN_STATUSES = ("running", "paused", "completed", "cancelled")
+OUTREACH_DELIVERY_STATUSES = ("queued", "sending", "sent", "failed", "cancelled")
 
 
 class Company(Base):
@@ -211,3 +213,78 @@ class EmailTemplate(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class OutreachCampaign(Base):
+    __tablename__ = "outreach_campaigns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','paused','completed','cancelled')",
+            name="ck_outreach_campaigns_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="running", nullable=False, index=True)
+    filters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    matched_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    recipient_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sent_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cancelled_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    daily_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    hourly_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    min_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_per_domain_per_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    pause_reason: Mapped[str | None] = mapped_column(Text)
+    next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+
+    deliveries: Mapped[list["OutreachDelivery"]] = relationship(
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="OutreachDelivery.id",
+    )
+
+
+class OutreachDelivery(Base):
+    __tablename__ = "outreach_deliveries"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "recipient", name="uq_outreach_campaign_recipient"),
+        CheckConstraint(
+            "status IN ('queued','sending','sent','failed','cancelled')",
+            name="ck_outreach_deliveries_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("outreach_campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    company_id: Mapped[int | None] = mapped_column(
+        ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    company_name: Mapped[str] = mapped_column(String(400), nullable=False)
+    company_inn: Mapped[str] = mapped_column(String(12), nullable=False)
+    recipient: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    recipient_domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False, index=True)
+    message_id: Mapped[str | None] = mapped_column(String(255), index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    campaign: Mapped[OutreachCampaign] = relationship(back_populates="deliveries")

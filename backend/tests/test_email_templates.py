@@ -81,7 +81,8 @@ def test_single_company_send_updates_status_and_history(db, monkeypatch):
         def send(self, recipient: str, subject: str, body: str) -> str:
             assert recipient == "office@artel.ru"
             assert subject == 'Предложение для ООО "АРТЕЛЬ"'
-            assert body == "Персональный текст"
+            assert body.startswith("Персональный текст")
+            assert "ответьте «Не писать»" in body
             return "message-123"
 
     monkeypatch.setattr(main, "GmailOAuthSender", FakeSender)
@@ -107,4 +108,43 @@ def test_single_company_send_updates_status_and_history(db, monkeypatch):
     assert result["message_id"] == "message-123"
     assert company.status == "sent"
     assert company.history[0].event_type == "email_sent"
+    assert company.history[0].event_data["recipient"] == "office@artel.ru"
+
+
+def test_company_send_without_recipient_uses_only_primary_company_email(db, monkeypatch):
+    company = make_company(db)
+    company.emails.append(CompanyEmail(email="sales@artel.ru", source="Checko API"))
+    db.commit()
+
+    class FakeSender:
+        sent: list[tuple[str, str, str]] = []
+
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def send(self, recipient: str, subject: str, body: str) -> str:
+            self.__class__.sent.append((recipient, subject, body))
+            return f"message-{recipient}"
+
+    monkeypatch.setattr(main, "GmailOAuthSender", FakeSender)
+    settings = Settings(
+        _env_file=None,
+        outreach_sender_email="sender@example.ru",
+        gmail_client_id="client-id",
+        gmail_client_secret="client-secret",
+        gmail_refresh_token="refresh-token",
+    )
+
+    result = main.send_company_email(company.id, EmailSendRequest(), db, settings)
+
+    assert [item[0] for item in FakeSender.sent] == ["office@artel.ru"]
+    assert result["recipients"] == ["office@artel.ru"]
+    assert result["sent_count"] == 1
+    assert len(company.history) == 1
     assert company.history[0].event_data["recipient"] == "office@artel.ru"

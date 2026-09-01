@@ -92,6 +92,7 @@ export interface Health {
   outreach_sender_email: string;
   gmail_auth_mode: "oauth2";
   gmail_oauth_configured: boolean;
+  outreach_policy: OutreachPolicy;
 }
 
 export interface SearchRun {
@@ -161,8 +162,65 @@ export interface EmailPreview {
 
 export interface EmailSendResult {
   message_id: string;
+  message_ids: string[];
   company_id: number;
   recipient: string;
+  recipients: string[];
+  sent_count: number;
   status: "sent";
   sent_at: string;
+}
+
+export interface OutreachPolicy {
+  campaign_limit?: number;
+  daily_limit: number;
+  hourly_limit: number;
+  min_interval_seconds: number;
+  max_per_domain_per_day: number;
+  eligible_status?: "ready";
+  primary_address_only?: boolean;
+  automatic_stop_on_provider_error?: boolean;
+  opt_out_footer_enabled?: boolean;
+}
+
+export interface OutreachPreflight {
+  matched_count: number;
+  eligible_count: number;
+  selected_count: number;
+  deferred_by_campaign_limit: number;
+  skipped: {
+    not_ready: number;
+    inactive: number;
+    without_email: number;
+    already_contacted: number;
+    duplicate_address: number;
+  };
+  sender_email: string;
+  gmail_configured: boolean;
+  policy: OutreachPolicy;
+  sample: {
+    company_name: string;
+    recipient: string;
+    subject: string;
+    body: string;
+  } | null;
+}
+
+export interface OutreachCampaign {
+  id: number;
+  status: "running" | "paused" | "completed" | "cancelled";
+  matched_count: number;
+  recipient_count: number;
+  sent_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  remaining_count: number;
+  progress_percent: number;
+  pause_reason: string | null;
+  next_send_at: string | null;
+  last_sent_at: string | null;
+  started_at: string;
+  completed_at: string | null;
+  created_at: string;
+  policy: OutreachPolicy;
 }

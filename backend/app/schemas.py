@@ -92,3 +92,18 @@ class EmailSendRequest(BaseModel):
     recipient: str | None = Field(default=None, max_length=320)
     subject: str | None = Field(default=None, max_length=998)
     body: str | None = Field(default=None, max_length=20_000)
+
+
+class OutreachPreflightRequest(BaseModel):
+    filters: CompanyFilters = Field(default_factory=CompanyFilters)
+
+
+class OutreachCampaignCreate(OutreachPreflightRequest):
+    confirmed: bool
+
+    @field_validator("confirmed")
+    @classmethod
+    def require_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Подтвердите проверку получателей перед запуском")
+        return value

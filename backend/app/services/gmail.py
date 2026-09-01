@@ -1,6 +1,8 @@
 import base64
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email.utils import format_datetime, make_msgid
+from datetime import datetime, timezone
 
 import httpx
 
@@ -8,7 +10,9 @@ from app.services.provider import normalize_email
 
 
 class GmailOAuthError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +97,14 @@ class GmailOAuthSender:
         message = EmailMessage()
         message["To"] = normalized_recipient
         message["From"] = normalized_sender
+        message["Reply-To"] = normalized_sender
         message["Subject"] = subject.strip()
+        message["Date"] = format_datetime(datetime.now(timezone.utc))
+        sender_domain = normalized_sender.rsplit("@", 1)[1]
+        message["Message-ID"] = make_msgid(domain=sender_domain)
+        message["List-Unsubscribe"] = (
+            f"<mailto:{normalized_sender}?subject=unsubscribe>"
+        )
         message.set_content(text_body)
         if html_body:
             message.add_alternative(html_body, subtype="html")
@@ -109,9 +120,15 @@ class GmailOAuthSender:
             raise GmailOAuthError("Не удалось отправить письмо через Gmail API") from exc
 
         if response.is_error:
-            raise GmailOAuthError(
-                "Gmail API отклонил отправку. Проверьте OAuth-доступ и лимиты аккаунта."
-            )
+            if response.status_code == 429:
+                message = "Gmail временно ограничил частоту или дневной объём отправки"
+            elif response.status_code in (401, 403):
+                message = "Gmail отклонил доступ или отправку. Проверьте OAuth и лимиты аккаунта"
+            elif response.status_code >= 500:
+                message = "Gmail временно недоступен для отправки"
+            else:
+                message = "Gmail API отклонил письмо"
+            raise GmailOAuthError(message, status_code=response.status_code)
         message_id = str(response.json().get("id") or "")
         if not message_id:
             raise GmailOAuthError("Gmail API не вернул идентификатор письма")

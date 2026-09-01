@@ -1,4 +1,5 @@
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
@@ -29,6 +30,8 @@ from app.schemas import (
     EmailPreviewRequest,
     EmailSendRequest,
     EmailTemplateUpdate,
+    OutreachCampaignCreate,
+    OutreachPreflightRequest,
     SearchRunCreate,
     StatusUpdate,
 )
@@ -42,6 +45,22 @@ from app.services.email_templates import (
     render_email_template,
 )
 from app.services.gmail import GmailOAuthConfig, GmailOAuthError, GmailOAuthSender
+from app.services.outreach import (
+    OutreachPolicyError,
+    active_outreach_campaign,
+    append_opt_out_footer,
+    assert_manual_send_allowed,
+    build_outreach_preflight,
+    cancel_outreach_campaign,
+    create_outreach_campaign,
+    outreach_campaign_to_dict,
+    outreach_policy_dict,
+    pause_outreach_campaign,
+    recover_interrupted_outreach,
+    resume_outreach_campaign,
+    run_outreach_worker,
+    wake_outreach_worker,
+)
 from app.services.provider import normalize_email
 
 
@@ -51,7 +70,14 @@ async def lifespan(_: FastAPI):
     with SessionLocal() as db:
         fail_interrupted_search_runs(db)
         sanitize_search_run_errors(db)
-    yield
+        recover_interrupted_outreach(db)
+    worker = asyncio.create_task(run_outreach_worker(get_settings()))
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 
 app = FastAPI(title="FuelLead API", version="0.1.0", lifespan=lifespan)
@@ -161,6 +187,7 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "outreach_sender_email": settings.outreach_sender_email,
         "gmail_auth_mode": "oauth2",
         "gmail_oauth_configured": settings.gmail_oauth_configured,
+        "outreach_policy": outreach_policy_dict(settings),
     }
 
 
@@ -387,16 +414,27 @@ def delete_company(
     return {"deleted": True, "excluded_from_discovery": True, **deleted}
 
 
-def _company_recipient(company: Company, requested_recipient: str | None) -> str:
+def _company_recipients(company: Company, requested_recipient: str | None) -> list[str]:
+    recipients: list[str] = []
+    seen: set[str] = set()
+    for item in company.emails:
+        normalized = normalize_email(item.email)
+        if normalized and normalized not in seen:
+            recipients.append(normalized)
+            seen.add(normalized)
+
     recipient = normalize_email(requested_recipient or "")
-    company_emails = {normalize_email(item.email) for item in company.emails}
-    if requested_recipient and recipient not in company_emails:
+    if requested_recipient and recipient not in seen:
         raise HTTPException(status_code=422, detail="Выбранный email не принадлежит компании")
     if recipient:
-        return recipient
-    if company.emails:
-        return normalize_email(company.emails[0].email)
+        return [recipient]
+    if recipients:
+        return [recipients[0]]
     raise HTTPException(status_code=422, detail="У компании нет email для отправки")
+
+
+def _company_recipient(company: Company, requested_recipient: str | None) -> str:
+    return _company_recipients(company, requested_recipient)[0]
 
 
 @app.get("/api/email-template")
@@ -441,7 +479,10 @@ def preview_email_template(
     values = company_template_values(company, recipient, settings)
     try:
         subject = render_email_template(request.subject_template or template.subject_template, values)
-        body = render_email_template(request.body_template or template.body_template, values)
+        body = append_opt_out_footer(
+            render_email_template(request.body_template or template.body_template, values),
+            settings,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
@@ -466,12 +507,17 @@ def send_company_email(
     if not settings.gmail_oauth_configured:
         raise HTTPException(status_code=503, detail="Gmail OAuth не настроен")
 
-    recipient = _company_recipient(company, request.recipient)
-    template = get_or_create_email_template(db)
-    values = company_template_values(company, recipient, settings)
+    recipients = _company_recipients(company, request.recipient)
     try:
-        subject = render_email_template(request.subject or template.subject_template, values).strip()
-        body = render_email_template(request.body or template.body_template, values).strip()
+        assert_manual_send_allowed(db, recipients[0], settings)
+    except OutreachPolicyError as exc:
+        detail = str(exc)
+        if exc.retry_at:
+            detail += f". После: {exc.retry_at.astimezone(settings.timezone).isoformat()}"
+        raise HTTPException(status_code=429, detail=detail) from exc
+    template = get_or_create_email_template(db)
+    sent_messages: list[tuple[str, str, str]] = []
+    try:
         config = GmailOAuthConfig(
             sender_email=settings.outreach_sender_email,
             client_id=settings.gmail_client_id,
@@ -480,31 +526,121 @@ def send_company_email(
             timeout_seconds=settings.gmail_timeout_seconds,
         )
         with GmailOAuthSender(config) as sender:
-            message_id = sender.send(recipient, subject, body)
+            for recipient in recipients:
+                values = company_template_values(company, recipient, settings)
+                subject = render_email_template(request.subject or template.subject_template, values).strip()
+                body = append_opt_out_footer(
+                    render_email_template(request.body or template.body_template, values),
+                    settings,
+                )
+                message_id = sender.send(recipient, subject, body)
+                sent_messages.append((recipient, message_id, subject))
     except (GmailOAuthError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     previous_status = company.status
     company.status = "sent"
     company.last_updated_at = datetime.now(timezone.utc)
-    db.add(
-        ActivityHistory(
-            company=company,
-            event_type="email_sent",
-            description=f"Письмо отправлено на {recipient}",
-            from_status=previous_status,
-            to_status="sent",
-            event_data={"recipient": recipient, "message_id": message_id, "subject": subject},
+    for recipient, message_id, subject in sent_messages:
+        db.add(
+            ActivityHistory(
+                company=company,
+                event_type="email_sent",
+                description=f"Письмо отправлено на {recipient}",
+                from_status=previous_status,
+                to_status="sent",
+                event_data={"recipient": recipient, "message_id": message_id, "subject": subject},
+            )
         )
-    )
     db.commit()
+    recipient, message_id, _ = sent_messages[0]
     return {
         "message_id": message_id,
+        "message_ids": [item[1] for item in sent_messages],
         "company_id": company.id,
         "recipient": recipient,
+        "recipients": [item[0] for item in sent_messages],
+        "sent_count": len(sent_messages),
         "status": company.status,
         "sent_at": datetime.now(settings.timezone).isoformat(),
     }
+
+
+def _campaign_or_404(db: Session, campaign_id: int):
+    from app.models import OutreachCampaign
+
+    campaign = db.get(OutreachCampaign, campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Рассылка не найдена")
+    return campaign
+
+
+@app.post("/api/outreach/preflight")
+def outreach_preflight(
+    request: OutreachPreflightRequest,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    return build_outreach_preflight(db, request.filters, settings)
+
+
+@app.get("/api/outreach/campaigns/active")
+def get_active_outreach_campaign(db: Session = Depends(get_db)) -> dict | None:
+    campaign = active_outreach_campaign(db)
+    return outreach_campaign_to_dict(campaign) if campaign else None
+
+
+@app.post("/api/outreach/campaigns", status_code=202)
+def start_outreach_campaign(
+    request: OutreachCampaignCreate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    try:
+        campaign = create_outreach_campaign(db, request.filters, settings)
+    except OutreachPolicyError as exc:
+        status_code = 503 if not settings.gmail_oauth_configured else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    wake_outreach_worker()
+    return outreach_campaign_to_dict(campaign)
+
+
+@app.get("/api/outreach/campaigns/{campaign_id}")
+def get_outreach_campaign(
+    campaign_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    return outreach_campaign_to_dict(_campaign_or_404(db, campaign_id))
+
+
+@app.post("/api/outreach/campaigns/{campaign_id}/pause")
+def pause_campaign(campaign_id: int, db: Session = Depends(get_db)) -> dict:
+    try:
+        campaign = pause_outreach_campaign(db, _campaign_or_404(db, campaign_id))
+    except OutreachPolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    wake_outreach_worker()
+    return outreach_campaign_to_dict(campaign)
+
+
+@app.post("/api/outreach/campaigns/{campaign_id}/resume")
+def resume_campaign(campaign_id: int, db: Session = Depends(get_db)) -> dict:
+    try:
+        campaign = resume_outreach_campaign(db, _campaign_or_404(db, campaign_id))
+    except OutreachPolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    wake_outreach_worker()
+    return outreach_campaign_to_dict(campaign)
+
+
+@app.post("/api/outreach/campaigns/{campaign_id}/cancel")
+def cancel_campaign(campaign_id: int, db: Session = Depends(get_db)) -> dict:
+    try:
+        campaign = cancel_outreach_campaign(db, _campaign_or_404(db, campaign_id))
+    except OutreachPolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    wake_outreach_worker()
+    return outreach_campaign_to_dict(campaign)
 
 
 @app.post("/api/search-runs", status_code=202)

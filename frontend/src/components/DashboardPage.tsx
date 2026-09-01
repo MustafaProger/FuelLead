@@ -2,7 +2,6 @@ import {
   ArrowRight,
   Building2,
   CheckCircle2,
-  Download,
   Mail,
   RefreshCw,
   Search,
@@ -16,12 +15,12 @@ import { Notice } from "./Notice";
 import { SearchRunNotice } from "./SearchRunNotice";
 
 interface DashboardPageProps {
-  exportUrl: string;
   searchError: string | null;
   searchRun: SearchRun | null;
   searching: boolean;
   refreshToken: number;
   onSearch: () => void;
+  onOpenOutreach: () => void;
   onCloseSearchError: () => void;
   onCloseSearchRun: () => void;
 }
@@ -51,12 +50,12 @@ function formatShortDate(value: string) {
 }
 
 export function DashboardPage({
-  exportUrl,
   searchError,
   searchRun,
   searching,
   refreshToken,
   onSearch,
+  onOpenOutreach,
   onCloseSearchError,
   onCloseSearchRun,
 }: DashboardPageProps) {
@@ -98,9 +97,9 @@ export function DashboardPage({
           <p>Воронка поиска и работы с потенциальными клиентами</p>
         </div>
         <div className="page-actions">
-          <a className="button button--secondary" href={exportUrl}>
-            <Download size={17} /> Экспорт
-          </a>
+          <button className="button button--secondary" type="button" onClick={onOpenOutreach}>
+            <Send size={17} /> Отправить письма
+          </button>
           <button className="button button--primary" type="button" onClick={onSearch} disabled={searching}>
             {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
             {searching ? "Идёт поиск…" : "Найти компании"}

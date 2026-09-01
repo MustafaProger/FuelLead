@@ -19,6 +19,8 @@ def test_gmail_sender_uses_oauth_and_sender_address():
         assert "From: artel.office8@gmail.com" in decoded
         assert "To: lead@example.ru" in decoded
         assert "Subject: FuelLead" in decoded
+        assert "Message-ID:" in decoded
+        assert "List-Unsubscribe: <mailto:artel.office8@gmail.com?subject=unsubscribe>" in decoded
         return httpx.Response(200, json={"id": "gmail-message-id"})
 
     config = GmailOAuthConfig(

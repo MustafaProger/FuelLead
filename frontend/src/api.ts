@@ -9,6 +9,8 @@ import type {
   EmailTemplate,
   Filters,
   Health,
+  OutreachCampaign,
+  OutreachPreflight,
   SearchRun,
 } from "./types";
 
@@ -54,6 +56,17 @@ export function filtersToParams(filters: Filters): URLSearchParams {
   if (filters.discoveredOn) params.set("discovered_on", filters.discoveredOn);
   if (filters.search.trim()) params.set("search", filters.search.trim());
   return params;
+}
+
+function filtersToPayload(filters: Filters) {
+  return {
+    status: filters.status || null,
+    has_email: filters.hasEmail ? filters.hasEmail === "true" : null,
+    email_provider: filters.emailProvider || null,
+    category: filters.category || null,
+    discovered_on: filters.discoveredOn || null,
+    search: filters.search.trim() || null,
+  };
 }
 
 export const api = {
@@ -122,5 +135,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ recipient, subject, body }),
     }),
+  sendTemplateEmail: (companyId: number) =>
+    request<EmailSendResult>(`/companies/${companyId}/send-email`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  outreachPreflight: (filters: Filters) =>
+    request<OutreachPreflight>("/outreach/preflight", {
+      method: "POST",
+      body: JSON.stringify({ filters: filtersToPayload(filters) }),
+    }),
+  activeOutreachCampaign: () =>
+    request<OutreachCampaign | null>("/outreach/campaigns/active"),
+  outreachCampaign: (id: number) =>
+    request<OutreachCampaign>(`/outreach/campaigns/${id}`),
+  startOutreachCampaign: (filters: Filters) =>
+    request<OutreachCampaign>("/outreach/campaigns", {
+      method: "POST",
+      body: JSON.stringify({ filters: filtersToPayload(filters), confirmed: true }),
+    }),
+  pauseOutreachCampaign: (id: number) =>
+    request<OutreachCampaign>(`/outreach/campaigns/${id}/pause`, { method: "POST" }),
+  resumeOutreachCampaign: (id: number) =>
+    request<OutreachCampaign>(`/outreach/campaigns/${id}/resume`, { method: "POST" }),
+  cancelOutreachCampaign: (id: number) =>
+    request<OutreachCampaign>(`/outreach/campaigns/${id}/cancel`, { method: "POST" }),
   exportUrl: (filters: Filters) => `${API_BASE}/export.xlsx?${filtersToParams(filters)}`,
 };
