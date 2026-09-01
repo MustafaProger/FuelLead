@@ -4,7 +4,7 @@ from email.message import EmailMessage
 
 import httpx
 
-from app.services.checko import normalize_email
+from app.services.provider import normalize_email
 
 
 class GmailOAuthError(RuntimeError):

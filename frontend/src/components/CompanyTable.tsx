@@ -105,6 +105,11 @@ function CompanyRow({
   onCompanyDelete,
 }: CompanyTableProps & { company: Company }) {
   const expanded = expandedId === company.id;
+  const summaryLimit = 3;
+  const visibleEmails = company.emails.slice(0, summaryLimit);
+  const visibleContacts = company.contacts.slice(0, summaryLimit - visibleEmails.length);
+  const hiddenContactCount = company.emails.length + company.contacts.length - visibleEmails.length - visibleContacts.length;
+
   return (
     <>
       <tr className={expanded ? "company-row company-row--expanded" : "company-row"}>
@@ -127,13 +132,13 @@ function CompanyRow({
           <span>{company.primary_okved.name || "Не указан"}</span>
         </td>
         <td data-label="Связь" className="email-cell contact-summary-cell">
-          {company.emails.length ? company.emails.map((email) => (
+          {visibleEmails.map((email) => (
             <span key={email.id}>
               <a href={`mailto:${email.email}`}><Mail size={12} /> {email.email}</a>
               <small>{email.source}</small>
             </span>
-          )) : null}
-          {company.contacts.map((contact) => (
+          ))}
+          {visibleContacts.map((contact) => (
             <span key={contact.id}>
               <a href={contact.href} target={contact.contact_type === "phone" ? undefined : "_blank"} rel="noreferrer">
                 {contact.contact_type === "phone" ? <Phone size={12} /> : null}
@@ -144,6 +149,17 @@ function CompanyRow({
               <small>{contact.contact_type === "phone" ? "Телефон" : contact.contact_type === "whatsapp" ? "WhatsApp" : "Telegram"}</small>
             </span>
           ))}
+          {hiddenContactCount > 0 ? (
+            <button
+              className="contact-overflow-button"
+              type="button"
+              aria-expanded={expanded}
+              aria-label={`Показать все способы связи компании ${company.name}`}
+              onClick={() => onToggle(company.id)}
+            >
+              Ещё {hiddenContactCount}
+            </button>
+          ) : null}
           {!company.emails.length && !company.contacts.length ? <span className="not-found">Не найдено</span> : null}
         </td>
         <td data-label="Обнаружена" className="date-cell">{formatDiscovered(company.first_discovered_at)}</td>

@@ -74,12 +74,20 @@ export interface CompanyListResponse {
   stats: Stats;
 }
 
+export type DiscoveryProvider = "checko" | "api_fns" | "combined" | "demo";
+
 export interface Health {
   status: string;
   app: string;
   checko_configured: boolean;
-  mode: "checko" | "demo";
+  checko_api_key_count: number;
+  checko_state: "selected" | "standby" | "not_configured";
+  api_fns_configured: boolean;
+  api_fns_request_budget_per_run: { search: number; egr: number };
+  selected_discovery_provider: DiscoveryProvider;
+  mode: DiscoveryProvider;
   default_okved_codes: string[];
+  target_region_codes: string[];
   discovery_limit_per_code: number;
   outreach_sender_email: string;
   gmail_auth_mode: "oauth2";
@@ -89,7 +97,7 @@ export interface Health {
 export interface SearchRun {
   id: number;
   status: "pending" | "running" | "completed" | "failed";
-  mode: "checko" | "demo";
+  mode: DiscoveryProvider;
   requested_okved_codes: string[];
   candidates_found: number;
   companies_created: number;
@@ -102,6 +110,7 @@ export interface SearchRun {
 export interface Filters {
   status: "" | CompanyStatus;
   hasEmail: "" | "true" | "false";
+  emailProvider: "" | "yandex" | "google" | "mail_ru" | "rambler" | "other";
   category: string;
   discoveredOn: string;
   search: string;

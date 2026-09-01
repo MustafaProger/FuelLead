@@ -1,10 +1,11 @@
 import { Building2, CheckCircle2, Fuel, LayoutDashboard, LogOut, Mail } from "lucide-react";
+import type { DiscoveryProvider } from "../types";
 
 export type AppPage = "dashboard" | "companies" | "template";
 
 interface AppSidebarProps {
   activePage: AppPage;
-  mode: "checko" | "demo";
+  mode: DiscoveryProvider;
   gmailConfigured: boolean;
   userEmail: string;
   onLogout: () => void;
@@ -17,6 +18,13 @@ const navigation = [
 ];
 
 export function AppSidebar({ activePage, mode, gmailConfigured, userEmail, onLogout }: AppSidebarProps) {
+  const providerLabel = mode === "combined"
+    ? "Checko → API-ФНС подключены"
+    : mode === "api_fns"
+      ? "API-ФНС подключён"
+      : mode === "checko"
+        ? "Checko подключён"
+        : "Демо-режим";
   return (
     <aside className="workspace-sidebar">
       <div className="sidebar-brand">
@@ -44,7 +52,7 @@ export function AppSidebar({ activePage, mode, gmailConfigured, userEmail, onLog
       <div className="sidebar-statuses">
         <div className="sidebar-status">
           <CheckCircle2 size={17} />
-          <span>{mode === "checko" ? "Checko подключён" : "Демо-режим"}</span>
+          <span>{providerLabel}</span>
         </div>
         <div className={`sidebar-status ${gmailConfigured ? "" : "sidebar-status--muted"}`}>
           <Mail size={17} />

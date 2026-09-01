@@ -49,6 +49,7 @@ export function filtersToParams(filters: Filters): URLSearchParams {
   const params = new URLSearchParams();
   if (filters.status) params.set("status", filters.status);
   if (filters.hasEmail) params.set("has_email", filters.hasEmail);
+  if (filters.emailProvider) params.set("email_provider", filters.emailProvider);
   if (filters.category) params.set("category", filters.category);
   if (filters.discoveredOn) params.set("discovered_on", filters.discoveredOn);
   if (filters.search.trim()) params.set("search", filters.search.trim());

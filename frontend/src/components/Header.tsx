@@ -1,13 +1,21 @@
 import { Download, Fuel, RefreshCw, Search } from "lucide-react";
+import type { DiscoveryProvider } from "../types";
 
 interface HeaderProps {
-  mode: "checko" | "demo";
+  mode: DiscoveryProvider;
   searching: boolean;
   exportUrl: string;
   onSearch: () => void;
 }
 
 export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
+  const providerLabel = mode === "combined"
+    ? "Checko → API-ФНС подключены"
+    : mode === "api_fns"
+      ? "API-ФНС подключён"
+      : mode === "checko"
+        ? "Checko подключён"
+        : "Демо-режим";
   return (
     <header className="app-header">
       <div className="header-inner">
@@ -24,7 +32,7 @@ export function Header({ mode, searching, exportUrl, onSearch }: HeaderProps) {
         <div className="header-actions">
           <span className={`mode-indicator mode-indicator--${mode}`}>
             <span className="mode-dot" aria-hidden="true" />
-            {mode === "checko" ? "Checko подключён" : "Демо-режим"}
+            {providerLabel}
           </span>
           <a className="button button--secondary" href={exportUrl} aria-label="Экспортировать компании в Excel">
             <Download size={17} />

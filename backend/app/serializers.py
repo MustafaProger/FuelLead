@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 
 from app.config import Settings
 from app.models import Company, SearchRun
-from app.services.checko import redact_sensitive_url
 from app.services.contacts import contact_href
+from app.services.provider import redact_sensitive_url
 
 
 def as_aware(value: datetime) -> datetime:

@@ -3,6 +3,8 @@ import type { CompanyStatus, Filters } from "../types";
 
 interface FiltersBarProps {
   filters: Filters;
+  total: number;
+  loading: boolean;
   onChange: (filters: Filters) => void;
 }
 
@@ -14,7 +16,7 @@ const statusTabs: Array<{ value: "" | CompanyStatus; label: string }> = [
   { value: "sent", label: "Отправленные" },
 ];
 
-export function FiltersBar({ filters, onChange }: FiltersBarProps) {
+export function FiltersBar({ filters, total, loading, onChange }: FiltersBarProps) {
   const set = <K extends keyof Filters>(key: K, value: Filters[K]) => onChange({ ...filters, [key]: value });
   const hasFilters = Object.values(filters).some(Boolean);
 
@@ -56,6 +58,21 @@ export function FiltersBar({ filters, onChange }: FiltersBarProps) {
           </select>
         </label>
 
+        <label className="select-field select-field--provider">
+          <span className="sr-only">Тип почты</span>
+          <select
+            value={filters.emailProvider}
+            onChange={(event) => set("emailProvider", event.target.value as Filters["emailProvider"])}
+          >
+            <option value="">Все типы почты</option>
+            <option value="yandex">Яндекс</option>
+            <option value="google">Google</option>
+            <option value="mail_ru">Mail.ru</option>
+            <option value="rambler">Rambler</option>
+            <option value="other">Другие</option>
+          </select>
+        </label>
+
         <label className="select-field select-field--wide">
           <span className="sr-only">Категория деятельности</span>
           <select value={filters.category} onChange={(event) => set("category", event.target.value)}>
@@ -81,12 +98,22 @@ export function FiltersBar({ filters, onChange }: FiltersBarProps) {
           <button
             type="button"
             className="clear-filters"
-            onClick={() => onChange({ status: "", hasEmail: "", category: "", discoveredOn: "", search: "" })}
+            onClick={() => onChange({ status: "", hasEmail: "", emailProvider: "", category: "", discoveredOn: "", search: "" })}
           >
             <X size={15} />
             Сбросить
           </button>
         )}
+      </div>
+
+      <div
+        className={`filter-results ${loading ? "filter-results--loading" : ""}`}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        <span>Найдено компаний</span>
+        <strong>{total.toLocaleString("ru-RU")}</strong>
       </div>
     </section>
   );

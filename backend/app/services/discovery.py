@@ -16,15 +16,17 @@ from app.models import (
     ExcludedCompany,
     SearchRun,
 )
-from app.services.checko import (
-    CheckoAPIError,
-    CheckoClient,
+from app.services.api_fns import ApiFnsClient
+from app.services.checko import CheckoClient
+from app.services.demo_data import DEMO_COMPANIES
+from app.services.provider import (
     CompanyPayload,
+    DiscoveryAPIError,
+    DiscoveryClient,
     OkvedItem,
     SearchPage,
     redact_sensitive_url,
 )
-from app.services.demo_data import DEMO_COMPANIES
 
 
 CATEGORY_RULES = [
@@ -111,7 +113,12 @@ def add_history(
     )
 
 
-def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko API") -> tuple[Company, bool]:
+def upsert_company(
+    db: Session,
+    payload: CompanyPayload,
+    source: str = "Checko API",
+    provider: str = "checko",
+) -> tuple[Company, bool]:
     if not payload.inn:
         raise ValueError("Company payload has no INN")
 
@@ -131,7 +138,7 @@ def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko A
             primary_okved_name=primary_name,
             activity_category=category,
             is_active=payload.is_active,
-            provider="checko",
+            provider=provider,
             first_discovered_at=now,
             last_checked_at=now,
             last_updated_at=now,
@@ -139,7 +146,7 @@ def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko A
         db.add(company)
         db.flush()
         add_history(db, company, "company_discovered", "Компания обнаружена")
-        add_history(db, company, "provider_data_received", "Данные компании получены из Checko")
+        add_history(db, company, "provider_data_received", f"Данные компании получены: {source}")
     else:
         changed = any(
             [
@@ -149,6 +156,7 @@ def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko A
                 company.primary_okved_name != primary_name,
                 company.activity_category != category,
                 company.is_active != payload.is_active,
+                company.provider != provider,
             ]
         )
         company.name = payload.name
@@ -157,10 +165,11 @@ def upsert_company(db: Session, payload: CompanyPayload, source: str = "Checko A
         company.primary_okved_name = primary_name
         company.activity_category = category
         company.is_active = payload.is_active
+        company.provider = provider
         company.last_checked_at = now
         if changed:
             company.last_updated_at = now
-            add_history(db, company, "company_updated", "Данные компании обновлены из Checko")
+            add_history(db, company, "company_updated", f"Данные компании обновлены: {source}")
 
     existing_okveds = {item.code: item for item in company.additional_okveds}
     incoming_okveds: dict[str, OkvedItem] = {}
@@ -224,18 +233,35 @@ def _update_run_counter(db: Session, run: SearchRun, *, created: bool) -> None:
 def _get_discovery_cursor(
     db: Session,
     *,
+    provider: str,
     okved_code: str,
     region_code: str,
     page_size: int,
 ) -> DiscoveryCursor:
     cursor = db.scalar(
         select(DiscoveryCursor).where(
+            DiscoveryCursor.provider == provider,
             DiscoveryCursor.okved_code == okved_code,
             DiscoveryCursor.region_code == region_code,
         )
     )
+    # A cursor without a provider can only be a row created by an older
+    # application version or by a direct data import. Adopt it once for API-FNS
+    # instead of losing its position, while migrated production rows are already
+    # explicitly marked as Checko.
+    if cursor is None and provider == "api_fns":
+        cursor = db.scalar(
+            select(DiscoveryCursor).where(
+                DiscoveryCursor.provider.is_(None),
+                DiscoveryCursor.okved_code == okved_code,
+                DiscoveryCursor.region_code == region_code,
+            )
+        )
+        if cursor is not None:
+            cursor.provider = provider
     if cursor is None:
         cursor = DiscoveryCursor(
+            provider=provider,
             okved_code=okved_code,
             region_code=region_code,
             page_size=page_size,
@@ -277,24 +303,33 @@ def _advance_cursor_after_record(
 def discover_new_companies(
     db: Session,
     run: SearchRun,
-    client: CheckoClient,
+    client: DiscoveryClient,
     limit_per_code: int,
+    *,
+    provider: str = "checko",
+    source: str = "Checko API",
+    max_search_requests: int | None = None,
+    max_company_requests: int | None = None,
 ) -> bool:
-    """Discover only unknown INNs while continuing through persistent Checko pages.
+    """Discover unknown INNs while continuing through persistent provider pages.
 
     Returns True when the provider made further discovery impossible for this run.
     """
     known_inns = set(db.scalars(select(Company.inn)).all())
     known_inns.update(db.scalars(select(ExcludedCompany.inn)).all())
     seen_inns: set[str] = set()
+    cursor_page_size = getattr(client, "fixed_page_size", None) or limit_per_code
+    search_requests = 0
+    company_requests = 0
 
     for code in run.requested_okved_codes:
         for region_code in TARGET_REGION_CODES:
             cursor = _get_discovery_cursor(
                 db,
+                provider=provider,
                 okved_code=code,
                 region_code=region_code,
-                page_size=limit_per_code,
+                page_size=cursor_page_size,
             )
             candidate_attempts = 0
             pages_scanned = 0
@@ -304,6 +339,16 @@ def discover_new_companies(
                 and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN
             ):
                 requested_page = cursor.next_page
+                if max_search_requests is not None and search_requests >= max_search_requests:
+                    run.errors_count += 1
+                    run.error_message = (
+                        "Достигнут безопасный лимит API-ФНС. "
+                        f"Лимит search на один запуск: {max_search_requests}. "
+                        "Курсор сохранён для продолжения."
+                    )
+                    db.commit()
+                    return True
+                search_requests += 1
                 try:
                     search_page = client.search_by_okved(
                         code,
@@ -311,7 +356,7 @@ def discover_new_companies(
                         limit=limit_per_code,
                         page=requested_page,
                     )
-                except CheckoAPIError as exc:
+                except DiscoveryAPIError as exc:
                     run.errors_count += 1
                     run.error_message = str(exc)
                     db.commit()
@@ -351,13 +396,28 @@ def discover_new_companies(
                     seen_inns.add(inn)
                     run.candidates_found += 1
                     candidate_attempts += 1
+                    if max_company_requests is not None and company_requests >= max_company_requests:
+                        run.errors_count += 1
+                        run.error_message = (
+                            "Достигнут безопасный лимит API-ФНС. "
+                            f"Лимит egr на один запуск: {max_company_requests}. "
+                            "Курсор сохранён для продолжения."
+                        )
+                        db.commit()
+                        return True
+                    company_requests += 1
                     try:
                         payload = client.get_company(inn)
                         if not payload.is_active:
                             run.skipped_inactive += 1
                         elif is_target_region(payload):
                             with db.begin_nested():
-                                _, created = upsert_company(db, payload)
+                                _, created = upsert_company(
+                                    db,
+                                    payload,
+                                    source=source,
+                                    provider=provider,
+                                )
                             _advance_cursor_after_record(cursor, search_page, record_index + 1)
                             if created:
                                 known_inns.add(inn)
@@ -366,7 +426,7 @@ def discover_new_companies(
                             if candidate_attempts >= limit_per_code:
                                 break
                             continue
-                    except CheckoAPIError as exc:
+                    except DiscoveryAPIError as exc:
                         run.errors_count += 1
                         run.error_message = str(exc)
                         db.commit()
@@ -405,6 +465,91 @@ def discover_new_companies(
     return False
 
 
+def _run_provider_discovery(
+    db: Session,
+    run: SearchRun,
+    settings: Settings,
+    limit_per_code: int,
+    provider: str,
+) -> bool:
+    if provider == "checko":
+        if not settings.checko_configured:
+            raise DiscoveryAPIError(
+                "Выбран провайдер Checko, но CHECKO_API_KEY не настроен в локальном .env.",
+                stop_discovery=True,
+            )
+        with CheckoClient(
+            settings.checko_api_keys,
+            settings.checko_base_url,
+            settings.checko_timeout_seconds,
+        ) as client:
+            return discover_new_companies(
+                db,
+                run,
+                client,
+                limit_per_code,
+                provider="checko",
+                source="Checko API",
+            )
+
+    if provider == "api_fns":
+        if not settings.api_fns_configured:
+            raise DiscoveryAPIError(
+                "Выбран провайдер API-ФНС, но API_FNS_KEY не настроен в локальном .env.",
+                stop_discovery=True,
+            )
+        with ApiFnsClient(
+            settings.api_fns_key,
+            settings.api_fns_base_url,
+            settings.api_fns_timeout_seconds,
+            require_phone=settings.api_fns_require_phone,
+            require_email=settings.api_fns_require_email,
+        ) as client:
+            return discover_new_companies(
+                db,
+                run,
+                client,
+                limit_per_code,
+                provider="api_fns",
+                source="API-ФНС",
+                max_search_requests=settings.api_fns_max_search_requests_per_run,
+                max_company_requests=settings.api_fns_max_egr_requests_per_run,
+            )
+
+    raise ValueError(f"Unsupported discovery provider: {provider}")
+
+
+def _run_combined_discovery(
+    db: Session,
+    run: SearchRun,
+    settings: Settings,
+    limit_per_code: int,
+) -> bool:
+    """Run both paid providers in a deterministic Checko -> API-FNS order."""
+    error_messages: list[str] = []
+    successful_stages = 0
+
+    for provider, label in (("checko", "Checko"), ("api_fns", "API-ФНС")):
+        errors_before = run.errors_count
+        run.error_message = None
+        try:
+            _run_provider_discovery(db, run, settings, limit_per_code, provider)
+        except DiscoveryAPIError as exc:
+            run.errors_count += 1
+            error_messages.append(f"{label}: {exc}")
+            db.commit()
+            continue
+
+        if run.errors_count == errors_before:
+            successful_stages += 1
+        elif run.error_message:
+            error_messages.append(f"{label}: {run.error_message}")
+
+    run.error_message = "\n".join(error_messages) or None
+    db.commit()
+    return successful_stages > 0
+
+
 def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
     db = SessionLocal()
     run = db.get(SearchRun, run_id)
@@ -412,12 +557,14 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
         db.close()
         return
 
+    provider = settings.resolved_discovery_provider
     run.status = "running"
+    run.mode = provider
     run.started_at = utcnow()
     db.commit()
 
     try:
-        if not settings.checko_configured:
+        if provider == "demo":
             run.mode = "demo"
             excluded_inns = set(db.scalars(select(ExcludedCompany.inn)).all())
             demo_items = [
@@ -425,26 +572,34 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
             ][:limit_per_code]
             run.candidates_found = len(demo_items)
             for payload in demo_items:
-                _, created = upsert_company(db, payload, source="Демонстрационные данные")
+                _, created = upsert_company(
+                    db,
+                    payload,
+                    source="Демонстрационные данные",
+                    provider="demo",
+                )
                 _update_run_counter(db, run, created=created)
+        elif provider == "combined":
+            combined_succeeded = _run_combined_discovery(
+                db,
+                run,
+                settings,
+                limit_per_code,
+            )
+            run.status = "completed" if combined_succeeded else "failed"
         else:
-            run.mode = "checko"
-            with CheckoClient(
-                settings.checko_api_keys,
-                settings.checko_base_url,
-                settings.checko_timeout_seconds,
-            ) as client:
-                discover_new_companies(db, run, client, limit_per_code)
+            _run_provider_discovery(db, run, settings, limit_per_code, provider)
 
-        has_processed_companies = (run.companies_created + run.companies_updated) > 0
-        run.status = "completed" if has_processed_companies or run.errors_count == 0 else "failed"
+        if provider != "combined":
+            has_processed_companies = (run.companies_created + run.companies_updated) > 0
+            run.status = "completed" if has_processed_companies or run.errors_count == 0 else "failed"
     except Exception as exc:  # keep the background task observable via the run record
         db.rollback()
         run = db.get(SearchRun, run_id)
         if run is not None:
             run.status = "failed"
             run.errors_count += 1
-            run.error_message = str(exc)
+            run.error_message = redact_sensitive_url(str(exc))
     finally:
         if run is not None:
             run.completed_at = utcnow()

@@ -37,6 +37,8 @@ def make_payload(emails: list[str]) -> CompanyPayload:
 
 
 class FakePaginatedCheckoClient:
+    fixed_page_size = None
+
     def __init__(self, inns: list[str]):
         self.inns = inns
         self.search_calls: list[tuple[str, str, int, int]] = []
@@ -67,6 +69,104 @@ class FakePaginatedCheckoClient:
         payload = make_payload([])
         payload.inn = inn
         payload.name = f'ООО "КОМПАНИЯ {inn}"'
+        payload.region_code = "77"
+        return payload
+
+
+class FakeApiFnsClient:
+    fixed_page_size = 100
+
+    def __init__(self, *_: object, **__: object):
+        self.company_calls: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def search_by_okved(
+        self,
+        code: str,
+        *,
+        region_code: str,
+        limit: int,
+        page: int,
+    ) -> SearchPage:
+        del code, limit
+        if region_code == "50":
+            return SearchPage(records=[], current_page=page, total_pages=page)
+        return SearchPage(
+            records=[{"ИНН": "7701000099", "РегионКод": ""}],
+            current_page=page,
+            total_pages=page,
+        )
+
+    def get_company(self, inn: str) -> CompanyPayload:
+        self.company_calls.append(inn)
+        payload = make_payload(["Lead@Example.ru", "lead@example.ru"])
+        payload.inn = inn
+        payload.region_code = "77"
+        payload.phone_numbers = ["+74951234567", "+74951234567"]
+        return payload
+
+
+class FakeCombinedCheckoClient:
+    fixed_page_size = None
+
+    def __init__(self, events: list[str]):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("checko_enter")
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.events.append("checko_exit")
+
+    def search_by_okved(self, code, *, region_code, limit, page):
+        del code, limit, page
+        self.events.append(f"checko_search_{region_code}")
+        return SearchPage(
+            records=[{"ИНН": "7701000001", "РегионКод": "77"}],
+            current_page=1,
+            total_pages=1,
+        )
+
+    def get_company(self, inn):
+        self.events.append(f"checko_get_{inn}")
+        payload = make_payload([])
+        payload.inn = inn
+        payload.region_code = "77"
+        return payload
+
+
+class FakeCombinedApiFnsClient:
+    fixed_page_size = 100
+
+    def __init__(self, events: list[str], *_: object, **__: object):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("api_fns_enter")
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.events.append("api_fns_exit")
+
+    def search_by_okved(self, code, *, region_code, limit, page):
+        del code, limit, page
+        self.events.append(f"api_fns_search_{region_code}")
+        return SearchPage(
+            records=[{"ИНН": "7701000002", "РегионКод": "77"}],
+            current_page=1,
+            total_pages=1,
+        )
+
+    def get_company(self, inn):
+        self.events.append(f"api_fns_get_{inn}")
+        payload = make_payload([])
+        payload.inn = inn
         payload.region_code = "77"
         return payload
 
@@ -254,3 +354,216 @@ def test_demo_discovery_also_skips_excluded_inn(db, monkeypatch):
     assert stored_run.status == "completed"
     assert stored_run.companies_created == 1
     assert db.scalar(select(Company.inn)) != excluded_inn
+
+
+def test_api_fns_run_persists_provider_contacts_and_reuses_cursor_table(db, monkeypatch):
+    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", FakeApiFnsClient)
+
+    run_discovery(
+        run.id,
+        Settings(
+            _env_file=None,
+            discovery_provider="api_fns",
+            api_fns_key="secret",
+        ),
+        limit_per_code=1,
+    )
+
+    db.expire_all()
+    stored_run = db.get(SearchRun, run.id)
+    company = db.scalar(select(Company).where(Company.inn == "7701000099"))
+    cursor = db.scalar(
+        select(DiscoveryCursor).where(
+            DiscoveryCursor.okved_code == "49.41",
+            DiscoveryCursor.region_code == "77",
+        )
+    )
+    assert stored_run.status == "completed"
+    assert stored_run.mode == "api_fns"
+    assert company.provider == "api_fns"
+    assert [(item.email, item.source) for item in company.emails] == [
+        ("lead@example.ru", "API-ФНС")
+    ]
+    assert [(item.value, item.source) for item in company.contacts] == [
+        ("+74951234567", "API-ФНС")
+    ]
+    assert cursor.page_size == 100
+
+
+def test_api_fns_fixed_page_size_translates_existing_checko_cursor(db):
+    db.add(
+        DiscoveryCursor(
+            okved_code="49.41",
+            region_code="77",
+            next_page=3,
+            next_record_index=0,
+            page_size=1,
+        )
+    )
+    run = SearchRun(status="running", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+
+    class FixedPageClient(FakeApiFnsClient):
+        def search_by_okved(self, code, *, region_code, limit, page):
+            del code, limit
+            if region_code == "50":
+                return SearchPage(records=[], current_page=1, total_pages=1)
+            assert page == 1
+            return SearchPage(
+                records=[
+                    {"ИНН": "7701000001", "РегионКод": "77"},
+                    {"ИНН": "7701000002", "РегионКод": "77"},
+                    {"ИНН": "7701000003", "РегионКод": "77"},
+                ],
+                current_page=1,
+                total_pages=1,
+            )
+
+    client = FixedPageClient()
+    discover_new_companies(
+        db,
+        run,
+        client,
+        limit_per_code=1,
+        provider="api_fns",
+        source="API-ФНС",
+    )
+
+    assert client.company_calls == ["7701000003"]
+
+
+def test_selected_api_fns_without_key_fails_with_actionable_message(db, monkeypatch):
+    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
+
+    run_discovery(
+        run.id,
+        Settings(_env_file=None, discovery_provider="api_fns", api_fns_key=""),
+        limit_per_code=1,
+    )
+
+    db.expire_all()
+    stored_run = db.get(SearchRun, run.id)
+    assert stored_run.status == "failed"
+    assert stored_run.mode == "api_fns"
+    assert stored_run.errors_count == 1
+    assert stored_run.error_message == (
+        "Выбран провайдер API-ФНС, но API_FNS_KEY не настроен в локальном .env."
+    )
+
+
+def test_api_fns_request_budget_stops_before_second_egr(db):
+    run = SearchRun(status="running", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    client = FakePaginatedCheckoClient(
+        ["7701000001", "7701000002", "7701000003"]
+    )
+
+    stopped = discover_new_companies(
+        db,
+        run,
+        client,
+        limit_per_code=3,
+        provider="api_fns",
+        source="API-ФНС",
+        max_search_requests=1,
+        max_company_requests=1,
+    )
+
+    assert stopped is True
+    assert client.company_calls == ["7701000001"]
+    assert run.companies_created == 1
+    assert run.errors_count == 1
+    assert "Лимит egr на один запуск: 1" in run.error_message
+
+
+def test_combined_run_uses_checko_before_api_fns(db, monkeypatch):
+    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        "app.services.discovery.SessionLocal", session_factory
+    )
+    monkeypatch.setattr(
+        "app.services.discovery.CheckoClient",
+        lambda *_args, **_kwargs: FakeCombinedCheckoClient(events),
+    )
+    monkeypatch.setattr(
+        "app.services.discovery.ApiFnsClient",
+        lambda *_args, **_kwargs: FakeCombinedApiFnsClient(events),
+    )
+
+    run_discovery(
+        run.id,
+        Settings(
+            _env_file=None,
+            discovery_provider="combined",
+            checko_api_key="checko-key",
+            api_fns_key="api-fns-key",
+        ),
+        limit_per_code=1,
+    )
+
+    db.expire_all()
+    stored_run = db.get(SearchRun, run.id)
+    assert events == [
+        "checko_enter",
+        "checko_search_77",
+        "checko_get_7701000001",
+        "checko_search_50",
+        "checko_exit",
+        "api_fns_enter",
+        "api_fns_search_77",
+        "api_fns_get_7701000002",
+        "api_fns_search_50",
+        "api_fns_exit",
+    ]
+    assert stored_run.mode == "combined"
+    assert stored_run.status == "completed"
+    assert stored_run.companies_created == 2
+    assert stored_run.errors_count == 0
+
+
+def test_combined_run_continues_with_api_fns_when_checko_key_is_missing(db, monkeypatch):
+    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    events: list[str] = []
+    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
+    monkeypatch.setattr(
+        "app.services.discovery.ApiFnsClient",
+        lambda *_args, **_kwargs: FakeCombinedApiFnsClient(events),
+    )
+
+    run_discovery(
+        run.id,
+        Settings(
+            _env_file=None,
+            discovery_provider="combined",
+            checko_api_key="",
+            api_fns_key="api-fns-key",
+        ),
+        limit_per_code=1,
+    )
+
+    db.expire_all()
+    stored_run = db.get(SearchRun, run.id)
+    assert events[:2] == ["api_fns_enter", "api_fns_search_77"]
+    assert stored_run.status == "completed"
+    assert stored_run.companies_created == 1
+    assert stored_run.errors_count == 1
+    assert stored_run.error_message.startswith("Checko: Выбран провайдер Checko")

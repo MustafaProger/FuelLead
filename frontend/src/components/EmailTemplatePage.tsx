@@ -34,7 +34,7 @@ export function EmailTemplatePage({ gmailConfigured, senderEmail, onSent }: Emai
     let cancelled = false;
     Promise.all([
       api.emailTemplate(),
-      api.companies({ status: "", hasEmail: "true", category: "", discoveredOn: "", search: "" }, 1, 100),
+      api.companies({ status: "", hasEmail: "true", emailProvider: "", category: "", discoveredOn: "", search: "" }, 1, 100),
     ]).then(([templateResponse, companiesResponse]) => {
       if (cancelled) return;
       setTemplate(templateResponse);

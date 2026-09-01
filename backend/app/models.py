@@ -177,10 +177,18 @@ class SearchRun(Base):
 class DiscoveryCursor(Base):
     __tablename__ = "discovery_cursors"
     __table_args__ = (
-        UniqueConstraint("okved_code", "region_code", name="uq_discovery_cursor_query"),
+        UniqueConstraint(
+            "provider",
+            "okved_code",
+            "region_code",
+            name="uq_discovery_cursor_provider_query",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable keeps direct imports of legacy cursor rows compatible. All cursors
+    # created by discovery are explicitly scoped to a provider.
+    provider: Mapped[str | None] = mapped_column(String(20), index=True)
     okved_code: Mapped[str] = mapped_column(String(20), nullable=False)
     region_code: Mapped[str] = mapped_column(String(2), nullable=False)
     next_page: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

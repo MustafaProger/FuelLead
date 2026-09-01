@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import Field
@@ -33,10 +34,18 @@ class Settings(BaseSettings):
 
     app_name: str = "FuelLead"
     database_url: str = "sqlite:///./fuellead.sqlite3"
+    discovery_provider: Literal["auto", "demo", "checko", "api_fns", "combined"] = "auto"
     checko_api_key: str = ""
     checko_api_key_fallbacks: str = ""
     checko_base_url: str = "https://api.checko.ru/v2"
     checko_timeout_seconds: float = 30.0
+    api_fns_key: str = ""
+    api_fns_base_url: str = "https://api-fns.ru/api"
+    api_fns_timeout_seconds: float = 30.0
+    api_fns_require_phone: bool = False
+    api_fns_require_email: bool = False
+    api_fns_max_search_requests_per_run: int = Field(default=5, ge=1, le=100)
+    api_fns_max_egr_requests_per_run: int = Field(default=5, ge=1, le=100)
     app_timezone: str = "Europe/Moscow"
     discovery_limit_per_code: int = Field(default=10, ge=1, le=100)
     outreach_sender_email: str = "artel.office8@gmail.com"
@@ -62,6 +71,16 @@ class Settings(BaseSettings):
     def checko_api_keys(self) -> tuple[str, ...]:
         candidates = [self.checko_api_key, *self.checko_api_key_fallbacks.split(",")]
         return tuple(dict.fromkeys(value.strip() for value in candidates if value.strip()))
+
+    @property
+    def api_fns_configured(self) -> bool:
+        return bool(self.api_fns_key.strip())
+
+    @property
+    def resolved_discovery_provider(self) -> Literal["demo", "checko", "api_fns", "combined"]:
+        if self.discovery_provider == "auto":
+            return "checko" if self.checko_configured else "demo"
+        return self.discovery_provider
 
     @property
     def gmail_oauth_configured(self) -> bool:

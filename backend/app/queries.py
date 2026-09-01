@@ -2,6 +2,7 @@ from datetime import datetime, time, timedelta, timezone, tzinfo
 
 from sqlalchemy import Select, or_, select
 
+from app.email_providers import email_provider_predicate
 from app.models import Company
 from app.schemas import CompanyFilters
 
@@ -16,6 +17,8 @@ def build_company_query(
         query = query.where(Company.emails.any())
     elif filters.has_email is False:
         query = query.where(~Company.emails.any())
+    if filters.email_provider:
+        query = query.where(Company.emails.any(email_provider_predicate(filters.email_provider)))
     if filters.category:
         query = query.where(Company.activity_category == filters.category)
     if filters.discovered_on:

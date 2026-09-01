@@ -1,4 +1,4 @@
-from app.services.checko import CompanyPayload, OkvedItem
+from app.services.provider import CompanyPayload, OkvedItem
 
 
 DEMO_COMPANIES = [
@@ -51,4 +51,3 @@ DEMO_COMPANIES = [
         emails=[],
     ),
 ]
-

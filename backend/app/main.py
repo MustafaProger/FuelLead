@@ -33,7 +33,6 @@ from app.schemas import (
     StatusUpdate,
 )
 from app.serializers import as_aware, company_to_dict, search_run_to_dict
-from app.services.checko import normalize_email
 from app.services.contacts import CONTACT_TYPE_LABELS, normalize_contact_value
 from app.services.discovery import fail_interrupted_search_runs, run_discovery, sanitize_search_run_errors
 from app.services.email_templates import (
@@ -43,6 +42,7 @@ from app.services.email_templates import (
     render_email_template,
 )
 from app.services.gmail import GmailOAuthConfig, GmailOAuthError, GmailOAuthSender
+from app.services.provider import normalize_email
 
 
 @asynccontextmanager
@@ -117,6 +117,7 @@ def logout(request: Request, response: Response) -> dict:
 def filters_dependency(
     status: str | None = None,
     has_email: bool | None = None,
+    email_provider: str | None = None,
     category: str | None = None,
     discovered_on: date | None = None,
     search: str | None = None,
@@ -124,6 +125,7 @@ def filters_dependency(
     return CompanyFilters(
         status=status,
         has_email=has_email,
+        email_provider=email_provider,
         category=category,
         discovered_on=discovered_on,
         search=search,
@@ -132,12 +134,27 @@ def filters_dependency(
 
 @app.get("/api/health")
 def health(settings: Settings = Depends(get_settings)) -> dict:
+    selected_provider = settings.resolved_discovery_provider
+    checko_state = (
+        "selected"
+        if selected_provider in ("checko", "combined") and settings.checko_configured
+        else "standby"
+        if settings.checko_configured
+        else "not_configured"
+    )
     return {
         "status": "ok",
         "app": settings.app_name,
         "checko_configured": settings.checko_configured,
         "checko_api_key_count": len(settings.checko_api_keys),
-        "mode": "checko" if settings.checko_configured else "demo",
+        "checko_state": checko_state,
+        "api_fns_configured": settings.api_fns_configured,
+        "api_fns_request_budget_per_run": {
+            "search": settings.api_fns_max_search_requests_per_run,
+            "egr": settings.api_fns_max_egr_requests_per_run,
+        },
+        "selected_discovery_provider": selected_provider,
+        "mode": selected_provider,
         "default_okved_codes": DEFAULT_OKVED_CODES,
         "target_region_codes": TARGET_REGION_CODES,
         "discovery_limit_per_code": settings.discovery_limit_per_code,
@@ -330,7 +347,7 @@ def delete_company_contact(
     if contact.source != "Вручную":
         raise HTTPException(
             status_code=422,
-            detail="Контакт из Checko обновляется автоматически и не удаляется вручную",
+            detail="Контакт от провайдера обновляется автоматически и не удаляется вручную",
         )
 
     label = CONTACT_TYPE_LABELS[contact.contact_type]
@@ -502,7 +519,7 @@ def start_search(
         raise HTTPException(status_code=409, detail="Поиск уже выполняется")
     run = SearchRun(
         requested_okved_codes=request.okved_codes,
-        mode="checko" if settings.checko_configured else "demo",
+        mode=settings.resolved_discovery_provider,
     )
     db.add(run)
     db.commit()

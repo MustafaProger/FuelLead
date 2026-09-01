@@ -17,13 +17,25 @@ function splitMessage(message: string) {
   };
 }
 
+function providerName(run: SearchRun) {
+  return run.mode === "combined"
+    ? "Checko → API-ФНС"
+    : run.mode === "api_fns"
+      ? "API-ФНС"
+      : run.mode === "checko"
+        ? "Checko"
+        : "демо-провайдер";
+}
+
 function progressDescription(run: SearchRun) {
   if (run.status === "pending") {
     return "Запуск принят. Ожидаем начало обработки.";
   }
 
   if (!run.candidates_found) {
-    return "Проверяем целевые ОКВЭД и доступность данных в Checko.";
+    return run.mode === "combined"
+      ? "Сначала проверяем целевые ОКВЭД через Checko, затем продолжаем через API-ФНС."
+      : `Проверяем целевые ОКВЭД и доступность данных в ${providerName(run)}.`;
   }
 
   const processed = run.companies_created + run.companies_updated;
@@ -35,7 +47,7 @@ function completedDescription(run: SearchRun) {
   const summary = `Найдено ${run.candidates_found}, добавлено ${run.companies_created}, обновлено ${run.companies_updated}.`;
   if (!run.errors_count) return summary;
 
-  const errorDetails = run.error_message ? ` Последняя ошибка Checko: ${run.error_message}` : "";
+  const errorDetails = run.error_message ? ` Последняя ошибка ${providerName(run)}: ${run.error_message}` : "";
   return `${summary} Ошибок провайдера: ${run.errors_count}.${errorDetails}`;
 }
 
@@ -74,7 +86,7 @@ export function SearchRunNotice({ error, run, onCloseError, onCloseRun }: Search
           <Notice
             tone="error"
             title={failedResult?.title || "Поиск не выполнен"}
-            description={failedResult?.description || "Checko не вернул компании."}
+            description={failedResult?.description || `${providerName(run)} не вернул компании.`}
             onClose={onCloseRun}
           />
         )

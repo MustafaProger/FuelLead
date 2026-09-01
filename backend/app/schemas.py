@@ -3,6 +3,7 @@ from datetime import date
 from pydantic import BaseModel, Field, field_validator
 
 from app.config import DEFAULT_OKVED_CODES
+from app.email_providers import EMAIL_PROVIDER_VALUES
 from app.models import ALL_STATUSES, CONTACT_TYPES
 
 
@@ -14,9 +15,20 @@ class AuthLoginRequest(BaseModel):
 class CompanyFilters(BaseModel):
     status: str | None = None
     has_email: bool | None = None
+    email_provider: str | None = None
     category: str | None = None
     discovered_on: date | None = None
     search: str | None = None
+
+    @field_validator("email_provider")
+    @classmethod
+    def validate_email_provider(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().lower()
+        if normalized not in EMAIL_PROVIDER_VALUES:
+            raise ValueError(f"Email provider must be one of: {', '.join(EMAIL_PROVIDER_VALUES)}")
+        return normalized
 
 
 class StatusUpdate(BaseModel):

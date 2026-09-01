@@ -24,6 +24,7 @@ import type {
 const defaultFilters: Filters = {
   status: "",
   hasEmail: "",
+  emailProvider: "",
   category: "",
   discoveredOn: "",
   search: "",
@@ -251,7 +252,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
             />
 
             <StatsStrip stats={stats} loading={loading && !companies.length} />
-            <FiltersBar filters={filters} onChange={handleFilters} />
+            <FiltersBar filters={filters} total={total} loading={loading} onChange={handleFilters} />
             <CompanyTable
               companies={companies}
               total={total}
