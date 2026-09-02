@@ -83,9 +83,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="FuelLead API", version="0.1.0", lifespan=lifespan)
-# 14 complete Monday-to-Sunday weeks form a compact three-month heatmap with no
+# 27 complete Monday-to-Sunday weeks form a six-month heatmap with no
 # partial-week placeholders at either edge.
-DASHBOARD_HISTORY_DAYS = 98
+DASHBOARD_HISTORY_DAYS = 189
 
 
 @app.middleware("http")
@@ -211,7 +211,7 @@ def dashboard(
 
     local_today = datetime.now(settings.timezone).date()
     current_week_start = local_today - timedelta(days=local_today.weekday())
-    first_day = current_week_start - timedelta(weeks=13)
+    first_day = current_week_start - timedelta(weeks=26)
     local_start = datetime.combine(first_day, time.min, tzinfo=settings.timezone)
     discovered_values = db.scalars(
         select(Company.first_discovered_at).where(

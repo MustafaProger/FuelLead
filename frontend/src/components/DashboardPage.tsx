@@ -48,6 +48,49 @@ function formatShortDate(value: string) {
     .replace(" г.", "");
 }
 
+function formatFullDate(value: string) {
+  return new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", year: "numeric" })
+    .format(new Date(`${value}T12:00:00`));
+}
+
+function formatMonth(value: string) {
+  return new Intl.DateTimeFormat("ru-RU", { month: "short" })
+    .format(new Date(`${value}T12:00:00`))
+    .replace(".", "");
+}
+
+function getDiscoveryStreaks(days: DashboardResponse["daily_discoveries"]) {
+  let longest = 0;
+  let running = 0;
+
+  days.forEach((day) => {
+    running = day.count > 0 ? running + 1 : 0;
+    longest = Math.max(longest, running);
+  });
+
+  const now = new Date();
+  const today = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"), String(now.getDate()).padStart(2, "0")].join("-");
+  let index = days.length - 1;
+  while (index >= 0 && days[index].date > today) index -= 1;
+
+  let current = 0;
+  for (; index >= 0 && days[index].count > 0; index -= 1) current += 1;
+  return { current, longest };
+}
+
+function formatDayCount(value: number) {
+  const lastTwoDigits = value % 100;
+  const lastDigit = value % 10;
+  const word = lastTwoDigits >= 11 && lastTwoDigits <= 14
+    ? "дней"
+    : lastDigit === 1
+      ? "день"
+      : lastDigit >= 2 && lastDigit <= 4
+        ? "дня"
+        : "дней";
+  return `${value.toLocaleString("ru-RU")} ${word}`;
+}
+
 export function DashboardPage({
   searching,
   refreshToken,
@@ -56,6 +99,7 @@ export function DashboardPage({
 }: DashboardPageProps) {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [heatmapTooltip, setHeatmapTooltip] = useState<{ date: string; left: number; top: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,8 +119,27 @@ export function DashboardPage({
   const maxFunnel = Math.max(1, ...funnel.map((item) => data?.status_counts[item.key] || 0));
   const heatmap = useMemo(() => data?.daily_discoveries || [], [data?.daily_discoveries]);
   const heatmapColumns = Math.max(1, Math.ceil(heatmap.length / 7));
-  const heatmapMinWidth = heatmapColumns * 20 + Math.max(0, heatmapColumns - 1) * 4;
+  const heatmapMinWidth = heatmapColumns * 30 + Math.max(0, heatmapColumns - 1) * 7;
   const maxDaily = Math.max(1, ...(data?.daily_discoveries.map((item) => item.count) || [0]));
+  const streaks = useMemo(() => getDiscoveryStreaks(heatmap), [heatmap]);
+  const monthMarkers = useMemo(() => heatmap.reduce<Array<{ date: string; column: number }>>((markers, item, index) => {
+    const previous = heatmap[index - 1];
+    if (!previous || item.date.slice(0, 7) !== previous.date.slice(0, 7)) {
+      markers.push({ date: item.date, column: Math.floor(index / 7) + 1 });
+    }
+    return markers;
+  }, []), [heatmap]);
+  const activeHeatmapItem = heatmap.find((item) => item.date === heatmapTooltip?.date) || null;
+
+  const showHeatmapTooltip = (target: HTMLElement, date: string) => {
+    const panel = target.closest<HTMLElement>(".activity-panel");
+    if (!panel) return;
+    const panelRect = panel.getBoundingClientRect();
+    const cellRect = target.getBoundingClientRect();
+    const left = Math.min(panelRect.width - 120, Math.max(120, cellRect.left + cellRect.width / 2 - panelRect.left));
+    const top = Math.max(78, cellRect.top - panelRect.top - 80);
+    setHeatmapTooltip({ date, left, top });
+  };
 
   return (
     <div className="content-page dashboard-page">
@@ -106,40 +169,6 @@ export function DashboardPage({
       </section>
 
       <section className="dashboard-main-grid">
-        <article className="dashboard-panel activity-panel">
-          <div className="panel-heading">
-            <div><h2>Новые компании</h2><p>За последние 3 месяца</p></div>
-          </div>
-          <div className="heatmap-layout">
-            <div className="heatmap-days" aria-hidden="true">
-              {['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((day) => <span key={day}>{day}</span>)}
-            </div>
-            <div className="heatmap-scroll">
-              <div
-                className="heatmap-chart"
-                style={{ minWidth: `${heatmapMinWidth}px`, "--heatmap-columns": heatmapColumns } as CSSProperties}
-              >
-                <div className="heatmap-grid" role="img" aria-label="Количество найденных компаний по дням">
-                  {heatmap.map((item) => (
-                    <span
-                      key={item.date}
-                      className={`heatmap-cell heatmap-cell--has-tooltip heatmap-cell--${item.count ? Math.max(1, Math.ceil((item.count / maxDaily) * 4)) : 0}`}
-                      title={`${formatShortDate(item.date)}. Найдено компаний: ${item.count}`}
-                      aria-label={`${formatShortDate(item.date)}. Найдено компаний: ${item.count}`}
-                      tabIndex={0}
-                    />
-                  ))}
-                </div>
-                <div className="heatmap-legend">
-                  <span>Меньше</span>
-                  {[0, 1, 2, 3, 4].map((level) => <i className={`heatmap-cell heatmap-cell--${level}`} key={level} />)}
-                  <span>Больше</span>
-                </div>
-              </div>
-            </div>
-          </div>
-        </article>
-
         <article className="dashboard-panel funnel-panel">
           <div className="panel-heading"><div><h2>Воронка</h2><p>Текущее состояние компаний</p></div></div>
           <div className="funnel-list">
@@ -157,6 +186,58 @@ export function DashboardPage({
             })}
           </div>
         </article>
+
+        <article className="dashboard-panel activity-panel">
+          <div className="activity-summary">
+            <div>
+              <h2>{formatDayCount(streaks.current)} подряд</h2>
+              <span>Самый длинный: {formatDayCount(streaks.longest)}</span>
+            </div>
+          </div>
+          {activeHeatmapItem && heatmapTooltip ? (
+            <div className="heatmap-tooltip" role="status" style={{ left: heatmapTooltip.left, top: heatmapTooltip.top }}>
+              <strong>{formatFullDate(activeHeatmapItem.date)}</strong>
+              <span>Найдено компаний: <b>{activeHeatmapItem.count.toLocaleString("ru-RU")}</b></span>
+            </div>
+          ) : null}
+          <div className="heatmap-layout">
+            <div className="heatmap-days" aria-hidden="true">
+              {['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((day) => <span key={day}>{day}</span>)}
+            </div>
+            <div className="heatmap-scroll">
+              <div
+                className="heatmap-chart"
+                style={{ minWidth: `${heatmapMinWidth}px`, "--heatmap-columns": heatmapColumns } as CSSProperties}
+              >
+                <div className="heatmap-months" aria-hidden="true">
+                  {monthMarkers.map((marker) => (
+                    <span key={marker.date} style={{ gridColumn: marker.column }}>{formatMonth(marker.date)}</span>
+                  ))}
+                </div>
+                <div className="heatmap-grid" role="img" aria-label="Количество найденных компаний по дням за последние 6 месяцев">
+                  {heatmap.map((item) => (
+                    <span
+                      key={item.date}
+                      className={`heatmap-cell heatmap-cell--has-tooltip heatmap-cell--${item.count ? Math.max(1, Math.ceil((item.count / maxDaily) * 4)) : 0}`}
+                      aria-label={`${formatShortDate(item.date)}. Найдено компаний: ${item.count}`}
+                      tabIndex={0}
+                      onMouseEnter={(event) => showHeatmapTooltip(event.currentTarget, item.date)}
+                      onMouseLeave={() => setHeatmapTooltip(null)}
+                      onFocus={(event) => showHeatmapTooltip(event.currentTarget, item.date)}
+                      onBlur={() => setHeatmapTooltip(null)}
+                    />
+                  ))}
+                </div>
+                <div className="heatmap-legend">
+                  <span>Меньше</span>
+                  {[0, 1, 2, 3, 4].map((level) => <i className={`heatmap-cell heatmap-cell--${level}`} key={level} />)}
+                  <span>Больше</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+
       </section>
 
       <section className="dashboard-panel recent-panel">

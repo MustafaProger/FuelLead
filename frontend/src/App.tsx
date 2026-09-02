@@ -10,7 +10,6 @@ import { FiltersBar } from "./components/FiltersBar";
 import { Notice } from "./components/Notice";
 import { OutreachDialog } from "./components/OutreachDialog";
 import { SearchRunNotice } from "./components/SearchRunNotice";
-import { StatsStrip } from "./components/StatsStrip";
 import type {
   Company,
   CompanyDetail,
@@ -19,7 +18,6 @@ import type {
   Filters,
   Health,
   SearchRun,
-  Stats,
 } from "./types";
 
 const defaultFilters: Filters = {
@@ -31,7 +29,6 @@ const defaultFilters: Filters = {
   search: "",
 };
 
-const emptyStats: Stats = { total: 0, new: 0, with_email: 0, without_email: 0 };
 const PAGE_SIZE = 20;
 
 function pageFromHash(): AppPage {
@@ -48,7 +45,6 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [health, setHealth] = useState<Health | null>(null);
   const [companies, setCompanies] = useState<Company[]>([]);
-  const [stats, setStats] = useState<Stats>(emptyStats);
   const [total, setTotal] = useState(0);
   const [filters, setFilters] = useState<Filters>(defaultFilters);
   const [page, setPage] = useState(1);
@@ -76,7 +72,6 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
     try {
       const response = await api.companies(filters, page, PAGE_SIZE);
       setCompanies(response.items);
-      setStats(response.stats);
       setTotal(response.total);
       setError(null);
     } catch (requestError) {
@@ -277,7 +272,6 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
 
             {error ? <Notice tone="error" title="Не удалось выполнить действие" description={error} onClose={() => setError(null)} /> : null}
             {emailSuccess ? <Notice tone="success" title="Письмо отправлено" description={emailSuccess} onClose={() => setEmailSuccess(null)} /> : null}
-            <StatsStrip stats={stats} loading={loading && !companies.length} />
             <FiltersBar filters={filters} total={total} loading={loading} onChange={handleFilters} />
             <CompanyTable
               companies={companies}

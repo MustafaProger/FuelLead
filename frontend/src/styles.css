@@ -1151,28 +1151,40 @@ a.contact-item, .contact-item > a { min-width: 0; flex: 1; padding: 8px 10px; di
 .metric-icon--teal { color: #0f756d; background: #edf8f7; }
 .metric-card small { display: block; color: var(--muted); font-size: 12px; font-weight: 580; }
 .metric-card strong { display: block; margin-top: 8px; color: var(--graphite); font-size: 30px; font-weight: 740; line-height: 1; letter-spacing: -0.045em; font-variant-numeric: tabular-nums; }
-.dashboard-main-grid { margin-bottom: 20px; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.85fr); gap: 20px; }
+.dashboard-main-grid { margin-bottom: 20px; display: grid; grid-template-columns: 1fr; gap: 20px; }
 .dashboard-panel { min-width: 0; border: 1px solid var(--border); border-radius: 16px; background: #fff; box-shadow: var(--shadow-sm); }
-.activity-panel, .funnel-panel { min-height: 365px; padding: 24px; }
+.activity-panel { position: relative; min-height: 470px; padding: 27px 29px 25px; }
+.funnel-panel { min-height: 0; padding: 24px; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .panel-heading h2, .template-panel-heading h2 { margin: 0; color: var(--graphite); font-size: 18px; font-weight: 730; letter-spacing: -0.025em; }
 .panel-heading p, .template-panel-heading p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
-.heatmap-layout { min-height: 245px; margin-top: 29px; display: flex; align-items: flex-start; gap: 10px; }
-.heatmap-days { padding-top: 1px; display: grid; grid-template-rows: repeat(7, 28px); row-gap: 6px; color: var(--muted); font-size: 10.5px; }
+.activity-summary { min-height: 66px; display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
+.activity-summary h2 { margin: 0; color: #222326; font-size: 31px; font-weight: 750; line-height: 1.04; letter-spacing: -0.04em; }
+.activity-summary span { display: block; margin-top: 10px; color: #8b8d91; font-size: 17px; line-height: 1.35; }
+.heatmap-tooltip { position: absolute; z-index: 3; min-width: 215px; padding: 15px 17px; border-radius: 13px; color: #fff; background: #242424; box-shadow: 0 8px 22px rgba(16, 24, 40, 0.24); transform: translateX(-50%); pointer-events: none; }
+.heatmap-tooltip::after { content: ""; position: absolute; left: 50%; bottom: -7px; width: 14px; height: 14px; background: inherit; transform: translateX(-50%) rotate(45deg); }
+.heatmap-tooltip strong, .heatmap-tooltip span { position: relative; z-index: 1; display: block; }
+.heatmap-tooltip strong { font-size: 14px; font-weight: 700; }
+.heatmap-tooltip span { margin-top: 8px; font-size: 13px; }
+.heatmap-tooltip b { color: #ffad7e; font-size: 16px; }
+.heatmap-layout { min-height: 300px; margin-top: 29px; display: flex; align-items: flex-start; gap: 14px; }
+.heatmap-days { padding-top: 31px; display: grid; grid-template-rows: repeat(7, 32px); row-gap: 8px; color: #85878b; font-size: 13px; }
 .heatmap-days span { display: flex; align-items: center; }
 .heatmap-scroll { min-width: 0; flex: 1; overflow-x: auto; padding-bottom: 4px; }
 .heatmap-chart { width: 100%; }
-.heatmap-grid { width: 100%; display: grid; grid-template-rows: repeat(7, 28px); grid-template-columns: repeat(var(--heatmap-columns), minmax(20px, 1fr)); grid-auto-flow: column; row-gap: 6px; column-gap: 4px; }
-.heatmap-cell { width: min(100%, 28px); aspect-ratio: 1; display: block; align-self: center; justify-self: center; border-radius: 5px; background: #f2f3f5; }
+.heatmap-months { height: 23px; margin-bottom: 8px; display: grid; grid-template-columns: repeat(var(--heatmap-columns), minmax(30px, 1fr)); column-gap: 7px; color: #85878b; font-size: 13px; }
+.heatmap-months span { align-self: end; white-space: nowrap; }
+.heatmap-grid { width: 100%; display: grid; grid-template-rows: repeat(7, 32px); grid-template-columns: repeat(var(--heatmap-columns), minmax(30px, 1fr)); grid-auto-flow: column; row-gap: 8px; column-gap: 7px; }
+.heatmap-cell { width: min(100%, 32px); aspect-ratio: 1; display: block; align-self: center; justify-self: center; border-radius: 7px; background: #eceef2; }
 .heatmap-cell--has-tooltip { cursor: help; }
 .heatmap-cell--has-tooltip:hover, .heatmap-cell--has-tooltip:focus-visible { outline: 2px solid rgba(224, 97, 28, 0.45); outline-offset: 2px; }
 .heatmap-cell--1 { background: #ffe4d4; }
 .heatmap-cell--2 { background: #ffba91; }
 .heatmap-cell--3 { background: #ff8550; }
 .heatmap-cell--4 { background: var(--orange); }
-.heatmap-legend { margin-top: 22px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 10.5px; }
-.heatmap-legend .heatmap-cell { width: 13px; height: 13px; border-radius: 4px; }
-.funnel-list { margin-top: 24px; display: grid; gap: 19px; }
+.heatmap-legend { margin-top: 20px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; color: #85878b; font-size: 13px; }
+.heatmap-legend .heatmap-cell { width: 15px; height: 15px; border-radius: 5px; }
+.funnel-list { margin-top: 24px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 19px 28px; }
 .funnel-row { display: flex; align-items: center; gap: 13px; }
 .funnel-icon { width: 40px; height: 40px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; }
 .funnel-icon--orange { color: var(--orange); background: var(--orange-soft); }
@@ -1347,6 +1359,7 @@ body.dialog-open { overflow: hidden; }
   .dashboard-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-main-grid { grid-template-columns: 1fr; }
   .activity-panel, .funnel-panel { min-height: 0; }
+  .funnel-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .template-workspace { grid-template-columns: 1fr; }
   .final-body-input { min-height: 270px; }
 }
@@ -1396,7 +1409,12 @@ body.dialog-open { overflow: hidden; }
   .metric-icon { width: 36px; height: 36px; border-radius: 10px; }
   .metric-card strong { margin-top: 5px; font-size: 26px; }
   .activity-panel, .funnel-panel { padding: 18px; }
-  .heatmap-layout { margin-top: 23px; }
+  .activity-summary { min-height: 0; align-items: stretch; flex-direction: column; gap: 17px; }
+  .activity-summary h2 { font-size: 25px; }
+  .activity-summary span { margin-top: 7px; font-size: 14px; }
+  .heatmap-layout { margin-top: 24px; }
+  .heatmap-days { font-size: 12px; }
+  .funnel-list { grid-template-columns: 1fr; }
   .recent-panel > .panel-heading { padding: 18px; }
   .panel-link { white-space: nowrap; }
   .integration-chip { width: 100%; }
