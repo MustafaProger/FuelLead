@@ -25,13 +25,12 @@ interface CompanyTableProps {
 
 const statusLabels: Record<CompanyStatus, string> = {
   new: "Новая",
-  checked: "Проверена",
-  ready: "Готова",
-  sent: "Отправлено",
-  answered: "Ответили",
-  interested: "Интерес",
+  sent: "Письмо отправлено",
+  answered: "Ответила",
+  interested: "Заинтересована",
+  customer: "Работает с нами",
   rejected: "Отказ",
-  error: "Ошибка",
+  error: "Ошибка отправки",
 };
 
 type CompanyColumnId =
@@ -61,7 +60,7 @@ const COMPANY_COLUMNS: CompanyColumn[] = [
   { id: "primaryOkved", label: "Основной ОКВЭД", width: 240, defaultVisible: true },
   { id: "contacts", label: "Связь", width: 245, defaultVisible: true },
   { id: "discovered", label: "Обнаружена", width: 135, defaultVisible: true },
-  { id: "status", label: "Статус", width: 135, defaultVisible: true },
+  { id: "status", label: "Статус", width: 185, defaultVisible: true },
   { id: "category", label: "Категория", width: 170, defaultVisible: false },
   { id: "lastChecked", label: "Последняя проверка", width: 150, defaultVisible: false },
   { id: "updated", label: "Обновлена", width: 150, defaultVisible: false },

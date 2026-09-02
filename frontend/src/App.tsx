@@ -235,16 +235,18 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         onLogout={onLogout}
       />
       <main className="workspace-main">
+        <SearchRunNotice
+          error={searchError}
+          run={searchRun}
+          onCloseError={() => setSearchError(null)}
+          onCloseRun={() => setSearchRun(null)}
+        />
         {activePage === "dashboard" ? (
           <DashboardPage
-            searchError={searchError}
-            searchRun={searchRun}
             searching={Boolean(searching)}
             refreshToken={refreshToken}
             onSearch={handleSearch}
             onOpenOutreach={() => openOutreach(defaultFilters)}
-            onCloseSearchError={() => setSearchError(null)}
-            onCloseSearchRun={() => setSearchRun(null)}
           />
         ) : null}
 
@@ -275,13 +277,6 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
 
             {error ? <Notice tone="error" title="Не удалось выполнить действие" description={error} onClose={() => setError(null)} /> : null}
             {emailSuccess ? <Notice tone="success" title="Письмо отправлено" description={emailSuccess} onClose={() => setEmailSuccess(null)} /> : null}
-            <SearchRunNotice
-              error={searchError}
-              run={searchRun}
-              onCloseError={() => setSearchError(null)}
-              onCloseRun={() => setSearchRun(null)}
-            />
-
             <StatsStrip stats={stats} loading={loading && !companies.length} />
             <FiltersBar filters={filters} total={total} loading={loading} onChange={handleFilters} />
             <CompanyTable

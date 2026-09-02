@@ -19,7 +19,7 @@ def add_company(
     name: str,
     inn: str,
     *,
-    status: str = "ready",
+    status: str = "new",
     emails: tuple[str, ...] = (),
     is_active: bool = True,
 ) -> Company:
@@ -49,14 +49,15 @@ def outreach_settings(**overrides) -> Settings:
         "outreach_hourly_limit": 5,
         "outreach_min_interval_seconds": 300,
         "outreach_max_per_domain_per_day": 2,
+        "outreach_automatic_send_enabled": False,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
 
 
-def test_preflight_uses_only_ready_active_unique_uncontacted_primary_addresses(db):
-    add_company(db, "Готовая", "7700000001", emails=("first@example.ru", "second@example.ru"))
-    add_company(db, "Новая", "7700000002", status="new", emails=("new@example.ru",))
+def test_preflight_uses_only_new_active_unique_uncontacted_primary_addresses(db):
+    add_company(db, "Новая", "7700000001", emails=("first@example.ru", "second@example.ru"))
+    add_company(db, "Отправленная", "7700000002", status="sent", emails=("sent-status@example.ru",))
     add_company(db, "Дубль", "7700000003", emails=("first@example.ru",))
     contacted = add_company(db, "Контакт был", "7700000004", emails=("sent@example.ru",))
     add_company(db, "Без почты", "7700000005")
@@ -79,7 +80,7 @@ def test_preflight_uses_only_ready_active_unique_uncontacted_primary_addresses(d
     assert result["sample"]["recipient"] == "first@example.ru"
     assert "ответьте «Не писать»" in result["sample"]["body"]
     assert result["skipped"] == {
-        "not_ready": 1,
+        "not_new": 1,
         "inactive": 1,
         "without_email": 1,
         "already_contacted": 1,
@@ -105,6 +106,50 @@ def test_campaign_snapshots_policy_and_limits_batch_size(db):
     assert len(campaign.deliveries) == 2
     assert all(delivery.status == "queued" for delivery in campaign.deliveries)
     assert all("ответьте «Не писать»" in delivery.body for delivery in campaign.deliveries)
+
+
+def test_preflight_reports_overlapping_skip_reasons(db):
+    add_company(db, "Отправленная без почты", "7700000019", status="sent")
+
+    result = build_outreach_preflight(db, CompanyFilters(), outreach_settings())
+
+    assert result["skipped"]["not_new"] == 1
+    assert result["skipped"]["without_email"] == 1
+
+
+def test_worker_automatically_creates_campaign_for_new_company(db):
+    company = add_company(db, "Автоматическая", "7700000018", emails=("auto@carrier.ru",))
+    settings = outreach_settings(outreach_automatic_send_enabled=True)
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False, autoflush=False)
+    sent: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def send(self, recipient: str, *_):
+            sent.append(recipient)
+            return "automatic-message"
+
+    process_outreach_tick(
+        settings,
+        sender_factory=FakeSender,
+        session_factory=factory,
+        now=datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc),
+    )
+    db.expire_all()
+
+    campaign = db.query(OutreachCampaign).one()
+    assert sent == ["auto@carrier.ru"]
+    assert campaign.status == "completed"
+    assert campaign.sent_count == 1
+    assert db.get(Company, company.id).status == "sent"
 
 
 def test_worker_sends_one_delivery_updates_company_and_completes(db):
@@ -152,7 +197,7 @@ def test_worker_sends_one_delivery_updates_company_and_completes(db):
 
 
 def test_worker_pauses_campaign_after_gmail_error(db):
-    add_company(db, "Перевозчик", "7700000030", emails=("lead@carrier.ru",))
+    company = add_company(db, "Перевозчик", "7700000030", emails=("lead@carrier.ru",))
     settings = outreach_settings()
     campaign = create_outreach_campaign(db, CompanyFilters(), settings)
     factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False, autoflush=False)
@@ -186,6 +231,11 @@ def test_worker_pauses_campaign_after_gmail_error(db):
     assert current.failed_count == 1
     assert "ограничил" in current.pause_reason
     assert current.deliveries[0].status == "failed"
+    failed_company = db.get(Company, company.id)
+    assert failed_company.status == "error"
+    assert failed_company.history[0].event_type == "email_failed"
+    assert failed_company.history[0].to_status == "error"
+    assert "Gmail временно ограничил отправку" in failed_company.history[0].description
 
 
 def test_worker_waits_when_recent_manual_message_used_interval(db):
@@ -225,8 +275,88 @@ def test_worker_waits_when_recent_manual_message_used_interval(db):
     assert current.deliveries[0].status == "queued"
 
 
+def test_worker_skips_rolling_hour_check_when_hourly_limit_is_disabled(db):
+    company = add_company(db, "Перевозчик", "7700000042", emails=("lead@carrier.ru",))
+    settings = outreach_settings(
+        outreach_daily_limit=500,
+        outreach_hourly_limit=0,
+        outreach_min_interval_seconds=10,
+    )
+    campaign = create_outreach_campaign(db, CompanyFilters(), settings)
+    now = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    campaign.next_send_at = now
+    for index in range(5):
+        db.add(
+            ActivityHistory(
+                company=company,
+                event_type="email_sent",
+                description="Предыдущая отправка",
+                event_data={"recipient": f"other{index}@another{index}.ru"},
+                created_at=now - timedelta(minutes=index + 1),
+            )
+        )
+    db.commit()
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False, autoflush=False)
+    sent: list[str] = []
+
+    class FakeSender:
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def send(self, recipient: str, *_):
+            sent.append(recipient)
+            return "message-without-hourly-limit"
+
+    process_outreach_tick(
+        settings,
+        sender_factory=FakeSender,
+        session_factory=factory,
+        now=now,
+    )
+    db.expire_all()
+
+    assert sent == ["lead@carrier.ru"]
+    assert db.get(OutreachCampaign, campaign.id).status == "completed"
+
+
+def test_worker_rechecks_company_before_sending_queued_delivery(db):
+    company = add_company(db, "Отказавшаяся", "7700000041", emails=("stop@carrier.ru",))
+    settings = outreach_settings()
+    campaign = create_outreach_campaign(db, CompanyFilters(), settings)
+    now = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc)
+    company.status = "rejected"
+    campaign.next_send_at = now
+    db.commit()
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False, autoflush=False)
+
+    class MustNotSend:
+        def __init__(self, *_):
+            raise AssertionError("A rejected company must be skipped before Gmail is called")
+
+    process_outreach_tick(
+        settings,
+        sender_factory=MustNotSend,
+        session_factory=factory,
+        now=now,
+    )
+    db.expire_all()
+
+    current = db.get(OutreachCampaign, campaign.id)
+    assert current.status == "completed"
+    assert current.sent_count == 0
+    assert current.cancelled_count == 1
+    assert current.deliveries[0].status == "cancelled"
+    assert "больше не соответствует" in current.deliveries[0].error_message
+
+
 def test_recovery_pauses_ambiguous_inflight_delivery_without_retry(db):
-    add_company(db, "Перевозчик", "7700000050", emails=("lead@carrier.ru",))
+    company = add_company(db, "Перевозчик", "7700000050", emails=("lead@carrier.ru",))
     campaign = create_outreach_campaign(db, CompanyFilters(), outreach_settings())
     campaign.deliveries[0].status = "sending"
     db.commit()
@@ -237,6 +367,7 @@ def test_recovery_pauses_ambiguous_inflight_delivery_without_retry(db):
     assert campaign.failed_count == 1
     assert campaign.deliveries[0].status == "failed"
     assert "автоматический повтор отключён" in campaign.deliveries[0].error_message
+    assert db.get(Company, company.id).status == "error"
 
 
 def test_cancellation_during_inflight_send_is_not_overwritten_by_completion(db):

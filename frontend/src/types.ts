@@ -1,10 +1,9 @@
 export type CompanyStatus =
   | "new"
-  | "checked"
-  | "ready"
   | "sent"
   | "answered"
   | "interested"
+  | "customer"
   | "rejected"
   | "error";
 
@@ -120,7 +119,7 @@ export interface Filters {
 export interface DashboardMetrics {
   total: number;
   with_email: number;
-  ready: number;
+  new: number;
   sent_emails: number;
   interested: number;
 }
@@ -177,9 +176,10 @@ export interface OutreachPolicy {
   hourly_limit: number;
   min_interval_seconds: number;
   max_per_domain_per_day: number;
-  eligible_status?: "ready";
+  eligible_status?: "new";
   primary_address_only?: boolean;
   automatic_stop_on_provider_error?: boolean;
+  automatic_send_enabled?: boolean;
   opt_out_footer_enabled?: boolean;
 }
 
@@ -189,7 +189,7 @@ export interface OutreachPreflight {
   selected_count: number;
   deferred_by_campaign_limit: number;
   skipped: {
-    not_ready: number;
+    not_new: number;
     inactive: number;
     without_email: number;
     already_contacted: number;

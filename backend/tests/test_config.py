@@ -39,3 +39,14 @@ def test_combined_provider_requires_no_extra_key_setting():
     )
 
     assert settings.resolved_discovery_provider == "combined"
+
+
+def test_outreach_defaults_enable_automatic_queue_with_higher_limits():
+    settings = Settings(_env_file=None)
+
+    assert settings.outreach_automatic_send_enabled is True
+    assert settings.outreach_campaign_size == 500
+    assert settings.outreach_daily_limit == 500
+    assert settings.outreach_hourly_limit == 0
+    assert settings.outreach_min_interval_seconds == 10
+    assert settings.outreach_max_per_domain_per_day == 5

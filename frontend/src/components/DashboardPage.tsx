@@ -1,7 +1,9 @@
 import {
   ArrowRight,
+  AlertTriangle,
   Building2,
   CheckCircle2,
+  Handshake,
   Mail,
   RefreshCw,
   Search,
@@ -9,38 +11,35 @@ import {
   Users,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import type { CSSProperties } from "react";
 import { api } from "../api";
-import type { CompanyStatus, DashboardResponse, SearchRun } from "../types";
+import type { CompanyStatus, DashboardResponse } from "../types";
 import { Notice } from "./Notice";
-import { SearchRunNotice } from "./SearchRunNotice";
 
 interface DashboardPageProps {
-  searchError: string | null;
-  searchRun: SearchRun | null;
   searching: boolean;
   refreshToken: number;
   onSearch: () => void;
   onOpenOutreach: () => void;
-  onCloseSearchError: () => void;
-  onCloseSearchRun: () => void;
 }
 
 const statusLabels: Record<CompanyStatus, string> = {
   new: "Новая",
-  checked: "Проверена",
-  ready: "Готова",
-  sent: "Отправлено",
-  answered: "Ответили",
-  interested: "Интерес",
+  sent: "Письмо отправлено",
+  answered: "Ответила",
+  interested: "Заинтересована",
+  customer: "Работает с нами",
   rejected: "Отказ",
-  error: "Ошибка",
+  error: "Ошибка отправки",
 };
 
 const funnel = [
   { key: "new" as const, label: "Новые", tone: "orange", icon: Users },
-  { key: "checked" as const, label: "Проверены", tone: "teal", icon: CheckCircle2 },
-  { key: "ready" as const, label: "Готовы", tone: "amber", icon: Mail },
   { key: "sent" as const, label: "Отправлено", tone: "green", icon: Send },
+  { key: "answered" as const, label: "Ответили", tone: "teal", icon: Mail },
+  { key: "interested" as const, label: "Заинтересованы", tone: "amber", icon: CheckCircle2 },
+  { key: "customer" as const, label: "Работают с нами", tone: "green", icon: Handshake },
+  { key: "error" as const, label: "Ошибки отправки", tone: "red", icon: AlertTriangle },
 ];
 
 function formatShortDate(value: string) {
@@ -50,14 +49,10 @@ function formatShortDate(value: string) {
 }
 
 export function DashboardPage({
-  searchError,
-  searchRun,
   searching,
   refreshToken,
   onSearch,
   onOpenOutreach,
-  onCloseSearchError,
-  onCloseSearchRun,
 }: DashboardPageProps) {
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,15 +73,9 @@ export function DashboardPage({
   }, [refreshToken]);
 
   const maxFunnel = Math.max(1, ...funnel.map((item) => data?.status_counts[item.key] || 0));
-  const heatmap = useMemo(() => {
-    const values = data?.daily_discoveries || [];
-    if (!values.length) return [];
-    const firstDay = new Date(`${values[0].date}T12:00:00`).getDay();
-    const mondayOffset = (firstDay + 6) % 7;
-    const paddedHistory = [...Array<null>(mondayOffset).fill(null), ...values];
-    const sundayOffset = (7 - (paddedHistory.length % 7)) % 7;
-    return [...paddedHistory, ...Array<null>(sundayOffset).fill(null)];
-  }, [data?.daily_discoveries]);
+  const heatmap = useMemo(() => data?.daily_discoveries || [], [data?.daily_discoveries]);
+  const heatmapColumns = Math.max(1, Math.ceil(heatmap.length / 7));
+  const heatmapMinWidth = heatmapColumns * 20 + Math.max(0, heatmapColumns - 1) * 4;
   const maxDaily = Math.max(1, ...(data?.daily_discoveries.map((item) => item.count) || [0]));
 
   return (
@@ -108,43 +97,44 @@ export function DashboardPage({
       </header>
 
       {error ? <Notice tone="error" title="Не удалось загрузить дашборд" description={error} /> : null}
-      <SearchRunNotice
-        error={searchError}
-        run={searchRun}
-        onCloseError={onCloseSearchError}
-        onCloseRun={onCloseSearchRun}
-      />
 
       <section className="dashboard-metrics" aria-label="Ключевые показатели">
         <Metric icon={Building2} label="Всего компаний" value={data?.metrics.total} tone="orange" />
         <Metric icon={Mail} label="С email" value={data?.metrics.with_email} tone="teal" />
-        <Metric icon={Send} label="Готовы к отправке" value={data?.metrics.ready} tone="orange" />
+        <Metric icon={Send} label="Новые для отправки" value={data?.metrics.new} tone="orange" />
         <Metric icon={CheckCircle2} label="Писем отправлено" value={data?.metrics.sent_emails} tone="teal" />
       </section>
 
       <section className="dashboard-main-grid">
         <article className="dashboard-panel activity-panel">
           <div className="panel-heading">
-            <div><h2>Новые компании</h2><p>За последние 6 месяцев</p></div>
+            <div><h2>Новые компании</h2><p>За последние 3 месяца</p></div>
           </div>
           <div className="heatmap-layout">
             <div className="heatmap-days" aria-hidden="true">
               {['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].map((day) => <span key={day}>{day}</span>)}
             </div>
             <div className="heatmap-scroll">
-              <div className="heatmap-grid" role="img" aria-label="Количество найденных компаний по дням">
-                {heatmap.map((item, index) => item ? (
-                  <span
-                    key={item.date}
-                    className={`heatmap-cell heatmap-cell--${item.count ? Math.max(1, Math.ceil((item.count / maxDaily) * 4)) : 0}`}
-                    title={`${formatShortDate(item.date)}: ${item.count}`}
-                  />
-                ) : <span aria-hidden="true" className="heatmap-cell heatmap-cell--empty" key={`empty-${index}`} />)}
-              </div>
-              <div className="heatmap-legend">
-                <span>Меньше</span>
-                {[0, 1, 2, 3, 4].map((level) => <i className={`heatmap-cell heatmap-cell--${level}`} key={level} />)}
-                <span>Больше</span>
+              <div
+                className="heatmap-chart"
+                style={{ minWidth: `${heatmapMinWidth}px`, "--heatmap-columns": heatmapColumns } as CSSProperties}
+              >
+                <div className="heatmap-grid" role="img" aria-label="Количество найденных компаний по дням">
+                  {heatmap.map((item) => (
+                    <span
+                      key={item.date}
+                      className={`heatmap-cell heatmap-cell--has-tooltip heatmap-cell--${item.count ? Math.max(1, Math.ceil((item.count / maxDaily) * 4)) : 0}`}
+                      title={`${formatShortDate(item.date)}. Найдено компаний: ${item.count}`}
+                      aria-label={`${formatShortDate(item.date)}. Найдено компаний: ${item.count}`}
+                      tabIndex={0}
+                    />
+                  ))}
+                </div>
+                <div className="heatmap-legend">
+                  <span>Меньше</span>
+                  {[0, 1, 2, 3, 4].map((level) => <i className={`heatmap-cell heatmap-cell--${level}`} key={level} />)}
+                  <span>Больше</span>
+                </div>
               </div>
             </div>
           </div>

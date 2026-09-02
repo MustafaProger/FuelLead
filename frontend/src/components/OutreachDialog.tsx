@@ -28,6 +28,10 @@ function formatDelay(seconds: number) {
   return `${seconds} сек`;
 }
 
+function formatHourlyLimit(hourlyLimit: number) {
+  return hourlyLimit === 0 ? "часового лимита нет" : `${hourlyLimit}/час`;
+}
+
 function formatDateTime(value: string | null) {
   if (!value) return "—";
   return new Intl.DateTimeFormat("ru-RU", {
@@ -141,7 +145,7 @@ export function OutreachDialog({
           <span className="outreach-dialog-icon"><Send size={20} /></span>
           <div>
             <h2 id="outreach-dialog-title">Отправка писем</h2>
-            <p>Персональная очередь с ограничениями для защиты почты</p>
+            <p>Автоматическая очередь с ограничениями для защиты почты</p>
           </div>
           <button type="button" className="dialog-close" onClick={onClose} aria-label="Закрыть"><X size={19} /></button>
         </header>
@@ -161,15 +165,15 @@ export function OutreachDialog({
             <div className="outreach-summary-grid">
               <article><small>По текущим фильтрам</small><strong>{preflight.matched_count}</strong></article>
               <article><small>Можно отправить</small><strong>{preflight.eligible_count}</strong></article>
-              <article className="outreach-summary-primary"><small>В этой очереди</small><strong>{preflight.selected_count}</strong></article>
+              <article className="outreach-summary-primary"><small>{preflight.policy.automatic_send_enabled ? "Новые по фильтру" : "В этой очереди"}</small><strong>{preflight.selected_count}</strong></article>
             </div>
 
             <div className="outreach-safety-panel">
-              <div className="outreach-panel-title"><ShieldCheck size={18} /><strong>Ограничения применяются на сервере</strong></div>
+              <div className="outreach-panel-title"><ShieldCheck size={18} /><strong>{preflight.policy.automatic_send_enabled ? "Автоотправка включена на сервере" : "Ограничения применяются на сервере"}</strong></div>
               <ul>
-                <li>только действующие компании со статусом «Готова»;</li>
+                <li>{preflight.policy.automatic_send_enabled ? "новые действующие компании автоматически попадают в очередь;" : "только действующие компании со статусом «Новая»;"}</li>
                 <li>одно письмо на основной email, без повторов уже отправленным;</li>
-                <li>до {preflight.policy.hourly_limit} писем в час и {preflight.policy.daily_limit} в день;</li>
+                <li>{preflight.policy.hourly_limit === 0 ? "часового лимита нет" : `до ${preflight.policy.hourly_limit} писем в час`}, до {preflight.policy.daily_limit} писем в день;</li>
                 <li>пауза не меньше {formatDelay(preflight.policy.min_interval_seconds)} между письмами;</li>
                 <li>до {preflight.policy.max_per_domain_per_day} писем на один домен в день;</li>
                 <li>при ошибке или ограничении Gmail очередь автоматически встанет на паузу.</li>
@@ -177,8 +181,9 @@ export function OutreachDialog({
             </div>
 
             <div className="outreach-skips">
-              <span>Не войдут в очередь:</span>
-              <small>не готовы — {preflight.skipped.not_ready}</small>
+              <span>Причины исключения могут пересекаться:</span>
+              <small>другой статус — {preflight.skipped.not_new}</small>
+              {preflight.skipped.inactive ? <small>не действуют — {preflight.skipped.inactive}</small> : null}
               <small>без email — {preflight.skipped.without_email}</small>
               <small>уже получали письмо — {preflight.skipped.already_contacted}</small>
               <small>повторяющийся адрес — {preflight.skipped.duplicate_address}</small>
@@ -192,18 +197,29 @@ export function OutreachDialog({
               </details>
             ) : null}
 
-            <label className="outreach-confirmation">
-              <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
-              <span>Я проверил получателей: предложение релевантно, адресаты не отказывались от писем, а ответы «Не писать» будут сразу исключаться из следующих запусков.</span>
-            </label>
+            {preflight.policy.automatic_send_enabled ? (
+              <>
+                <p className="outreach-auto-note">Автоочередь обрабатывает все новые действующие компании независимо от открытого фильтра. После отправки статус изменится на «Письмо отправлено»; окно можно закрыть — backend продолжит работу сам.</p>
+                <footer className="outreach-dialog-actions outreach-dialog-actions--single">
+                  <button className="button button--primary" type="button" onClick={onClose}>Понятно</button>
+                </footer>
+              </>
+            ) : (
+              <>
+                <label className="outreach-confirmation">
+                  <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+                  <span>Я проверил получателей: предложение релевантно, адресаты не отказывались от писем, а ответы «Не писать» будут сразу исключаться из следующих запусков.</span>
+                </label>
 
-            <footer className="outreach-dialog-actions">
-              <button className="button button--secondary" type="button" onClick={onClose}>Отмена</button>
-              <button className="button button--primary" type="button" disabled={!gmailConfigured || !confirmed || !preflight.selected_count || acting} onClick={start}>
-                {acting ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}
-                {acting ? "Создаём очередь…" : `Запустить на ${preflight.selected_count}`}
-              </button>
-            </footer>
+                <footer className="outreach-dialog-actions">
+                  <button className="button button--secondary" type="button" onClick={onClose}>Отмена</button>
+                  <button className="button button--primary" type="button" disabled={!gmailConfigured || !confirmed || !preflight.selected_count || acting} onClick={start}>
+                    {acting ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}
+                    {acting ? "Создаём очередь…" : `Запустить на ${preflight.selected_count}`}
+                  </button>
+                </footer>
+              </>
+            )}
           </>
         ) : null}
       </section>
@@ -233,7 +249,7 @@ function CampaignProgress({
         <span><small>Осталось</small><strong>{campaign.remaining_count}</strong></span>
         <span><small>Ошибки</small><strong>{campaign.failed_count}</strong></span>
       </div>
-      <div className="campaign-policy-line"><Clock3 size={15} /> {campaign.policy.hourly_limit}/час · {campaign.policy.daily_limit}/день · пауза {formatDelay(campaign.policy.min_interval_seconds)}</div>
+      <div className="campaign-policy-line"><Clock3 size={15} /> {formatHourlyLimit(campaign.policy.hourly_limit)} · {campaign.policy.daily_limit}/день · пауза {formatDelay(campaign.policy.min_interval_seconds)}</div>
       {!terminal ? (
         <div className="campaign-actions">
           {campaign.status === "running" ? (

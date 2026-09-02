@@ -28,7 +28,110 @@ def create_database() -> None:
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _upgrade_company_status_schema(
+        models.Company,
+        models.ALL_STATUSES,
+        models.REMOVED_COMPANY_STATUSES,
+    )
     _upgrade_discovery_cursor_schema(models.DiscoveryCursor)
+
+
+def _upgrade_company_status_schema(company_model, statuses, removed_statuses) -> None:
+    """Replace legacy lead statuses without losing existing companies.
+
+    FuelLead has no versioned migration runner yet. PostgreSQL can replace the
+    named check constraint in place; SQLite needs a table rebuild because it
+    cannot drop check constraints. Removed status values are folded into
+    ``new`` so the simplified pipeline has no inaccessible rows; delivery
+    errors remain visible as ``error``.
+    """
+    with engine.connect() as connection:
+        inspector = inspect(connection)
+        if "companies" not in inspector.get_table_names():
+            return
+        checks = inspector.get_check_constraints("companies")
+        status_check = next(
+            (item for item in checks if item.get("name") == "ck_companies_status"),
+            None,
+        )
+        definition = str((status_check or {}).get("sqltext") or "").lower()
+        is_current = all(status in definition for status in statuses) and not any(
+            status in definition for status in removed_statuses
+        )
+        dialect = connection.dialect.name
+
+    if is_current:
+        return
+    if dialect == "sqlite":
+        _rebuild_sqlite_companies(company_model, removed_statuses)
+        return
+
+    allowed_values = ",".join(f"'{status}'" for status in statuses)
+    removed_values = ",".join(f"'{status}'" for status in removed_statuses)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"UPDATE companies SET status = 'new' "
+                f"WHERE status IN ({removed_values})"
+            )
+        )
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text(
+                    "ALTER TABLE companies "
+                    "DROP CONSTRAINT IF EXISTS ck_companies_status"
+                )
+            )
+            connection.execute(
+                text(
+                    "ALTER TABLE companies ADD CONSTRAINT ck_companies_status "
+                    f"CHECK (status IN ({allowed_values}))"
+                )
+            )
+
+
+def _rebuild_sqlite_companies(company_model, removed_statuses) -> None:
+    """Rebuild only the SQLite companies table while preserving child FKs."""
+    removed_values = ",".join(f"'{status}'" for status in removed_statuses)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+        connection.commit()
+        try:
+            with connection.begin():
+                indexes = inspect(connection).get_indexes("companies")
+                connection.execute(
+                    text(
+                        f"UPDATE companies SET status = 'new' "
+                        f"WHERE status IN ({removed_values})"
+                    )
+                )
+                connection.execute(
+                    text("ALTER TABLE companies RENAME TO companies_legacy")
+                )
+                quote = connection.dialect.identifier_preparer.quote
+                for index in indexes:
+                    if index.get("name"):
+                        connection.execute(
+                            text(f"DROP INDEX IF EXISTS {quote(index['name'])}")
+                        )
+                company_model.__table__.create(bind=connection, checkfirst=False)
+                columns = ", ".join(
+                    quote(column.name) for column in company_model.__table__.columns
+                )
+                connection.execute(
+                    text(
+                        f"INSERT INTO companies ({columns}) "
+                        f"SELECT {columns} FROM companies_legacy"
+                    )
+                )
+                connection.execute(text("DROP TABLE companies_legacy"))
+        finally:
+            if connection.in_transaction():
+                connection.rollback()
+            connection.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
 
 
 def _upgrade_discovery_cursor_schema(cursor_model) -> None:

@@ -1,8 +1,10 @@
 import pytest
 
+from app.config import Settings
+from app.main import update_company_status
 from app.models import Company, CompanyEmail
 from app.queries import build_company_query
-from app.schemas import CompanyFilters
+from app.schemas import CompanyFilters, StatusUpdate
 
 
 def add_company(db, name: str, inn: str, *emails: str) -> Company:
@@ -37,3 +39,45 @@ def test_email_provider_filter_covers_public_and_other_domains(db):
 def test_email_provider_filter_rejects_unknown_value():
     with pytest.raises(ValueError, match="Email provider must be one of"):
         CompanyFilters(email_provider="unknown")
+
+
+def test_company_statuses_use_simplified_pipeline():
+    assert StatusUpdate(status="customer").status == "customer"
+    assert CompanyFilters(status="CUSTOMER").status == "customer"
+    assert StatusUpdate(status="error").status == "error"
+
+    for removed in ("checked", "ready"):
+        with pytest.raises(ValueError, match="Status must be one of"):
+            StatusUpdate(status=removed)
+        with pytest.raises(ValueError, match="Status must be one of"):
+            CompanyFilters(status=removed)
+
+
+def test_status_update_supports_customer_and_wakes_automatic_queue_for_new(db, monkeypatch):
+    company = add_company(db, "Статус", "7700000010", "lead@example.ru")
+    company.status = "sent"
+    db.commit()
+    wakeups: list[bool] = []
+    monkeypatch.setattr("app.main.wake_outreach_worker", lambda: wakeups.append(True))
+    settings = Settings(_env_file=None, outreach_automatic_send_enabled=True)
+
+    customer = update_company_status(
+        company.id,
+        StatusUpdate(status="customer"),
+        db,
+        settings,
+    )
+    assert customer["status"] == "customer"
+    assert customer["history"][0]["description"] == (
+        "Статус изменён: Письмо отправлено → Работает с нами"
+    )
+    assert wakeups == []
+
+    new = update_company_status(
+        company.id,
+        StatusUpdate(status="new"),
+        db,
+        settings,
+    )
+    assert new["status"] == "new"
+    assert wakeups == [True]

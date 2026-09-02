@@ -1,6 +1,7 @@
 from datetime import date
 
 import pytest
+from fastapi import HTTPException
 
 from app import main
 from app.config import Settings
@@ -11,6 +12,7 @@ from app.services.email_templates import (
     get_or_create_email_template,
     render_email_template,
 )
+from app.services.gmail import GmailOAuthError
 
 
 def make_company(db) -> Company:
@@ -21,7 +23,7 @@ def make_company(db) -> Company:
         primary_okved_code="49.41",
         primary_okved_name="Грузовые перевозки",
         activity_category="freight",
-        status="ready",
+        status="new",
     )
     company.emails.append(CompanyEmail(email="office@artel.ru", source="Checko API"))
     db.add(company)
@@ -148,3 +150,39 @@ def test_company_send_without_recipient_uses_only_primary_company_email(db, monk
     assert result["sent_count"] == 1
     assert len(company.history) == 1
     assert company.history[0].event_data["recipient"] == "office@artel.ru"
+
+
+def test_single_company_send_marks_company_error_and_saves_reason(db, monkeypatch):
+    company = make_company(db)
+
+    class FailingSender:
+        def __init__(self, config):
+            self.config = config
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def send(self, *_):
+            raise GmailOAuthError("Gmail отклонил отправку", status_code=429)
+
+    monkeypatch.setattr(main, "GmailOAuthSender", FailingSender)
+    settings = Settings(
+        _env_file=None,
+        outreach_sender_email="sender@example.ru",
+        gmail_client_id="client-id",
+        gmail_client_secret="client-secret",
+        gmail_refresh_token="refresh-token",
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        main.send_company_email(company.id, EmailSendRequest(), db, settings)
+
+    db.expire_all()
+    failed_company = db.get(Company, company.id)
+    assert caught.value.status_code == 502
+    assert failed_company.status == "error"
+    assert failed_company.history[0].event_type == "email_failed"
+    assert failed_company.history[0].event_data["error"] == "Gmail отклонил отправку"

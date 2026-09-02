@@ -65,6 +65,40 @@ def _iso(value: datetime | None) -> str | None:
     return aware.isoformat() if aware else None
 
 
+def mark_company_send_failed(
+    db: Session,
+    company_id: int | None,
+    recipient: str,
+    reason: str,
+    *,
+    campaign_id: int | None = None,
+    occurred_at: datetime | None = None,
+) -> Company | None:
+    """Expose a delivery failure on the company and preserve its reason in history."""
+    company = db.get(Company, company_id) if company_id else None
+    if company is None:
+        return None
+    timestamp = _aware(occurred_at) or datetime.now(timezone.utc)
+    previous_status = company.status
+    company.status = "error"
+    company.last_updated_at = timestamp
+    event_data: dict[str, object] = {"recipient": recipient, "error": reason}
+    if campaign_id is not None:
+        event_data["campaign_id"] = campaign_id
+    db.add(
+        ActivityHistory(
+            company=company,
+            event_type="email_failed",
+            description=f"Ошибка отправки на {recipient}: {reason}",
+            from_status=previous_status,
+            to_status="error",
+            event_data=event_data,
+            created_at=timestamp,
+        )
+    )
+    return company
+
+
 def append_opt_out_footer(body: str, settings: Settings) -> str:
     footer = settings.outreach_opt_out_text.strip()
     clean_body = body.strip()
@@ -110,7 +144,7 @@ def select_outreach_candidates(
     candidates: list[OutreachCandidate] = []
     skipped = Counter(
         {
-            "not_ready": 0,
+            "not_new": 0,
             "inactive": 0,
             "without_email": 0,
             "already_contacted": 0,
@@ -119,12 +153,12 @@ def select_outreach_candidates(
     )
 
     for company in companies:
-        if company.status != "ready":
-            skipped["not_ready"] += 1
-            continue
-        if not company.is_active:
+        is_not_new = company.status != "new"
+        is_inactive = not company.is_active
+        if is_not_new:
+            skipped["not_new"] += 1
+        if is_inactive:
             skipped["inactive"] += 1
-            continue
         recipients = [
             normalized
             for email in company.emails
@@ -133,14 +167,20 @@ def select_outreach_candidates(
         recipients = list(dict.fromkeys(recipients))
         if not recipients:
             skipped["without_email"] += 1
+        recipient = recipients[0] if recipients else None
+        was_contacted = bool(recipient and recipient in contacted)
+        if was_contacted:
+            skipped["already_contacted"] += 1
+
+        # Diagnostic counters intentionally overlap. This keeps the preflight
+        # consistent with the dashboard (for example, a new company without an
+        # email is counted in both groups) instead of hiding later reasons
+        # behind the first failed check.
+        if is_not_new or is_inactive or not recipient or was_contacted:
             continue
 
         # One company gets one message. We intentionally do not fall back to a
         # second inbox when the primary address was already contacted.
-        recipient = recipients[0]
-        if recipient in contacted:
-            skipped["already_contacted"] += 1
-            continue
         if recipient in selected_addresses:
             skipped["duplicate_address"] += 1
             continue
@@ -179,9 +219,10 @@ def outreach_policy_dict(settings: Settings) -> dict:
         "hourly_limit": settings.outreach_hourly_limit,
         "min_interval_seconds": settings.outreach_min_interval_seconds,
         "max_per_domain_per_day": settings.outreach_max_per_domain_per_day,
-        "eligible_status": "ready",
+        "eligible_status": "new",
         "primary_address_only": True,
         "automatic_stop_on_provider_error": True,
+        "automatic_send_enabled": settings.outreach_automatic_send_enabled,
         "opt_out_footer_enabled": bool(settings.outreach_opt_out_text.strip()),
     }
 
@@ -236,7 +277,7 @@ def create_outreach_campaign(
     selection = select_outreach_candidates(db, filters, settings)
     if not selection.candidates:
         raise OutreachPolicyError(
-            "Нет получателей: нужны действующие компании со статусом «Готова», "
+            "Нет получателей: нужны действующие компании со статусом «Новая», "
             "которым ещё не отправляли письмо"
         )
 
@@ -362,6 +403,13 @@ def recover_interrupted_outreach(db: Session) -> None:
             "Backend был перезапущен во время отправки. Проверьте Gmail перед продолжением"
         )
         campaign.next_send_at = None
+        mark_company_send_failed(
+            db,
+            delivery.company_id,
+            delivery.recipient,
+            delivery.error_message,
+            campaign_id=campaign.id,
+        )
     if interrupted:
         db.commit()
 
@@ -413,11 +461,12 @@ def _global_policy_retry_at(
     if len(today_records) >= daily_limit:
         return next_day
 
-    hour_start = now - timedelta(hours=1)
-    hour_records = sorted(sent_at for sent_at, _ in records if sent_at > hour_start)
     retry_candidates: list[datetime] = []
-    if len(hour_records) >= hourly_limit:
-        retry_candidates.append(hour_records[-hourly_limit] + timedelta(hours=1))
+    if hourly_limit > 0:
+        hour_start = now - timedelta(hours=1)
+        hour_records = sorted(sent_at for sent_at, _ in records if sent_at > hour_start)
+        if len(hour_records) >= hourly_limit:
+            retry_candidates.append(hour_records[-hourly_limit] + timedelta(hours=1))
     if records:
         latest = max(sent_at for sent_at, _ in records)
         interval_retry = latest + timedelta(seconds=min_interval_seconds)
@@ -479,7 +528,19 @@ def process_outreach_tick(
             .order_by(OutreachCampaign.id.asc())
         )
         if campaign is None:
-            return float(settings.outreach_worker_poll_seconds)
+            if not (
+                settings.outreach_automatic_send_enabled
+                and settings.gmail_oauth_configured
+            ):
+                return float(settings.outreach_worker_poll_seconds)
+            try:
+                # Newly discovered companies enter the automatic queue without
+                # requiring the dialog to stay open or another manual click.
+                campaign = create_outreach_campaign(db, CompanyFilters(), settings)
+                campaign.next_send_at = effective_now
+                db.commit()
+            except OutreachPolicyError:
+                return float(settings.outreach_worker_poll_seconds)
 
         scheduled_at = _aware(campaign.next_send_at)
         if scheduled_at and scheduled_at > effective_now:
@@ -509,6 +570,24 @@ def process_outreach_tick(
                 .order_by(OutreachDelivery.id.asc())
             ).all()
         )
+        contacted = _previously_contacted_addresses(db)
+        eligible_queued: list[OutreachDelivery] = []
+        for item in queued:
+            company = db.get(Company, item.company_id) if item.company_id else None
+            if (
+                company is not None
+                and company.is_active
+                and company.status == "new"
+                and item.recipient not in contacted
+            ):
+                eligible_queued.append(item)
+                continue
+            item.status = "cancelled"
+            item.error_message = (
+                "Пропущено перед отправкой: компания больше не соответствует условиям"
+            )
+            campaign.cancelled_count += 1
+        queued = eligible_queued
         if not queued:
             campaign.status = "completed"
             campaign.completed_at = effective_now
@@ -568,6 +647,14 @@ def process_outreach_tick(
                         f"Отправка остановлена после ошибки Gmail: {exc}"
                     )
                 campaign.next_send_at = None
+                mark_company_send_failed(
+                    db,
+                    delivery.company_id,
+                    delivery.recipient,
+                    delivery.error_message,
+                    campaign_id=campaign.id,
+                    occurred_at=effective_now,
+                )
                 db.commit()
             return float(settings.outreach_worker_poll_seconds)
         except Exception:
@@ -584,6 +671,14 @@ def process_outreach_tick(
                         "Отправка остановлена после неизвестной ошибки. Проверьте Gmail"
                     )
                 campaign.next_send_at = None
+                mark_company_send_failed(
+                    db,
+                    delivery.company_id,
+                    delivery.recipient,
+                    delivery.error_message,
+                    campaign_id=campaign.id,
+                    occurred_at=effective_now,
+                )
                 db.commit()
             return float(settings.outreach_worker_poll_seconds)
 

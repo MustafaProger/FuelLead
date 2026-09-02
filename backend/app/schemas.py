@@ -20,6 +20,16 @@ class CompanyFilters(BaseModel):
     discovered_on: date | None = None
     search: str | None = None
 
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().lower()
+        if normalized not in ALL_STATUSES:
+            raise ValueError(f"Status must be one of: {', '.join(ALL_STATUSES)}")
+        return normalized
+
     @field_validator("email_provider")
     @classmethod
     def validate_email_provider(cls, value: str | None) -> str | None:

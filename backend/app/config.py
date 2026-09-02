@@ -53,12 +53,13 @@ class Settings(BaseSettings):
     gmail_client_secret: str = ""
     gmail_refresh_token: str = ""
     gmail_timeout_seconds: float = 30.0
-    outreach_campaign_size: int = Field(default=20, ge=1, le=100)
-    outreach_daily_limit: int = Field(default=20, ge=1, le=100)
-    outreach_hourly_limit: int = Field(default=5, ge=1, le=20)
-    outreach_min_interval_seconds: int = Field(default=300, ge=60, le=86_400)
-    outreach_max_per_domain_per_day: int = Field(default=2, ge=1, le=20)
+    outreach_campaign_size: int = Field(default=500, ge=1, le=500)
+    outreach_daily_limit: int = Field(default=500, ge=1, le=500)
+    outreach_hourly_limit: int = Field(default=0, ge=0, le=500)
+    outreach_min_interval_seconds: int = Field(default=10, ge=10, le=86_400)
+    outreach_max_per_domain_per_day: int = Field(default=5, ge=1, le=20)
     outreach_worker_poll_seconds: int = Field(default=30, ge=5, le=300)
+    outreach_automatic_send_enabled: bool = True
     outreach_opt_out_text: str = (
         "Если предложение неактуально, ответьте «Не писать», "
         "и мы исключим адрес из дальнейших обращений."

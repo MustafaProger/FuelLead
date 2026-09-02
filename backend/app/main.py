@@ -17,6 +17,7 @@ from app.export import build_xlsx
 from app.models import (
     ALL_STATUSES,
     ActivityHistory,
+    COMPANY_STATUS_LABELS,
     Company,
     CompanyContact,
     ExcludedCompany,
@@ -53,6 +54,7 @@ from app.services.outreach import (
     build_outreach_preflight,
     cancel_outreach_campaign,
     create_outreach_campaign,
+    mark_company_send_failed,
     outreach_campaign_to_dict,
     outreach_policy_dict,
     pause_outreach_campaign,
@@ -81,7 +83,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="FuelLead API", version="0.1.0", lifespan=lifespan)
-DASHBOARD_HISTORY_DAYS = 183
+# 14 complete Monday-to-Sunday weeks form a compact three-month heatmap with no
+# partial-week placeholders at either edge.
+DASHBOARD_HISTORY_DAYS = 98
 
 
 @app.middleware("http")
@@ -206,7 +210,8 @@ def dashboard(
     ) or 0
 
     local_today = datetime.now(settings.timezone).date()
-    first_day = local_today - timedelta(days=DASHBOARD_HISTORY_DAYS - 1)
+    current_week_start = local_today - timedelta(days=local_today.weekday())
+    first_day = current_week_start - timedelta(weeks=13)
     local_start = datetime.combine(first_day, time.min, tzinfo=settings.timezone)
     discovered_values = db.scalars(
         select(Company.first_discovered_at).where(
@@ -231,7 +236,7 @@ def dashboard(
         "metrics": {
             "total": total,
             "with_email": with_email,
-            "ready": status_counts["ready"],
+            "new": status_counts["new"],
             "sent_emails": sent_emails,
             "interested": status_counts["interested"],
         },
@@ -309,12 +314,18 @@ def update_company_status(
             ActivityHistory(
                 company=company,
                 event_type="status_changed",
-                description=f"Статус изменён: {previous} → {update.status}",
+                description=(
+                    "Статус изменён: "
+                    f"{COMPANY_STATUS_LABELS[previous]} → "
+                    f"{COMPANY_STATUS_LABELS[update.status]}"
+                ),
                 from_status=previous,
                 to_status=update.status,
             )
         )
         db.commit()
+        if update.status == "new" and settings.outreach_automatic_send_enabled:
+            wake_outreach_worker()
     return company_to_dict(company, settings, detailed=True)
 
 
@@ -536,7 +547,24 @@ def send_company_email(
                 message_id = sender.send(recipient, subject, body)
                 sent_messages.append((recipient, message_id, subject))
     except (GmailOAuthError, ValueError) as exc:
+        mark_company_send_failed(
+            db,
+            company.id,
+            recipients[0],
+            str(exc),
+        )
+        db.commit()
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        reason = "Неизвестная ошибка отправки"
+        mark_company_send_failed(
+            db,
+            company.id,
+            recipients[0],
+            reason,
+        )
+        db.commit()
+        raise HTTPException(status_code=502, detail=reason) from exc
 
     previous_status = company.status
     company.status = "sent"

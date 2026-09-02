@@ -23,15 +23,23 @@ def utcnow() -> datetime:
 
 ALL_STATUSES = (
     "new",
-    "checked",
-    "ready",
     "sent",
     "answered",
     "interested",
+    "customer",
     "rejected",
     "error",
 )
-MVP_STATUSES = ("new", "checked", "ready")
+REMOVED_COMPANY_STATUSES = ("checked", "ready")
+COMPANY_STATUS_LABELS = {
+    "new": "Новая",
+    "sent": "Письмо отправлено",
+    "answered": "Ответила",
+    "interested": "Заинтересована",
+    "customer": "Работает с нами",
+    "rejected": "Отказ",
+    "error": "Ошибка отправки",
+}
 CONTACT_TYPES = ("phone", "whatsapp", "telegram")
 OUTREACH_CAMPAIGN_STATUSES = ("running", "paused", "completed", "cancelled")
 OUTREACH_DELIVERY_STATUSES = ("queued", "sending", "sent", "failed", "cancelled")
@@ -41,7 +49,7 @@ class Company(Base):
     __tablename__ = "companies"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('new','checked','ready','sent','answered','interested','rejected','error')",
+            "status IN ('new','sent','answered','interested','customer','rejected','error')",
             name="ck_companies_status",
         ),
     )

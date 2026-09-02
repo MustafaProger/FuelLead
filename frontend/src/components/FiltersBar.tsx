@@ -11,9 +11,12 @@ interface FiltersBarProps {
 const statusTabs: Array<{ value: "" | CompanyStatus; label: string }> = [
   { value: "", label: "Все" },
   { value: "new", label: "Новые" },
-  { value: "checked", label: "Проверенные" },
-  { value: "ready", label: "Готовые" },
   { value: "sent", label: "Отправленные" },
+  { value: "answered", label: "Ответили" },
+  { value: "interested", label: "Заинтересованы" },
+  { value: "customer", label: "Работают с нами" },
+  { value: "rejected", label: "Отказ" },
+  { value: "error", label: "Ошибки отправки" },
 ];
 
 export function FiltersBar({ filters, total, loading, onChange }: FiltersBarProps) {
