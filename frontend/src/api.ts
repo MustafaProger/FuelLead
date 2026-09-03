@@ -202,7 +202,7 @@ export const api = {
   verifySenderAccount: (id: number) =>
     request<SenderAccount>(`/sender-accounts/${id}/verify`, { method: "POST" }),
   sendSenderTestEmail: (id: number, recipient: string) =>
-    request<{ accepted: true; recipient: string; message_id: string; notice: string }>(
+    request<{ accepted: true; recipient: string; message_id: string; sent_copy_saved: boolean; notice: string }>(
       `/sender-accounts/${id}/test-email`,
       { method: "POST", body: JSON.stringify({ recipient, confirmed: true }) },
     ),

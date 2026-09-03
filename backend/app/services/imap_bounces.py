@@ -1,6 +1,7 @@
 import asyncio
 import imaplib
 import logging
+import re
 import socket
 import ssl
 from contextlib import suppress
@@ -27,6 +28,11 @@ from app.services.provider import normalize_email
 
 
 logger = logging.getLogger("fuellead.imap")
+
+IMAP_LIST_RE = re.compile(
+    rb"^\((?P<flags>[^)]*)\)\s+(?:NIL|\"(?:\\.|[^\"])*\")\s+(?P<mailbox>.+)$",
+    re.IGNORECASE,
+)
 
 
 class IMAPCollectorError(RuntimeError):
@@ -94,6 +100,36 @@ class MailruIMAPClient:
             if raw_message:
                 result.append((uid, raw_message))
         return result
+
+    def append_sent(self, raw_message: bytes, sent_at: datetime) -> None:
+        """Save an accepted SMTP message in Mail.ru's server-side Sent folder."""
+        assert self.client is not None
+        try:
+            status, values = self.client.list()
+            if status != "OK":
+                raise IMAPCollectorError("Mail.ru не вернул список почтовых папок")
+
+            sent_mailbox = None
+            for value in values or []:
+                if not isinstance(value, bytes):
+                    continue
+                match = IMAP_LIST_RE.match(value)
+                if match and b"\\sent" in match.group("flags").lower().split():
+                    # Keep the server-provided modified UTF-7 name and quoting.
+                    sent_mailbox = match.group("mailbox")
+                    break
+            if sent_mailbox is None:
+                raise IMAPCollectorError("Mail.ru не сообщил системную папку «Отправленные»")
+
+            status, _ = self.client.append(sent_mailbox, r"(\Seen)", sent_at, raw_message)
+            if status != "OK":
+                raise IMAPCollectorError("Mail.ru не сохранил копию в папке «Отправленные»")
+        except IMAPCollectorError:
+            raise
+        except (imaplib.IMAP4.error, ssl.SSLError, socket.timeout, OSError) as exc:
+            raise IMAPCollectorError(
+                "Не удалось сохранить копию письма в IMAP Mail.ru"
+            ) from exc
 
 
 def _safe_message_id(raw_message: bytes) -> str | None:

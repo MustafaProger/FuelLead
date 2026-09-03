@@ -578,7 +578,7 @@ def _apply_accepted(db: Session, delivery: OutreachDelivery, campaign: OutreachC
         previous_status = company.status
         company.status = "sent"
         company.last_updated_at = now
-        db.add(ActivityHistory(company=company, event_type="email_sent", description=f"SMTP-сервер принял письмо на {delivery.recipient}", from_status=previous_status, to_status="sent", event_data={"recipient": delivery.recipient, "message_id": result.message_id, "campaign_id": campaign.id, "sender_account_id": account.id, "smtp_code": result.smtp_code}, created_at=now))
+        db.add(ActivityHistory(company=company, event_type="email_sent", description=f"SMTP-сервер принял письмо на {delivery.recipient}", from_status=previous_status, to_status="sent", event_data={"recipient": delivery.recipient, "message_id": result.message_id, "campaign_id": campaign.id, "sender_account_id": account.id, "smtp_code": result.smtp_code, "sent_copy_saved": result.sent_copy_saved}, created_at=now))
     batch_completed = campaign.batch_position >= campaign.current_batch_target
     if batch_completed and campaign.current_batch_target == account.current_batch_size:
         account.successful_full_batches += 1
@@ -669,7 +669,12 @@ def process_outreach_tick(settings: Settings, *, sender_factory: Callable = Mail
             if stored_account is None:
                 raise CredentialEncryptionError("Ящик удалён до отправки")
             password = CredentialCipher(settings.mail_credentials_encryption_key).decrypt(stored_account.encrypted_password)
-            client = sender_factory(stored_account, password, timeout_seconds=settings.mail_smtp_timeout_seconds)
+            client = sender_factory(
+                stored_account,
+                password,
+                timeout_seconds=settings.mail_smtp_timeout_seconds,
+                imap_timeout_seconds=settings.mail_imap_timeout_seconds,
+            )
             result = client.send(recipient, subject, body, delivery_id=delivery_id, campaign_id=campaign_id)
             if isinstance(result, str):
                 result = SMTPAccepted(result, "250", "accepted")

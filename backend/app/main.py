@@ -321,7 +321,14 @@ def send_mailbox_test_email(
         "recipient": request.recipient,
         "message_id": result.message_id,
         "smtp_code": result.smtp_code,
-        "notice": "SMTP-сервер принял тестовое письмо; доставка во «Входящие» не подтверждена",
+        "sent_copy_saved": result.sent_copy_saved,
+        "notice": (
+            "SMTP-сервер принял тестовое письмо, копия сохранена в «Отправленных»; "
+            "доставка во «Входящие» не подтверждена"
+            if result.sent_copy_saved
+            else "SMTP-сервер принял тестовое письмо, но копия не сохранена в «Отправленных»; "
+            "доставка во «Входящие» не подтверждена"
+        ),
     }
 
 
@@ -735,6 +742,7 @@ def send_company_email(
             sender_account,
             password,
             timeout_seconds=settings.mail_smtp_timeout_seconds,
+            imap_timeout_seconds=settings.mail_imap_timeout_seconds,
         )
         recipient = recipients[0]
         values = company_template_values(company, recipient, settings)
@@ -781,6 +789,7 @@ def send_company_email(
                     "message_id": message_id,
                     "subject": subject,
                     "sender_account_id": sender_account.id,
+                    "sent_copy_saved": result.sent_copy_saved,
                 },
             )
         )
@@ -796,6 +805,7 @@ def send_company_email(
         "status": company.status,
         "sent_at": datetime.now(settings.timezone).isoformat(),
         "acceptance_notice": "Принято SMTP-сервером; это не подтверждает доставку во «Входящие»",
+        "sent_copy_saved": result.sent_copy_saved,
     }
 
 

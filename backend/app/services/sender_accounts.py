@@ -189,6 +189,7 @@ def send_test_message(
         account,
         password,
         timeout_seconds=settings.mail_smtp_timeout_seconds,
+        imap_timeout_seconds=settings.mail_imap_timeout_seconds,
     )
     return client.send(
         recipient,

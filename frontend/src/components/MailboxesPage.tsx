@@ -27,7 +27,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [dailyLimit, setDailyLimit] = useState(50);
-  const [imapEnabled, setImapEnabled] = useState(false);
+  const [imapEnabled, setImapEnabled] = useState(true);
   const [replacementId, setReplacementId] = useState<number | null>(null);
   const [replacementPassword, setReplacementPassword] = useState("");
   const [testId, setTestId] = useState<number | null>(null);
@@ -58,7 +58,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
       setDisplayName("");
       setPassword("");
       setDailyLimit(50);
-      setImapEnabled(false);
+      setImapEnabled(true);
       setNotice("Ящик сохранён. Пароль зашифрован и больше не отображается; теперь проверьте подключение.");
       await load();
       onChanged();
@@ -92,7 +92,10 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
 
   const sendTest = async (account: SenderAccount) => {
     if (!testConfirmed || !testRecipient.trim()) return;
-    await act(account.id, () => api.sendSenderTestEmail(account.id, testRecipient.trim()), "Отправлено ровно одно тестовое письмо. SMTP подтвердил приём, но не доставку во «Входящие».");
+    await act(account.id, async () => {
+      const result = await api.sendSenderTestEmail(account.id, testRecipient.trim());
+      setNotice(result.notice);
+    });
     setTestRecipient("");
     setTestConfirmed(false);
     setTestId(null);
@@ -121,7 +124,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
           <label><span>Отображаемое имя</span><input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Отдел продаж" /></label>
           <label><span>Пароль внешнего приложения</span><input type="password" required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Вводится один раз" autoComplete="new-password" /></label>
           <label><span>Дневной лимит</span><input type="number" min={1} max={500} value={dailyLimit} onChange={(event) => setDailyLimit(Number(event.target.value))} /></label>
-          <label className="toggle-label"><input type="checkbox" checked={imapEnabled} onChange={(event) => setImapEnabled(event.target.checked)} /><span>Включить IMAP-сбор возвратов</span></label>
+          <label className="toggle-label"><input type="checkbox" checked={imapEnabled} onChange={(event) => setImapEnabled(event.target.checked)} /><span>IMAP: «Отправленные» и сбор возвратов</span></label>
         </div>
         <button className="button button--primary" type="submit" disabled={!encryptionConfigured || !email || !password}><Plus size={17} /> Добавить ящик</button>
       </form>

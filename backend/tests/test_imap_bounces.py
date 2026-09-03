@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from app.models import Company, CompanyEmail, EmailSuppression, OutreachCampaign, OutreachDelivery, SenderAccount
 from app.services.dsn import parse_permanent_dsn
-from app.services.imap_bounces import apply_dsn_bounce
+from app.services.imap_bounces import MailruIMAPClient, apply_dsn_bounce
 
 
 RAW_DSN = b"""From: postmaster@mail.ru\r
@@ -31,6 +31,67 @@ Message-ID: <outbound@mail.ru>\r
 \r
 --dsn--\r
 """
+
+
+class FakeIMAPTransport:
+    instances = []
+
+    def __init__(self, host, port, *, ssl_context, timeout):
+        assert host == "imap.mail.ru"
+        assert port == 993
+        assert ssl_context.check_hostname is True
+        assert timeout == 30
+        self.commands = []
+        self.__class__.instances.append(self)
+
+    def login(self, email, password):
+        self.commands.append(("LOGIN", email, password))
+
+    def select(self, mailbox, readonly):
+        self.commands.append(("SELECT", mailbox, readonly))
+        return "OK", []
+
+    def list(self):
+        self.commands.append("LIST")
+        return "OK", [
+            b'(\\HasNoChildren) "/" "INBOX"',
+            b'(\\HasNoChildren \\Sent) "/" "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"',
+        ]
+
+    def append(self, mailbox, flags, sent_at, raw_message):
+        self.commands.append(("APPEND", mailbox, flags, sent_at, raw_message))
+        return "OK", [b"APPEND completed"]
+
+    def close(self):
+        self.commands.append("CLOSE")
+
+    def logout(self):
+        self.commands.append("LOGOUT")
+
+
+def test_sent_copy_uses_server_reported_special_use_folder():
+    FakeIMAPTransport.instances = []
+    account = SenderAccount(
+        email="sender@mail.ru",
+        imap_host="imap.mail.ru",
+        imap_port=993,
+    )
+    sent_at = datetime.now(timezone.utc)
+    raw_message = b"From: sender@mail.ru\r\nTo: lead@example.ru\r\n\r\nHello"
+
+    with MailruIMAPClient(
+        account,
+        "secret",
+        timeout_seconds=30,
+        imap_factory=FakeIMAPTransport,
+    ) as client:
+        client.append_sent(raw_message, sent_at)
+
+    append = next(command for command in FakeIMAPTransport.instances[0].commands if isinstance(command, tuple) and command[0] == "APPEND")
+    assert append[1] == b'"&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"'
+    assert append[2] == r"(\Seen)"
+    assert append[3] == sent_at
+    assert append[4] == raw_message
 
 
 def test_dsn_classifier_uses_action_and_enhanced_status():

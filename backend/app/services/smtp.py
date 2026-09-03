@@ -1,13 +1,16 @@
+import logging
 import re
 import smtplib
 import socket
 import ssl
+import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import format_datetime, formataddr, make_msgid
 from datetime import datetime, timezone
 
 from app.models import SenderAccount
+from app.services.imap_bounces import IMAPCollectorError, MailruIMAPClient
 from app.services.provider import normalize_email
 
 
@@ -16,6 +19,8 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)\bAUTH\s+[^\r\n]*"),
     re.compile(r"(?i)\b(password|passwd|token)\s*[=:]\s*\S+"),
 )
+
+logger = logging.getLogger("fuellead.smtp")
 
 
 def safe_smtp_text(value: bytes | str | None, *, secret: str = "") -> str:
@@ -61,6 +66,8 @@ class SMTPAccepted:
     message_id: str
     smtp_code: str
     smtp_response: str
+    sent_copy_saved: bool | None = None
+    sent_copy_error: str | None = None
 
 
 def _map_connect_error(exc: BaseException, *, password: str = "") -> SMTPDeliveryError:
@@ -110,26 +117,79 @@ class MailruSMTPClient:
         *,
         timeout_seconds: float = 30.0,
         smtp_factory=smtplib.SMTP_SSL,
+        imap_timeout_seconds: float | None = None,
+        imap_client_factory=MailruIMAPClient,
+        connect_attempts: int = 3,
+        connect_retry_delay_seconds: float = 1.0,
+        sleep_func=time.sleep,
     ):
         self.account = account
         self.password = password
         self.timeout_seconds = timeout_seconds
         self.smtp_factory = smtp_factory
+        self.imap_timeout_seconds = imap_timeout_seconds or timeout_seconds
+        self.imap_client_factory = imap_client_factory
+        self.connect_attempts = max(1, connect_attempts)
+        self.connect_retry_delay_seconds = max(0.0, connect_retry_delay_seconds)
+        self.sleep_func = sleep_func
 
     def _connect(self):
         context = ssl.create_default_context()
+        last_error = None
+        for attempt in range(1, self.connect_attempts + 1):
+            smtp = None
+            try:
+                smtp = self.smtp_factory(
+                    self.account.smtp_host or "smtp.mail.ru",
+                    self.account.smtp_port or 465,
+                    timeout=self.timeout_seconds,
+                    context=context,
+                )
+                smtp.ehlo()
+                smtp.login(self.account.email, self.password)
+                return smtp
+            except Exception as exc:
+                if smtp is not None:
+                    try:
+                        smtp.close()
+                    except Exception:
+                        pass
+                last_error = _map_connect_error(exc, password=self.password)
+                retryable = last_error.category in ("connection", "timeout", "temporary")
+                if not retryable or attempt >= self.connect_attempts:
+                    raise last_error from exc
+                logger.warning(
+                    "smtp_connect_retry account_id=%s attempt=%s max_attempts=%s category=%s",
+                    self.account.id,
+                    attempt,
+                    self.connect_attempts,
+                    last_error.category,
+                )
+                self.sleep_func(self.connect_retry_delay_seconds * attempt)
+        assert last_error is not None
+        raise last_error
+
+    def _save_sent_copy(self, raw_message: bytes, sent_at: datetime) -> tuple[bool, str | None]:
+        if not self.account.imap_enabled:
+            return False, "IMAP отключён для этого ящика"
         try:
-            smtp = self.smtp_factory(
-                self.account.smtp_host or "smtp.mail.ru",
-                self.account.smtp_port or 465,
-                timeout=self.timeout_seconds,
-                context=context,
-            )
-            smtp.ehlo()
-            smtp.login(self.account.email, self.password)
-            return smtp
-        except Exception as exc:
-            raise _map_connect_error(exc, password=self.password) from exc
+            with self.imap_client_factory(
+                self.account,
+                self.password,
+                timeout_seconds=self.imap_timeout_seconds,
+            ) as imap:
+                imap.append_sent(raw_message, sent_at)
+            return True, None
+        except IMAPCollectorError as exc:
+            error = str(exc)
+        except Exception:
+            error = "Не удалось сохранить копию письма в IMAP Mail.ru"
+        logger.warning(
+            "imap_sent_copy_failed account_id=%s message_id_present=true reason=%s",
+            self.account.id,
+            error,
+        )
+        return False, error
 
     def verify(self) -> None:
         smtp = self._connect()
@@ -156,12 +216,13 @@ class MailruSMTPClient:
         if not text_body.strip():
             raise ValueError("Текст письма обязателен")
 
+        sent_at = datetime.now(timezone.utc)
         message = EmailMessage()
         message["To"] = target
         message["From"] = formataddr(((self.account.display_name or "").strip(), sender))
         message["Reply-To"] = sender
         message["Subject"] = subject.strip()
-        message["Date"] = format_datetime(datetime.now(timezone.utc))
+        message["Date"] = format_datetime(sent_at)
         message_id = make_msgid(domain=sender.rsplit("@", 1)[1])
         message["Message-ID"] = message_id
         message["List-Unsubscribe"] = f"<mailto:{sender}?subject=unsubscribe>"
@@ -171,8 +232,10 @@ class MailruSMTPClient:
             message["X-FuelLead-Campaign-ID"] = str(campaign_id)
         message.set_content(text_body)
 
+        raw_message = message.as_bytes()
         smtp = self._connect()
         data_started = False
+        accepted = None
         try:
             code, response = smtp.mail(sender)
             if not 200 <= code < 300:
@@ -187,7 +250,7 @@ class MailruSMTPClient:
                     permanent_recipient_failure=500 <= code < 600,
                 )
             data_started = True
-            code, response = smtp.data(message.as_bytes())
+            code, response = smtp.data(raw_message)
             if not 200 <= code < 300:
                 technical_code = smtp_status_code(code, response)
                 if 500 <= code < 600:
@@ -201,7 +264,7 @@ class MailruSMTPClient:
                     category="temporary",
                     smtp_code=technical_code,
                 )
-            return SMTPAccepted(
+            accepted = SMTPAccepted(
                 message_id=message_id,
                 smtp_code=smtp_status_code(code, response) or str(code),
                 smtp_response=safe_smtp_text(response, secret=self.password),
@@ -233,3 +296,12 @@ class MailruSMTPClient:
                     smtp.close()
                 except Exception:
                     pass
+        assert accepted is not None
+        sent_copy_saved, sent_copy_error = self._save_sent_copy(raw_message, sent_at)
+        return SMTPAccepted(
+            message_id=accepted.message_id,
+            smtp_code=accepted.smtp_code,
+            smtp_response=accepted.smtp_response,
+            sent_copy_saved=sent_copy_saved,
+            sent_copy_error=sent_copy_error,
+        )
