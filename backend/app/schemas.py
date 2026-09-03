@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.config import DEFAULT_OKVED_CODES
 from app.email_providers import EMAIL_PROVIDER_VALUES
 from app.models import ALL_STATUSES, CONTACT_TYPES
+from app.services.provider import normalize_email
 
 
 class AuthLoginRequest(BaseModel):
@@ -108,7 +109,8 @@ class OutreachPreflightRequest(BaseModel):
     filters: CompanyFilters = Field(default_factory=CompanyFilters)
 
 
-class OutreachCampaignCreate(OutreachPreflightRequest):
+class OutreachCampaignCreate(BaseModel):
+    snapshot_id: int = Field(ge=1)
     confirmed: bool
 
     @field_validator("confirmed")
@@ -116,4 +118,109 @@ class OutreachCampaignCreate(OutreachPreflightRequest):
     def require_confirmation(cls, value: bool) -> bool:
         if value is not True:
             raise ValueError("Подтвердите проверку получателей перед запуском")
+        return value
+
+
+class SenderAccountCreate(BaseModel):
+    provider: str = "mailru_smtp"
+    email: str = Field(min_length=3, max_length=320)
+    display_name: str = Field(default="", max_length=200)
+    password: str = Field(min_length=1, max_length=512)
+    daily_limit: int = Field(default=50, ge=1, le=500)
+    smtp_enabled: bool = True
+    imap_enabled: bool = False
+
+    @field_validator("provider")
+    @classmethod
+    def mailru_only(cls, value: str) -> str:
+        if value != "mailru_smtp":
+            raise ValueError("Через интерфейс можно добавить только Mail.ru SMTP")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if not normalized or normalized.rsplit("@", 1)[1] not in (
+            "mail.ru",
+            "bk.ru",
+            "inbox.ru",
+            "list.ru",
+            "internet.ru",
+        ):
+            raise ValueError("Укажите полный адрес ящика Mail.ru")
+        return normalized
+
+
+class SenderAccountUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=200)
+    password: str | None = Field(default=None, min_length=1, max_length=512)
+    daily_limit: int | None = Field(default=None, ge=1, le=500)
+    smtp_enabled: bool | None = None
+    imap_enabled: bool | None = None
+    is_active: bool | None = None
+
+
+class SenderTestEmailRequest(BaseModel):
+    recipient: str = Field(min_length=3, max_length=320)
+    confirmed: bool
+
+    @field_validator("recipient")
+    @classmethod
+    def valid_recipient(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if not normalized:
+            raise ValueError("Укажите корректный адрес получателя")
+        return normalized
+
+    @field_validator("confirmed")
+    @classmethod
+    def require_test_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Подтвердите адрес тестового письма")
+        return value
+
+
+class EmailSuppressionCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    reason: str = Field(min_length=1, max_length=500)
+    comment: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("email")
+    @classmethod
+    def valid_suppression_email(cls, value: str) -> str:
+        normalized = normalize_email(value)
+        if not normalized:
+            raise ValueError("Укажите корректный email")
+        return normalized
+
+
+class EmailSuppressionLift(BaseModel):
+    confirmed: bool
+    comment: str = Field(min_length=3, max_length=2000)
+
+    @field_validator("confirmed")
+    @classmethod
+    def require_lift_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Подтвердите снятие исключения")
+        return value
+
+
+class UncertainDeliveryResolution(BaseModel):
+    outcome: str
+    confirmed: bool
+
+    @field_validator("outcome")
+    @classmethod
+    def valid_outcome(cls, value: str) -> str:
+        if value not in ("accepted", "failed"):
+            raise ValueError("Результат должен быть accepted или failed")
+        return value
+
+    @field_validator("confirmed")
+    @classmethod
+    def require_resolution_confirmation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("Подтвердите ручное решение")
         return value

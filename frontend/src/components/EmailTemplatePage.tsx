@@ -5,14 +5,13 @@ import type { Company, EmailPreview, EmailTemplate } from "../types";
 import { Notice } from "./Notice";
 
 interface EmailTemplatePageProps {
-  gmailConfigured: boolean;
-  senderEmail: string;
+  mailConfigured: boolean;
   onSent: () => void;
 }
 
 type TemplateField = "subject" | "body";
 
-export function EmailTemplatePage({ gmailConfigured, senderEmail, onSent }: EmailTemplatePageProps) {
+export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageProps) {
   const [template, setTemplate] = useState<EmailTemplate | null>(null);
   const [subjectTemplate, setSubjectTemplate] = useState("");
   const [bodyTemplate, setBodyTemplate] = useState("");
@@ -127,9 +126,9 @@ export function EmailTemplatePage({ gmailConfigured, senderEmail, onSent }: Emai
     <div className="content-page template-page">
       <header className="page-header">
         <div><h1>Шаблон письма</h1><p>Один шаблон для персональных писем каждой компании</p></div>
-        <div className={`integration-chip ${gmailConfigured ? "integration-chip--ready" : "integration-chip--warning"}`}>
-          {gmailConfigured ? <CheckCircle2 size={17} /> : <Mail size={17} />}
-          <span>{gmailConfigured ? "Gmail OAuth подключён" : "Gmail OAuth не настроен"}<small>{senderEmail}</small></span>
+        <div className={`integration-chip ${mailConfigured ? "integration-chip--ready" : "integration-chip--warning"}`}>
+          {mailConfigured ? <CheckCircle2 size={17} /> : <Mail size={17} />}
+          <span>{mailConfigured ? "Mail.ru SMTP готов" : "Mail.ru SMTP не настроен"}<small>Ящик выбирает планировщик</small></span>
         </div>
       </header>
 
@@ -199,11 +198,11 @@ export function EmailTemplatePage({ gmailConfigured, senderEmail, onSent }: Emai
                 <button className="button button--secondary" type="button" onClick={() => { setFinalSubject(preview?.subject || ""); setFinalBody(preview?.body || ""); }}>
                   <RotateCcw size={17} /> Вернуть шаблон
                 </button>
-                <button className="button button--primary" type="button" disabled={!gmailConfigured || !preview || sending || !finalSubject.trim() || !finalBody.trim()} onClick={sendEmail}>
+                <button className="button button--primary" type="button" disabled={!mailConfigured || !preview || sending || !finalSubject.trim() || !finalBody.trim()} onClick={sendEmail}>
                   <Send size={17} /> {sending ? "Отправляем…" : "Отправить письмо"}
                 </button>
               </div>
-              {!gmailConfigured ? <p className="send-disabled-copy">Подключите Gmail OAuth, чтобы активировать отправку. Редактор и предпросмотр уже работают.</p> : null}
+              {!mailConfigured ? <p className="send-disabled-copy">Добавьте и проверьте Mail.ru ящик, чтобы активировать отправку. Редактор и предпросмотр уже работают.</p> : null}
             </>
           ) : (
             <div className="template-empty"><Mail size={24} /><h3>Нет компаний с email</h3><p>После поиска компании с найденным адресом появятся здесь.</p><a className="button button--secondary" href="#companies">Перейти к компаниям</a></div>

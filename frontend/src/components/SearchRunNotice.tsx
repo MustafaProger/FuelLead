@@ -33,14 +33,18 @@ function progressDescription(run: SearchRun) {
     return "Запуск принят. Ожидаем начало обработки.";
   }
 
+  const processed = run.companies_created + run.companies_updated;
+  const errors = run.errors_count
+    ? ` Ошибок провайдера: ${run.errors_count}.${run.error_message ? ` Последняя: ${run.error_message}` : ""}`
+    : "";
+
   if (!run.candidates_found) {
-    return run.mode === "combined"
-      ? "Сначала проверяем целевые ОКВЭД через Checko, затем продолжаем через API-ФНС."
+    const stage = run.mode === "combined"
+      ? "Проверяем Checko; при его недоступности автоматически продолжаем через API-ФНС."
       : `Проверяем целевые ОКВЭД и доступность данных в ${providerName(run)}.`;
+    return `${stage}${errors}`;
   }
 
-  const processed = run.companies_created + run.companies_updated;
-  const errors = run.errors_count ? ` Ошибок провайдера: ${run.errors_count}.` : "";
   return `Найдено кандидатов: ${run.candidates_found}. Обработано: ${processed}.${errors}`;
 }
 

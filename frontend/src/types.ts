@@ -88,9 +88,7 @@ export interface Health {
   default_okved_codes: string[];
   target_region_codes: string[];
   discovery_limit_per_code: number;
-  outreach_sender_email: string;
-  gmail_auth_mode: "oauth2";
-  gmail_oauth_configured: boolean;
+  mail_credentials_encryption_configured: boolean;
   outreach_policy: OutreachPolicy;
 }
 
@@ -168,19 +166,20 @@ export interface EmailSendResult {
   sent_count: number;
   status: "sent";
   sent_at: string;
+  acceptance_notice: string;
 }
 
 export interface OutreachPolicy {
   campaign_limit?: number;
-  daily_limit: number;
-  hourly_limit: number;
-  min_interval_seconds: number;
-  max_per_domain_per_day: number;
+  message_interval_seconds: [number, number];
+  round_rest_minutes: [number, number];
+  snapshot_ttl_seconds: number;
   eligible_status?: "new";
   primary_address_only?: boolean;
-  automatic_stop_on_provider_error?: boolean;
+  sequential_smtp?: boolean;
   automatic_send_enabled?: boolean;
   opt_out_footer_enabled?: boolean;
+  accepted_is_not_delivered?: boolean;
 }
 
 export interface OutreachPreflight {
@@ -194,9 +193,13 @@ export interface OutreachPreflight {
     without_email: number;
     already_contacted: number;
     duplicate_address: number;
+    suppressed: number;
   };
-  sender_email: string;
-  gmail_configured: boolean;
+  sender_count: number;
+  sender_emails: string[];
+  mailru_configured: boolean;
+  snapshot_id: number | null;
+  snapshot_expires_at: string | null;
   policy: OutreachPolicy;
   sample: {
     company_name: string;
@@ -208,19 +211,78 @@ export interface OutreachPreflight {
 
 export interface OutreachCampaign {
   id: number;
-  status: "running" | "paused" | "completed" | "cancelled";
+  status: "draft" | "running" | "paused" | "cooldown" | "interrupted" | "completed" | "stopped";
   matched_count: number;
   recipient_count: number;
   sent_count: number;
+  queued_count: number;
+  sending_count: number;
+  accepted_count: number;
   failed_count: number;
+  bounced_count: number;
+  uncertain_count: number;
+  suppressed_count: number;
   cancelled_count: number;
   remaining_count: number;
   progress_percent: number;
   pause_reason: string | null;
+  current_round: number;
+  active_sender_account_id: number | null;
+  active_sender_email: string | null;
+  sender_position: number;
+  batch_position: number;
+  current_batch_target: number;
+  current_interval_seconds: number | null;
   next_send_at: string | null;
+  round_rest_until: string | null;
   last_sent_at: string | null;
   started_at: string;
   completed_at: string | null;
   created_at: string;
   policy: OutreachPolicy;
+  uncertain_deliveries: { id: number; recipient: string }[];
+  acceptance_notice: string;
+}
+
+export type SenderVerificationStatus = "unverified" | "verified" | "failed" | "blocked" | "temporary_error";
+
+export interface SenderAccount {
+  id: number;
+  provider: "mailru_smtp" | "gmail_api";
+  email: string;
+  display_name: string;
+  smtp_host: string;
+  smtp_port: number;
+  imap_host: string;
+  imap_port: number;
+  smtp_enabled: boolean;
+  imap_enabled: boolean;
+  is_active: boolean;
+  password_saved: boolean;
+  verification_status: SenderVerificationStatus;
+  verification_error: string | null;
+  verification_checked_at: string | null;
+  daily_limit: number;
+  sent_today: number;
+  successful_full_batches: number;
+  current_batch_size: number;
+  blocked_until_round: number | null;
+  block_reason: string | null;
+  last_sent_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EmailSuppression {
+  id: number;
+  email: string;
+  reason: string;
+  source: string;
+  campaign_id: number | null;
+  delivery_id: number | null;
+  smtp_code: string | null;
+  created_at: string;
+  lifted_at: string | null;
+  comment: string | null;
+  active: boolean;
 }

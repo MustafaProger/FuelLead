@@ -23,11 +23,29 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fuellead:change-me@db:5432/fuellead}
+      MAIL_CREDENTIALS_ENCRYPTION_KEY: ${MAIL_CREDENTIALS_ENCRYPTION_KEY:-}
+      OUTREACH_AUTOMATIC_SEND_ENABLED: ${OUTREACH_AUTOMATIC_SEND_ENABLED:-false}
+      FUELLEAD_AUTH_EMAIL: ${FUELLEAD_AUTH_EMAIL:-}
+      FUELLEAD_AUTH_PASSWORD: ${FUELLEAD_AUTH_PASSWORD:-}
+      FUELLEAD_AUTH_SESSION_SECRET: ${FUELLEAD_AUTH_SESSION_SECRET:-}
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "8000:8000"
+
+  imap-worker:
+    build: ./backend
+    restart: unless-stopped
+    command: ["python", "-m", "app.commands.run_imap_worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fuellead:change-me@db:5432/fuellead}
+      MAIL_CREDENTIALS_ENCRYPTION_KEY: ${MAIL_CREDENTIALS_ENCRYPTION_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
 
   frontend:
     build:
@@ -42,4 +60,3 @@ services:
 
 volumes:
   fuellead_postgres_data:
-

@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -107,3 +108,21 @@ def test_company_status_migration_preserves_rows_and_child_foreign_keys(tmp_path
     with pytest.raises(IntegrityError):
         with legacy_engine.begin() as connection:
             connection.execute(text("UPDATE companies SET status = 'ready' WHERE id = 1"))
+
+
+def test_postgresql_mail_scheduler_migration_preserves_legacy_rows():
+    sql = (
+        Path(__file__).parents[1]
+        / "app"
+        / "migrations"
+        / "20260903_mailru_scheduler.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "UPDATE outreach_deliveries SET status = 'accepted'" in sql
+    assert "accepted_at = COALESCE(accepted_at, sent_at)" in sql
+    assert "UPDATE outreach_campaigns SET accepted_count = sent_count" in sql
+    assert "UPDATE outreach_campaigns SET status = 'stopped' WHERE status = 'cancelled'" in sql
+    assert "DROP CONSTRAINT IF EXISTS ck_outreach_deliveries_status" in sql
+    assert "DROP CONSTRAINT IF EXISTS ck_outreach_campaigns_status" in sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_one_active_outreach_campaign" in sql
+    assert "DROP TABLE" not in sql.upper()

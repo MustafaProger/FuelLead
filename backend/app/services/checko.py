@@ -124,9 +124,17 @@ class CheckoClient:
         try:
             return self.client.get(path, params={"key": api_key, **params})
         except httpx.TimeoutException as exc:
-            raise CheckoAPIError("Checko не ответил вовремя. Повторите поиск позже.") from exc
+            raise CheckoAPIError(
+                "Checko не ответил вовремя. Продолжаем поиск через следующий доступный провайдер.",
+                stop_discovery=True,
+                reason="timeout",
+            ) from exc
         except httpx.RequestError as exc:
-            raise CheckoAPIError("Не удалось связаться с Checko. Проверьте подключение и повторите поиск.") from exc
+            raise CheckoAPIError(
+                "Не удалось связаться с Checko. Продолжаем поиск через следующий доступный провайдер.",
+                stop_discovery=True,
+                reason="connection_error",
+            ) from exc
 
     @staticmethod
     def _response_error(response: httpx.Response, payload: dict[str, Any]) -> CheckoAPIError | None:

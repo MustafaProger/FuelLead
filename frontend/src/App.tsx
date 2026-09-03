@@ -7,9 +7,11 @@ import { CompanyTable } from "./components/CompanyTable";
 import { DashboardPage } from "./components/DashboardPage";
 import { EmailTemplatePage } from "./components/EmailTemplatePage";
 import { FiltersBar } from "./components/FiltersBar";
+import { MailboxesPage } from "./components/MailboxesPage";
 import { Notice } from "./components/Notice";
 import { OutreachDialog } from "./components/OutreachDialog";
 import { SearchRunNotice } from "./components/SearchRunNotice";
+import { SuppressionsPage } from "./components/SuppressionsPage";
 import type {
   Company,
   CompanyDetail,
@@ -33,7 +35,7 @@ const PAGE_SIZE = 20;
 
 function pageFromHash(): AppPage {
   const page = window.location.hash.replace("#", "");
-  return page === "companies" || page === "template" ? page : "dashboard";
+  return page === "companies" || page === "template" || page === "mailboxes" || page === "suppressions" ? page : "dashboard";
 }
 
 interface WorkspaceProps {
@@ -60,6 +62,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [refreshToken, setRefreshToken] = useState(0);
   const [outreachOpen, setOutreachOpen] = useState(false);
   const [outreachFilters, setOutreachFilters] = useState<Filters>(defaultFilters);
+  const [mailboxesReady, setMailboxesReady] = useState(false);
 
   useEffect(() => {
     const handleHashChange = () => setActivePage(pageFromHash());
@@ -81,11 +84,17 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
     }
   }, [filters, page]);
 
-  useEffect(() => {
-    api.health().then(setHealth).catch((requestError) => {
+  const loadIntegrationState = useCallback(async () => {
+    try {
+      const [currentHealth, accounts] = await Promise.all([api.health(), api.senderAccounts()]);
+      setHealth(currentHealth);
+      setMailboxesReady(accounts.some((account) => account.is_active && account.smtp_enabled && account.verification_status === "verified"));
+    } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Backend недоступен");
-    });
+    }
   }, []);
+
+  useEffect(() => { void loadIntegrationState(); }, [loadIntegrationState]);
 
   useEffect(() => {
     const timer = window.setTimeout(loadCompanies, filters.search ? 280 : 0);
@@ -225,7 +234,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
       <AppSidebar
         activePage={activePage}
         mode={health?.mode || "demo"}
-        gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+        mailboxesConfigured={mailboxesReady}
         userEmail={userEmail}
         onLogout={onLogout}
       />
@@ -264,9 +273,9 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
             </header>
             <div className="system-meta company-system-meta" aria-label="Состояние интеграций">
               <span><Database size={14} /> PostgreSQL</span>
-              <span className={health?.gmail_oauth_configured ? "integration-ready" : "integration-pending"}>
+              <span className={mailboxesReady ? "integration-ready" : "integration-pending"}>
                 <Mail size={14} />
-                <span>{health?.outreach_sender_email || "artel.office8@gmail.com"}<small>{health?.gmail_oauth_configured ? "Gmail OAuth подключён" : "Gmail OAuth ожидает настройки"}</small></span>
+                <span>Mail.ru SMTP<small>{mailboxesReady ? "Есть проверенный активный ящик" : "Добавьте и проверьте ящик"}</small></span>
               </span>
             </div>
 
@@ -287,7 +296,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
               onContactAdd={handleContactAdd}
               onContactDelete={handleContactDelete}
               onCompanyDelete={handleCompanyDelete}
-              gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+              mailConfigured={mailboxesReady}
               sendingEmailId={sendingEmailId}
               onSendEmail={handleSendEmail}
               onPageChange={setPage}
@@ -297,16 +306,24 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
 
         {activePage === "template" ? (
           <EmailTemplatePage
-            gmailConfigured={Boolean(health?.gmail_oauth_configured)}
-            senderEmail={health?.outreach_sender_email || "artel.office8@gmail.com"}
+            mailConfigured={mailboxesReady}
             onSent={() => setRefreshToken((value) => value + 1)}
           />
         ) : null}
+
+        {activePage === "mailboxes" ? (
+          <MailboxesPage
+            encryptionConfigured={Boolean(health?.mail_credentials_encryption_configured)}
+            onChanged={() => { void loadIntegrationState(); }}
+          />
+        ) : null}
+
+        {activePage === "suppressions" ? <SuppressionsPage /> : null}
       </main>
       <OutreachDialog
         open={outreachOpen}
         filters={outreachFilters}
-        gmailConfigured={Boolean(health?.gmail_oauth_configured)}
+        mailConfigured={mailboxesReady}
         onClose={() => setOutreachOpen(false)}
         onChanged={handleOutreachChanged}
       />

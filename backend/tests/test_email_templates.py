@@ -12,7 +12,9 @@ from app.services.email_templates import (
     get_or_create_email_template,
     render_email_template,
 )
-from app.services.gmail import GmailOAuthError
+from app.models import SenderAccount
+from app.services.credentials import CredentialCipher, generate_encryption_key
+from app.services.smtp import SMTPAccepted, SMTPDeliveryError
 
 
 def make_company(db) -> Company:
@@ -30,6 +32,20 @@ def make_company(db) -> Company:
     db.commit()
     db.refresh(company)
     return company
+
+
+def mail_settings_and_account(db):
+    key = generate_encryption_key()
+    settings = Settings(_env_file=None, mail_credentials_encryption_key=key)
+    account = SenderAccount(
+        email="sender@mail.ru",
+        display_name="FuelLead",
+        encrypted_password=CredentialCipher(key).encrypt("app-password"),
+        verification_status="verified",
+    )
+    db.add(account)
+    db.commit()
+    return settings, account
 
 
 def test_template_renders_company_values_and_russian_date(db):
@@ -71,30 +87,19 @@ def test_single_company_send_updates_status_and_history(db, monkeypatch):
     company = make_company(db)
 
     class FakeSender:
-        def __init__(self, config):
-            self.config = config
+        def __init__(self, account, password, **_):
+            assert account.email == "sender@mail.ru"
+            assert password == "app-password"
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return None
-
-        def send(self, recipient: str, subject: str, body: str) -> str:
+        def send(self, recipient: str, subject: str, body: str) -> SMTPAccepted:
             assert recipient == "office@artel.ru"
             assert subject == 'Предложение для ООО "АРТЕЛЬ"'
             assert body.startswith("Персональный текст")
             assert "ответьте «Не писать»" in body
-            return "message-123"
+            return SMTPAccepted("message-123", "250", "OK")
 
-    monkeypatch.setattr(main, "GmailOAuthSender", FakeSender)
-    settings = Settings(
-        _env_file=None,
-        outreach_sender_email="sender@example.ru",
-        gmail_client_id="client-id",
-        gmail_client_secret="client-secret",
-        gmail_refresh_token="refresh-token",
-    )
+    monkeypatch.setattr(main, "MailruSMTPClient", FakeSender)
+    settings, _ = mail_settings_and_account(db)
 
     result = main.send_company_email(
         company.id,
@@ -121,27 +126,15 @@ def test_company_send_without_recipient_uses_only_primary_company_email(db, monk
     class FakeSender:
         sent: list[tuple[str, str, str]] = []
 
-        def __init__(self, config):
-            self.config = config
+        def __init__(self, *_args, **_kwargs):
+            pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return None
-
-        def send(self, recipient: str, subject: str, body: str) -> str:
+        def send(self, recipient: str, subject: str, body: str) -> SMTPAccepted:
             self.__class__.sent.append((recipient, subject, body))
-            return f"message-{recipient}"
+            return SMTPAccepted(f"message-{recipient}", "250", "OK")
 
-    monkeypatch.setattr(main, "GmailOAuthSender", FakeSender)
-    settings = Settings(
-        _env_file=None,
-        outreach_sender_email="sender@example.ru",
-        gmail_client_id="client-id",
-        gmail_client_secret="client-secret",
-        gmail_refresh_token="refresh-token",
-    )
+    monkeypatch.setattr(main, "MailruSMTPClient", FakeSender)
+    settings, _ = mail_settings_and_account(db)
 
     result = main.send_company_email(company.id, EmailSendRequest(), db, settings)
 
@@ -156,26 +149,14 @@ def test_single_company_send_marks_company_error_and_saves_reason(db, monkeypatc
     company = make_company(db)
 
     class FailingSender:
-        def __init__(self, config):
-            self.config = config
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            return None
+        def __init__(self, *_args, **_kwargs):
+            pass
 
         def send(self, *_):
-            raise GmailOAuthError("Gmail отклонил отправку", status_code=429)
+            raise SMTPDeliveryError("Mail.ru временно отклонил отправку", category="temporary")
 
-    monkeypatch.setattr(main, "GmailOAuthSender", FailingSender)
-    settings = Settings(
-        _env_file=None,
-        outreach_sender_email="sender@example.ru",
-        gmail_client_id="client-id",
-        gmail_client_secret="client-secret",
-        gmail_refresh_token="refresh-token",
-    )
+    monkeypatch.setattr(main, "MailruSMTPClient", FailingSender)
+    settings, _ = mail_settings_and_account(db)
 
     with pytest.raises(HTTPException) as caught:
         main.send_company_email(company.id, EmailSendRequest(), db, settings)
@@ -185,4 +166,4 @@ def test_single_company_send_marks_company_error_and_saves_reason(db, monkeypatc
     assert caught.value.status_code == 502
     assert failed_company.status == "error"
     assert failed_company.history[0].event_type == "email_failed"
-    assert failed_company.history[0].event_data["error"] == "Gmail отклонил отправку"
+    assert failed_company.history[0].event_data["error"] == "Mail.ru временно отклонил отправку"

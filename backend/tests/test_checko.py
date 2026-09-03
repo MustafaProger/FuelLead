@@ -167,3 +167,28 @@ def test_search_requires_two_digit_region_code():
     ) as client:
         with pytest.raises(ValueError, match="two digits"):
             client.search_by_okved("49.41", region_code="all")
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "expected_reason"),
+    [
+        (httpx.ReadTimeout("provider timeout"), "timeout"),
+        (httpx.ConnectError("provider unavailable"), "connection_error"),
+    ],
+)
+def test_transport_failure_stops_checko_stage(raised_error, expected_reason):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raised_error.request = request
+        raise raised_error
+
+    with CheckoClient(
+        "key",
+        "https://api.checko.ru/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(CheckoAPIError) as caught:
+            client.search_by_okved("49.41", region_code="77", limit=2)
+
+    assert caught.value.stop_discovery is True
+    assert caught.value.reason == expected_reason
+    assert "следующий доступный провайдер" in str(caught.value)

@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import func, select
@@ -21,6 +22,10 @@ from app.models import (
     Company,
     CompanyContact,
     ExcludedCompany,
+    EmailSuppression,
+    OutreachCampaign,
+    OutreachDelivery,
+    SenderAccount,
     SearchRun,
 )
 from app.queries import build_company_query
@@ -30,11 +35,17 @@ from app.schemas import (
     ContactCreate,
     EmailPreviewRequest,
     EmailSendRequest,
+    EmailSuppressionCreate,
+    EmailSuppressionLift,
     EmailTemplateUpdate,
     OutreachCampaignCreate,
     OutreachPreflightRequest,
     SearchRunCreate,
+    SenderAccountCreate,
+    SenderAccountUpdate,
+    SenderTestEmailRequest,
     StatusUpdate,
+    UncertainDeliveryResolution,
 )
 from app.serializers import as_aware, company_to_dict, search_run_to_dict
 from app.services.contacts import CONTACT_TYPE_LABELS, normalize_contact_value
@@ -45,7 +56,7 @@ from app.services.email_templates import (
     get_or_create_email_template,
     render_email_template,
 )
-from app.services.gmail import GmailOAuthConfig, GmailOAuthError, GmailOAuthSender
+from app.services.credentials import CredentialCipher, CredentialEncryptionError
 from app.services.outreach import (
     OutreachPolicyError,
     active_outreach_campaign,
@@ -53,6 +64,7 @@ from app.services.outreach import (
     assert_manual_send_allowed,
     build_outreach_preflight,
     cancel_outreach_campaign,
+    confirm_outreach_campaign,
     create_outreach_campaign,
     mark_company_send_failed,
     outreach_campaign_to_dict,
@@ -64,6 +76,21 @@ from app.services.outreach import (
     wake_outreach_worker,
 )
 from app.services.provider import normalize_email
+from app.services.sender_accounts import (
+    SenderAccountError,
+    create_sender_account,
+    send_test_message,
+    sender_account_to_dict,
+    sender_used_by_active_campaign,
+    update_sender_account,
+    verify_sender_account,
+)
+from app.services.smtp import MailruSMTPClient, SMTPDeliveryError
+from app.services.suppressions import (
+    add_or_restore_suppression,
+    list_suppressions,
+    suppression_to_dict,
+)
 
 
 @asynccontextmanager
@@ -86,6 +113,28 @@ app = FastAPI(title="FuelLead API", version="0.1.0", lifespan=lifespan)
 # 27 complete Monday-to-Sunday weeks form a six-month heatmap with no
 # partial-week placeholders at either edge.
 DASHBOARD_HISTORY_DAYS = 189
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error_handler(
+    _: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Return useful validation errors without echoing request field values."""
+    safe_errors = []
+    for error in exc.errors():
+        location = [str(item) for item in error.get("loc", ())]
+        message = str(error.get("msg") or "Некорректное значение")
+        if message.startswith("Value error, "):
+            message = message.removeprefix("Value error, ")
+        safe_errors.append(
+            {
+                "loc": location,
+                "msg": message,
+                "type": str(error.get("type") or "value_error"),
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 @app.middleware("http")
@@ -188,11 +237,152 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "default_okved_codes": DEFAULT_OKVED_CODES,
         "target_region_codes": TARGET_REGION_CODES,
         "discovery_limit_per_code": settings.discovery_limit_per_code,
-        "outreach_sender_email": settings.outreach_sender_email,
-        "gmail_auth_mode": "oauth2",
-        "gmail_oauth_configured": settings.gmail_oauth_configured,
+        "mail_credentials_encryption_configured": settings.mail_credentials_encryption_configured,
         "outreach_policy": outreach_policy_dict(settings),
     }
+
+
+def _sender_account_or_404(db: Session, account_id: int) -> SenderAccount:
+    account = db.get(SenderAccount, account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Почтовый ящик не найден")
+    return account
+
+
+@app.get("/api/sender-accounts")
+def get_sender_accounts(db: Session = Depends(get_db)) -> list[dict]:
+    accounts = db.scalars(select(SenderAccount).order_by(SenderAccount.id.asc())).all()
+    return [sender_account_to_dict(account) for account in accounts]
+
+
+@app.post("/api/sender-accounts", status_code=201)
+def add_sender_account(
+    data: SenderAccountCreate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    try:
+        account = create_sender_account(db, data, settings)
+    except (SenderAccountError, CredentialEncryptionError) as exc:
+        status_code = 503 if isinstance(exc, CredentialEncryptionError) else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return sender_account_to_dict(account)
+
+
+@app.patch("/api/sender-accounts/{account_id}")
+def patch_sender_account(
+    account_id: int,
+    data: SenderAccountUpdate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    try:
+        account = update_sender_account(
+            db, _sender_account_or_404(db, account_id), data, settings
+        )
+    except CredentialEncryptionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    wake_outreach_worker()
+    return sender_account_to_dict(account)
+
+
+@app.post("/api/sender-accounts/{account_id}/verify")
+def verify_mailbox(
+    account_id: int,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    account = verify_sender_account(
+        db, _sender_account_or_404(db, account_id), settings
+    )
+    return sender_account_to_dict(account)
+
+
+@app.post("/api/sender-accounts/{account_id}/test-email")
+def send_mailbox_test_email(
+    account_id: int,
+    request: SenderTestEmailRequest,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    account = _sender_account_or_404(db, account_id)
+    if active_outreach_campaign(db):
+        raise HTTPException(
+            status_code=409,
+            detail="Тестовое письмо недоступно во время активной кампании",
+        )
+    try:
+        result = send_test_message(account, request.recipient, settings)
+    except (SenderAccountError, CredentialEncryptionError, SMTPDeliveryError) as exc:
+        detail = exc.safe_message if isinstance(exc, SMTPDeliveryError) else str(exc)
+        raise HTTPException(status_code=502, detail=detail) from exc
+    return {
+        "accepted": True,
+        "recipient": request.recipient,
+        "message_id": result.message_id,
+        "smtp_code": result.smtp_code,
+        "notice": "SMTP-сервер принял тестовое письмо; доставка во «Входящие» не подтверждена",
+    }
+
+
+@app.delete("/api/sender-accounts/{account_id}")
+def delete_sender_account(
+    account_id: int,
+    confirmed: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not confirmed:
+        raise HTTPException(status_code=422, detail="Подтвердите удаление ящика")
+    account = _sender_account_or_404(db, account_id)
+    if sender_used_by_active_campaign(db, account.id):
+        raise HTTPException(
+            status_code=409,
+            detail="Ящик используется активной кампанией и не может быть удалён",
+        )
+    db.delete(account)
+    db.commit()
+    return {"deleted": True, "id": account_id}
+
+
+@app.get("/api/email-suppressions")
+def get_email_suppressions(
+    search: str = Query(default="", max_length=320),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return [suppression_to_dict(item) for item in list_suppressions(db, search)]
+
+
+@app.post("/api/email-suppressions", status_code=201)
+def add_email_suppression(
+    data: EmailSuppressionCreate,
+    db: Session = Depends(get_db),
+) -> dict:
+    item = add_or_restore_suppression(
+        db,
+        data.email,
+        data.reason,
+        source="manual",
+        comment=data.comment,
+    )
+    return suppression_to_dict(item)
+
+
+@app.post("/api/email-suppressions/{suppression_id}/lift")
+def lift_email_suppression(
+    suppression_id: int,
+    data: EmailSuppressionLift,
+    db: Session = Depends(get_db),
+) -> dict:
+    item = db.get(EmailSuppression, suppression_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Исключение не найдено")
+    if item.lifted_at is not None:
+        raise HTTPException(status_code=409, detail="Исключение уже снято")
+    item.lifted_at = datetime.now(timezone.utc)
+    item.comment = data.comment
+    db.commit()
+    db.refresh(item)
+    return suppression_to_dict(item)
 
 
 @app.get("/api/dashboard")
@@ -515,9 +705,6 @@ def send_company_email(
     company = db.get(Company, company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Компания не найдена")
-    if not settings.gmail_oauth_configured:
-        raise HTTPException(status_code=503, detail="Gmail OAuth не настроен")
-
     recipients = _company_recipients(company, request.recipient)
     try:
         assert_manual_send_allowed(db, recipients[0], settings)
@@ -527,34 +714,46 @@ def send_company_email(
             detail += f". После: {exc.retry_at.astimezone(settings.timezone).isoformat()}"
         raise HTTPException(status_code=429, detail=detail) from exc
     template = get_or_create_email_template(db)
+    sender_account = db.scalar(
+        select(SenderAccount)
+        .where(
+            SenderAccount.provider == "mailru_smtp",
+            SenderAccount.smtp_enabled.is_(True),
+            SenderAccount.is_active.is_(True),
+            SenderAccount.verification_status == "verified",
+        )
+        .order_by(SenderAccount.id.asc())
+    )
+    if sender_account is None:
+        raise HTTPException(status_code=503, detail="Нет проверенного активного ящика Mail.ru")
     sent_messages: list[tuple[str, str, str]] = []
     try:
-        config = GmailOAuthConfig(
-            sender_email=settings.outreach_sender_email,
-            client_id=settings.gmail_client_id,
-            client_secret=settings.gmail_client_secret,
-            refresh_token=settings.gmail_refresh_token,
-            timeout_seconds=settings.gmail_timeout_seconds,
+        password = CredentialCipher(settings.mail_credentials_encryption_key).decrypt(
+            sender_account.encrypted_password
         )
-        with GmailOAuthSender(config) as sender:
-            for recipient in recipients:
-                values = company_template_values(company, recipient, settings)
-                subject = render_email_template(request.subject or template.subject_template, values).strip()
-                body = append_opt_out_footer(
-                    render_email_template(request.body or template.body_template, values),
-                    settings,
-                )
-                message_id = sender.send(recipient, subject, body)
-                sent_messages.append((recipient, message_id, subject))
-    except (GmailOAuthError, ValueError) as exc:
+        sender = MailruSMTPClient(
+            sender_account,
+            password,
+            timeout_seconds=settings.mail_smtp_timeout_seconds,
+        )
+        recipient = recipients[0]
+        values = company_template_values(company, recipient, settings)
+        subject = render_email_template(request.subject or template.subject_template, values).strip()
+        body = append_opt_out_footer(
+            render_email_template(request.body or template.body_template, values), settings
+        )
+        result = sender.send(recipient, subject, body)
+        sent_messages.append((recipient, result.message_id, subject))
+    except (SMTPDeliveryError, CredentialEncryptionError, ValueError) as exc:
+        reason = exc.safe_message if isinstance(exc, SMTPDeliveryError) else str(exc)
         mark_company_send_failed(
             db,
             company.id,
             recipients[0],
-            str(exc),
+            reason,
         )
         db.commit()
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=reason) from exc
     except Exception as exc:
         reason = "Неизвестная ошибка отправки"
         mark_company_send_failed(
@@ -574,10 +773,15 @@ def send_company_email(
             ActivityHistory(
                 company=company,
                 event_type="email_sent",
-                description=f"Письмо отправлено на {recipient}",
+                description=f"SMTP-сервер принял письмо на {recipient}",
                 from_status=previous_status,
                 to_status="sent",
-                event_data={"recipient": recipient, "message_id": message_id, "subject": subject},
+                event_data={
+                    "recipient": recipient,
+                    "message_id": message_id,
+                    "subject": subject,
+                    "sender_account_id": sender_account.id,
+                },
             )
         )
     db.commit()
@@ -591,6 +795,7 @@ def send_company_email(
         "sent_count": len(sent_messages),
         "status": company.status,
         "sent_at": datetime.now(settings.timezone).isoformat(),
+        "acceptance_notice": "Принято SMTP-сервером; это не подтверждает доставку во «Входящие»",
     }
 
 
@@ -625,10 +830,11 @@ def start_outreach_campaign(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     try:
-        campaign = create_outreach_campaign(db, request.filters, settings)
+        campaign = confirm_outreach_campaign(
+            db, request.snapshot_id, settings
+        )
     except OutreachPolicyError as exc:
-        status_code = 503 if not settings.gmail_oauth_configured else 409
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     wake_outreach_worker()
     return outreach_campaign_to_dict(campaign)
 
@@ -669,6 +875,71 @@ def cancel_campaign(campaign_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     wake_outreach_worker()
     return outreach_campaign_to_dict(campaign)
+
+
+@app.post("/api/outreach/campaigns/{campaign_id}/stop")
+def stop_campaign(campaign_id: int, db: Session = Depends(get_db)) -> dict:
+    return cancel_campaign(campaign_id, db)
+
+
+@app.post("/api/outreach/deliveries/{delivery_id}/resolve-uncertain")
+def resolve_uncertain_delivery(
+    delivery_id: int,
+    data: UncertainDeliveryResolution,
+    db: Session = Depends(get_db),
+) -> dict:
+    delivery = db.get(OutreachDelivery, delivery_id)
+    if delivery is None:
+        raise HTTPException(status_code=404, detail="Отправка не найдена")
+    if delivery.status != "uncertain":
+        raise HTTPException(status_code=409, detail="Отправка уже имеет однозначный результат")
+    campaign = db.get(OutreachCampaign, delivery.campaign_id)
+    delivery.status = data.outcome
+    delivery.error_message = (
+        "Пользователь подтвердил приём SMTP-сервером"
+        if data.outcome == "accepted"
+        else "Пользователь подтвердил отсутствие приёма; автоматический повтор запрещён"
+    )
+    if data.outcome == "accepted":
+        delivery.accepted_at = datetime.now(timezone.utc)
+        delivery.sent_at = delivery.accepted_at
+        company = db.get(Company, delivery.company_id) if delivery.company_id else None
+        if company:
+            previous = company.status
+            company.status = "sent"
+            company.last_updated_at = delivery.accepted_at
+            db.add(
+                ActivityHistory(
+                    company=company,
+                    event_type="email_sent",
+                    description=f"Приём письма на {delivery.recipient} подтверждён вручную",
+                    from_status=previous,
+                    to_status="sent",
+                    event_data={
+                        "recipient": delivery.recipient,
+                        "campaign_id": delivery.campaign_id,
+                        "manual_resolution": True,
+                    },
+                )
+            )
+    if campaign:
+        remaining_uncertain = sum(
+            1
+            for item in campaign.deliveries
+            if item.id != delivery.id and item.status == "uncertain"
+        )
+        if remaining_uncertain == 0 and campaign.status == "interrupted":
+            queued = any(item.status == "queued" for item in campaign.deliveries)
+            campaign.status = "paused" if queued else "completed"
+            campaign.pause_reason = (
+                "Неопределённые отправки разобраны. Проверьте очередь перед продолжением"
+                if queued
+                else None
+            )
+            if not queued:
+                campaign.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    return outreach_campaign_to_dict(campaign) if campaign else {"resolved": True}
 
 
 @app.post("/api/search-runs", status_code=202)

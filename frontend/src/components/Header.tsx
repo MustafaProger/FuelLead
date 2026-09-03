@@ -10,11 +10,11 @@ interface HeaderProps {
 
 export function Header({ mode, searching, onOpenOutreach, onSearch }: HeaderProps) {
   const providerLabel = mode === "combined"
-    ? "Checko → API-ФНС подключены"
+    ? "Checko → API-ФНС настроены"
     : mode === "api_fns"
-      ? "API-ФНС подключён"
+      ? "API-ФНС настроен"
       : mode === "checko"
-        ? "Checko подключён"
+        ? "Checko настроен"
         : "Демо-режим";
   return (
     <header className="app-header">

@@ -48,18 +48,24 @@ class Settings(BaseSettings):
     api_fns_max_egr_requests_per_run: int = Field(default=5, ge=1, le=100)
     app_timezone: str = "Europe/Moscow"
     discovery_limit_per_code: int = Field(default=10, ge=1, le=100)
-    outreach_sender_email: str = "artel.office8@gmail.com"
-    gmail_client_id: str = ""
-    gmail_client_secret: str = ""
-    gmail_refresh_token: str = ""
-    gmail_timeout_seconds: float = 30.0
+    mail_credentials_encryption_key: str = ""
+    mail_smtp_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+    mail_imap_timeout_seconds: float = Field(default=30.0, ge=5, le=120)
+    mail_imap_worker_poll_seconds: int = Field(default=300, ge=30, le=3600)
+    mail_imap_max_messages_per_tick: int = Field(default=50, ge=1, le=500)
     outreach_campaign_size: int = Field(default=500, ge=1, le=500)
     outreach_daily_limit: int = Field(default=500, ge=1, le=500)
     outreach_hourly_limit: int = Field(default=0, ge=0, le=500)
     outreach_min_interval_seconds: int = Field(default=10, ge=10, le=86_400)
-    outreach_max_per_domain_per_day: int = Field(default=5, ge=1, le=20)
+    # Zero disables the per-domain cap. Global daily and interval limits still apply.
+    outreach_max_per_domain_per_day: int = Field(default=0, ge=0, le=500)
     outreach_worker_poll_seconds: int = Field(default=30, ge=5, le=300)
-    outreach_automatic_send_enabled: bool = True
+    outreach_automatic_send_enabled: bool = False
+    outreach_snapshot_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    outreach_message_interval_min_seconds: int = Field(default=60, ge=60, le=85)
+    outreach_message_interval_max_seconds: int = Field(default=85, ge=60, le=85)
+    outreach_round_rest_min_minutes: int = Field(default=77, ge=77, le=93)
+    outreach_round_rest_max_minutes: int = Field(default=93, ge=77, le=93)
     outreach_opt_out_text: str = (
         "Если предложение неактуально, ответьте «Не писать», "
         "и мы исключим адрес из дальнейших обращений."
@@ -94,11 +100,8 @@ class Settings(BaseSettings):
         return self.discovery_provider
 
     @property
-    def gmail_oauth_configured(self) -> bool:
-        return all(
-            value.strip()
-            for value in (self.gmail_client_id, self.gmail_client_secret, self.gmail_refresh_token)
-        )
+    def mail_credentials_encryption_configured(self) -> bool:
+        return bool(self.mail_credentials_encryption_key.strip())
 
     @property
     def outreach_batch_limit(self) -> int:

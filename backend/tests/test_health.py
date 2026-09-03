@@ -1,5 +1,10 @@
+import asyncio
+import json
+
+from fastapi.exceptions import RequestValidationError
+
 from app.config import Settings
-from app.main import health
+from app.main import health, safe_validation_error_handler
 
 
 def test_health_reports_selected_provider_without_exposing_secrets():
@@ -10,6 +15,7 @@ def test_health_reports_selected_provider_without_exposing_secrets():
             api_fns_key="api-fns-secret",
             checko_api_key="checko-secret",
             discovery_limit_per_code=2,
+            mail_credentials_encryption_key="encryption-secret",
         )
     )
 
@@ -26,3 +32,31 @@ def test_health_reports_selected_provider_without_exposing_secrets():
     assert "checko_api_key" not in payload
     assert "api-fns-secret" not in str(payload)
     assert "checko-secret" not in str(payload)
+    assert payload["mail_credentials_encryption_configured"] is True
+    assert "mail_credentials_encryption_key" not in payload
+    assert "encryption-secret" not in str(payload)
+
+
+def test_validation_errors_never_echo_secret_input():
+    response = asyncio.run(
+        safe_validation_error_handler(
+            None,
+            RequestValidationError(
+                [
+                    {
+                        "type": "string_too_long",
+                        "loc": ("body", "password"),
+                        "msg": "String should have at most 512 characters",
+                        "input": "must-never-return-this-secret",
+                    }
+                ]
+            ),
+        )
+    )
+    payload = json.loads(response.body)
+    assert "must-never-return-this-secret" not in str(payload)
+    assert payload["detail"][0] == {
+        "loc": ["body", "password"],
+        "msg": "String should have at most 512 characters",
+        "type": "string_too_long",
+    }

@@ -1,12 +1,12 @@
-import { Building2, CheckCircle2, Fuel, LayoutDashboard, LogOut, Mail } from "lucide-react";
+import { Ban, Building2, CheckCircle2, Fuel, Inbox, LayoutDashboard, LogOut, Mail } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
-export type AppPage = "dashboard" | "companies" | "template";
+export type AppPage = "dashboard" | "companies" | "template" | "mailboxes" | "suppressions";
 
 interface AppSidebarProps {
   activePage: AppPage;
   mode: DiscoveryProvider;
-  gmailConfigured: boolean;
+  mailboxesConfigured: boolean;
   userEmail: string;
   onLogout: () => void;
 }
@@ -15,15 +15,17 @@ const navigation = [
   { page: "dashboard" as const, label: "Обзор", icon: LayoutDashboard },
   { page: "companies" as const, label: "Компании", icon: Building2 },
   { page: "template" as const, label: "Шаблон письма", icon: Mail },
+  { page: "mailboxes" as const, label: "Почтовые ящики", icon: Inbox },
+  { page: "suppressions" as const, label: "Исключения", icon: Ban },
 ];
 
-export function AppSidebar({ activePage, mode, gmailConfigured, userEmail, onLogout }: AppSidebarProps) {
+export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, onLogout }: AppSidebarProps) {
   const providerLabel = mode === "combined"
-    ? "Checko → API-ФНС подключены"
+    ? "Checko → API-ФНС настроены"
     : mode === "api_fns"
-      ? "API-ФНС подключён"
+      ? "API-ФНС настроен"
       : mode === "checko"
-        ? "Checko подключён"
+        ? "Checko настроен"
         : "Демо-режим";
   return (
     <aside className="workspace-sidebar">
@@ -54,9 +56,9 @@ export function AppSidebar({ activePage, mode, gmailConfigured, userEmail, onLog
           <CheckCircle2 size={17} />
           <span>{providerLabel}</span>
         </div>
-        <div className={`sidebar-status ${gmailConfigured ? "" : "sidebar-status--muted"}`}>
+        <div className={`sidebar-status ${mailboxesConfigured ? "" : "sidebar-status--muted"}`}>
           <Mail size={17} />
-          <span>{gmailConfigured ? "Gmail подключён" : "Gmail не настроен"}</span>
+          <span>{mailboxesConfigured ? "Mail.ru готов" : "Mail.ru не настроен"}</span>
         </div>
       </div>
 

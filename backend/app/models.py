@@ -1,10 +1,12 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -41,8 +43,33 @@ COMPANY_STATUS_LABELS = {
     "error": "Ошибка отправки",
 }
 CONTACT_TYPES = ("phone", "whatsapp", "telegram")
-OUTREACH_CAMPAIGN_STATUSES = ("running", "paused", "completed", "cancelled")
-OUTREACH_DELIVERY_STATUSES = ("queued", "sending", "sent", "failed", "cancelled")
+OUTREACH_CAMPAIGN_STATUSES = (
+    "draft",
+    "running",
+    "paused",
+    "cooldown",
+    "interrupted",
+    "completed",
+    "stopped",
+)
+OUTREACH_DELIVERY_STATUSES = (
+    "queued",
+    "sending",
+    "accepted",
+    "failed",
+    "bounced",
+    "uncertain",
+    "suppressed",
+    "cancelled",
+)
+SENDER_PROVIDERS = ("gmail_api", "mailru_smtp")
+SENDER_VERIFICATION_STATUSES = (
+    "unverified",
+    "verified",
+    "failed",
+    "blocked",
+    "temporary_error",
+)
 
 
 class Company(Base):
@@ -223,33 +250,144 @@ class EmailTemplate(Base):
     )
 
 
+class SenderAccount(Base):
+    __tablename__ = "sender_accounts"
+    __table_args__ = (
+        CheckConstraint(
+            "provider IN ('gmail_api','mailru_smtp')",
+            name="ck_sender_accounts_provider",
+        ),
+        CheckConstraint(
+            "verification_status IN "
+            "('unverified','verified','failed','blocked','temporary_error')",
+            name="ck_sender_accounts_verification_status",
+        ),
+        CheckConstraint("daily_limit > 0", name="ck_sender_accounts_daily_limit"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(30), default="mailru_smtp", nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    encrypted_password: Mapped[str | None] = mapped_column(Text)
+    smtp_host: Mapped[str] = mapped_column(String(255), default="smtp.mail.ru", nullable=False)
+    smtp_port: Mapped[int] = mapped_column(Integer, default=465, nullable=False)
+    imap_host: Mapped[str] = mapped_column(String(255), default="imap.mail.ru", nullable=False)
+    imap_port: Mapped[int] = mapped_column(Integer, default=993, nullable=False)
+    smtp_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    imap_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    verification_status: Mapped[str] = mapped_column(
+        String(30), default="unverified", nullable=False, index=True
+    )
+    verification_error: Mapped[str | None] = mapped_column(Text)
+    verification_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    daily_limit: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    sent_today: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    sent_today_date: Mapped[date | None] = mapped_column(Date)
+    successful_full_batches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_batch_size: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    blocked_until_round: Mapped[int | None] = mapped_column(Integer)
+    block_reason: Mapped[str | None] = mapped_column(Text)
+    last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    imap_last_uid: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class EmailSuppression(Base):
+    __tablename__ = "email_suppressions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    source: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    campaign_id: Mapped[int | None] = mapped_column(
+        ForeignKey("outreach_campaigns.id", ondelete="SET NULL"), index=True
+    )
+    delivery_id: Mapped[int | None] = mapped_column(
+        ForeignKey("outreach_deliveries.id", ondelete="SET NULL"), index=True
+    )
+    smtp_code: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False, index=True
+    )
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    comment: Mapped[str | None] = mapped_column(Text)
+
+
+class ImapProcessedMessage(Base):
+    __tablename__ = "imap_processed_messages"
+    __table_args__ = (
+        UniqueConstraint("sender_account_id", "uid", name="uq_imap_account_uid"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sender_account_id: Mapped[int] = mapped_column(
+        ForeignKey("sender_accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    uid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[str | None] = mapped_column(String(255))
+    outcome: Mapped[str] = mapped_column(String(30), nullable=False)
+    delivery_id: Mapped[int | None] = mapped_column(
+        ForeignKey("outreach_deliveries.id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class OutreachCampaign(Base):
     __tablename__ = "outreach_campaigns"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('running','paused','completed','cancelled')",
+            "status IN ('draft','running','paused','cooldown','interrupted','completed','stopped')",
             name="ck_outreach_campaigns_status",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    status: Mapped[str] = mapped_column(String(20), default="running", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft", nullable=False, index=True)
     filters: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     matched_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     recipient_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     sent_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    accepted_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bounced_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    uncertain_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    suppressed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cancelled_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     daily_limit: Mapped[int] = mapped_column(Integer, nullable=False)
     hourly_limit: Mapped[int] = mapped_column(Integer, nullable=False)
     min_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     max_per_domain_per_day: Mapped[int] = mapped_column(Integer, nullable=False)
     pause_reason: Mapped[str | None] = mapped_column(Text)
+    subject_snapshot: Mapped[str | None] = mapped_column(Text)
+    body_snapshot: Mapped[str | None] = mapped_column(Text)
+    recipients_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    sender_account_ids: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
+    scheduler_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    snapshot_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_round: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    sender_position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    batch_position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_batch_target: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_batch_sender_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sender_accounts.id", ondelete="SET NULL"), index=True
+    )
+    current_interval_seconds: Mapped[int | None] = mapped_column(Integer)
+    round_rest_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_claim_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    worker_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_send_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=utcnow, nullable=False
-    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
@@ -261,6 +399,9 @@ class OutreachCampaign(Base):
         lazy="selectin",
         order_by="OutreachDelivery.id",
     )
+    current_batch_sender: Mapped["SenderAccount | None"] = relationship(
+        foreign_keys=[current_batch_sender_id], lazy="selectin"
+    )
 
 
 class OutreachDelivery(Base):
@@ -268,7 +409,7 @@ class OutreachDelivery(Base):
     __table_args__ = (
         UniqueConstraint("campaign_id", "recipient", name="uq_outreach_campaign_recipient"),
         CheckConstraint(
-            "status IN ('queued','sending','sent','failed','cancelled')",
+            "status IN ('queued','sending','accepted','failed','bounced','uncertain','suppressed','cancelled')",
             name="ck_outreach_deliveries_status",
         ),
     )
@@ -280,6 +421,9 @@ class OutreachDelivery(Base):
     company_id: Mapped[int | None] = mapped_column(
         ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    sender_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sender_accounts.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     company_name: Mapped[str] = mapped_column(String(400), nullable=False)
     company_inn: Mapped[str] = mapped_column(String(12), nullable=False)
     recipient: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
@@ -289,10 +433,19 @@ class OutreachDelivery(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False, index=True)
     message_id: Mapped[str | None] = mapped_column(String(255), index=True)
     error_message: Mapped[str | None] = mapped_column(Text)
+    smtp_code: Mapped[str | None] = mapped_column(String(40))
+    smtp_response: Mapped[str | None] = mapped_column(String(500))
+    interval_seconds: Mapped[int | None] = mapped_column(Integer)
+    claim_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
 
     campaign: Mapped[OutreachCampaign] = relationship(back_populates="deliveries")
+    sender_account: Mapped["SenderAccount | None"] = relationship(
+        foreign_keys=[sender_account_id], lazy="selectin"
+    )

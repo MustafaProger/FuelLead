@@ -1,4 +1,5 @@
 from collections.abc import Generator
+from pathlib import Path
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -28,12 +29,49 @@ def create_database() -> None:
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _run_postgresql_migrations()
     _upgrade_company_status_schema(
         models.Company,
         models.ALL_STATUSES,
         models.REMOVED_COMPANY_STATUSES,
     )
     _upgrade_discovery_cursor_schema(models.DiscoveryCursor)
+
+
+def _run_postgresql_migrations() -> None:
+    """Apply the idempotent Mail.ru scheduler migration on PostgreSQL.
+
+    SQLite test databases are created directly from current metadata. Production
+    PostgreSQL keeps an explicit migration ledger and upgrades existing Gmail-era
+    campaign/delivery rows in place.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    migration_path = (
+        Path(__file__).resolve().parent
+        / "migrations"
+        / "20260903_mailru_scheduler.sql"
+    )
+    migration_sql = migration_path.read_text(encoding="utf-8")
+    with engine.begin() as connection:
+        # Backend and the standalone IMAP process can start together. A
+        # transaction-scoped advisory lock serializes their schema upgrade.
+        connection.exec_driver_sql(
+            "SELECT pg_advisory_xact_lock(701337, 20260903)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version VARCHAR(100) PRIMARY KEY, "
+            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        )
+        applied = connection.execute(
+            text(
+                "SELECT 1 FROM schema_migrations "
+                "WHERE version = '20260903_mailru_scheduler'"
+            )
+        ).scalar()
+        if not applied:
+            connection.exec_driver_sql(migration_sql)
 
 
 def _upgrade_company_status_schema(company_model, statuses, removed_statuses) -> None:

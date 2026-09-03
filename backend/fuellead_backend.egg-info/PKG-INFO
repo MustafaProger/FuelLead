@@ -3,6 +3,7 @@ Name: fuellead-backend
 Version: 0.1.0
 Summary: FuelLead company discovery API
 Requires-Python: >=3.11
+Requires-Dist: cryptography<46,>=43
 Requires-Dist: fastapi<1,>=0.115
 Requires-Dist: httpx<1,>=0.27
 Requires-Dist: openpyxl<4,>=3.1

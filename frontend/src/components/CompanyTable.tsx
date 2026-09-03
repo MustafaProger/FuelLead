@@ -17,7 +17,7 @@ interface CompanyTableProps {
   onContactAdd: (companyId: number, contactType: ContactType, value: string) => Promise<void>;
   onContactDelete: (companyId: number, contactId: number) => Promise<void>;
   onCompanyDelete: (company: CompanyDetail) => Promise<void>;
-  gmailConfigured: boolean;
+  mailConfigured: boolean;
   sendingEmailId: number | null;
   onSendEmail: (company: Company) => Promise<void>;
   onPageChange: (page: number) => void;
@@ -254,7 +254,7 @@ function CompanyRow({
   onContactAdd,
   onContactDelete,
   onCompanyDelete,
-  gmailConfigured,
+  mailConfigured,
   sendingEmailId,
   onSendEmail,
 }: CompanyTableProps & { company: Company; visibleColumns: Set<CompanyColumnId>; columnCount: number }) {
@@ -351,8 +351,8 @@ function CompanyRow({
           <button
             className="send-email-button"
             type="button"
-            disabled={!hasEmail || !gmailConfigured || sendingEmail}
-            title={!hasEmail ? "У компании нет email" : !gmailConfigured ? "Gmail OAuth не настроен" : "Отправить сохранённый шаблон на основной email компании"}
+            disabled={!hasEmail || !mailConfigured || sendingEmail}
+            title={!hasEmail ? "У компании нет email" : !mailConfigured ? "Нет проверенного ящика Mail.ru" : "Отправить сохранённый шаблон на основной email компании"}
             aria-label={`Отправить письмо на основной email компании ${company.name}`}
             onClick={() => void onSendEmail(company)}
           >

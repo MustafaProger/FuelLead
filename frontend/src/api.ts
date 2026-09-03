@@ -7,11 +7,13 @@ import type {
   EmailPreview,
   EmailSendResult,
   EmailTemplate,
+  EmailSuppression,
   Filters,
   Health,
   OutreachCampaign,
   OutreachPreflight,
   SearchRun,
+  SenderAccount,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -42,7 +44,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     if (response.status === 401 && !path.startsWith("/auth/")) {
       window.dispatchEvent(new Event("fuellead:unauthorized"));
     }
-    throw new ApiError(body?.detail || `Ошибка запроса: ${response.status}`, response.status);
+    const detail = body?.detail;
+    const message = typeof detail === "string"
+      ? detail
+      : Array.isArray(detail)
+        ? detail
+          .map((item) => typeof item?.msg === "string" ? item.msg.replace(/^Value error,\s*/, "") : null)
+          .filter(Boolean)
+          .join(". ")
+        : `Ошибка запроса: ${response.status}`;
+    throw new ApiError(message || `Ошибка запроса: ${response.status}`, response.status);
   }
   return response.json() as Promise<T>;
 }
@@ -149,16 +160,65 @@ export const api = {
     request<OutreachCampaign | null>("/outreach/campaigns/active"),
   outreachCampaign: (id: number) =>
     request<OutreachCampaign>(`/outreach/campaigns/${id}`),
-  startOutreachCampaign: (filters: Filters) =>
+  startOutreachCampaign: (snapshotId: number) =>
     request<OutreachCampaign>("/outreach/campaigns", {
       method: "POST",
-      body: JSON.stringify({ filters: filtersToPayload(filters), confirmed: true }),
+      body: JSON.stringify({ snapshot_id: snapshotId, confirmed: true }),
     }),
   pauseOutreachCampaign: (id: number) =>
     request<OutreachCampaign>(`/outreach/campaigns/${id}/pause`, { method: "POST" }),
   resumeOutreachCampaign: (id: number) =>
     request<OutreachCampaign>(`/outreach/campaigns/${id}/resume`, { method: "POST" }),
   cancelOutreachCampaign: (id: number) =>
-    request<OutreachCampaign>(`/outreach/campaigns/${id}/cancel`, { method: "POST" }),
+    request<OutreachCampaign>(`/outreach/campaigns/${id}/stop`, { method: "POST" }),
+  resolveUncertainDelivery: (id: number, outcome: "accepted" | "failed") =>
+    request<OutreachCampaign>(`/outreach/deliveries/${id}/resolve-uncertain`, {
+      method: "POST",
+      body: JSON.stringify({ outcome, confirmed: true }),
+    }),
+  senderAccounts: () => request<SenderAccount[]>("/sender-accounts"),
+  createSenderAccount: (data: {
+    email: string;
+    display_name: string;
+    password: string;
+    daily_limit: number;
+    smtp_enabled: boolean;
+    imap_enabled: boolean;
+  }) => request<SenderAccount>("/sender-accounts", {
+    method: "POST",
+    body: JSON.stringify({ provider: "mailru_smtp", ...data }),
+  }),
+  updateSenderAccount: (id: number, data: Partial<{
+    display_name: string;
+    password: string;
+    daily_limit: number;
+    smtp_enabled: boolean;
+    imap_enabled: boolean;
+    is_active: boolean;
+  }>) => request<SenderAccount>(`/sender-accounts/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  }),
+  verifySenderAccount: (id: number) =>
+    request<SenderAccount>(`/sender-accounts/${id}/verify`, { method: "POST" }),
+  sendSenderTestEmail: (id: number, recipient: string) =>
+    request<{ accepted: true; recipient: string; message_id: string; notice: string }>(
+      `/sender-accounts/${id}/test-email`,
+      { method: "POST", body: JSON.stringify({ recipient, confirmed: true }) },
+    ),
+  deleteSenderAccount: (id: number) =>
+    request<{ deleted: true; id: number }>(`/sender-accounts/${id}?confirmed=true`, { method: "DELETE" }),
+  emailSuppressions: (search = "") =>
+    request<EmailSuppression[]>(`/email-suppressions?search=${encodeURIComponent(search)}`),
+  addEmailSuppression: (email: string, reason: string, comment: string) =>
+    request<EmailSuppression>("/email-suppressions", {
+      method: "POST",
+      body: JSON.stringify({ email, reason, comment: comment || null }),
+    }),
+  liftEmailSuppression: (id: number, comment: string) =>
+    request<EmailSuppression>(`/email-suppressions/${id}/lift`, {
+      method: "POST",
+      body: JSON.stringify({ confirmed: true, comment }),
+    }),
   exportUrl: (filters: Filters) => `${API_BASE}/export.xlsx?${filtersToParams(filters)}`,
 };
