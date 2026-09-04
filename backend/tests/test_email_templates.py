@@ -145,7 +145,7 @@ def test_company_send_without_recipient_uses_only_primary_company_email(db, monk
     assert company.history[0].event_data["recipient"] == "office@artel.ru"
 
 
-def test_single_company_send_marks_company_error_and_saves_reason(db, monkeypatch):
+def test_single_company_send_keeps_company_new_and_saves_reason(db, monkeypatch):
     company = make_company(db)
 
     class FailingSender:
@@ -164,6 +164,6 @@ def test_single_company_send_marks_company_error_and_saves_reason(db, monkeypatc
     db.expire_all()
     failed_company = db.get(Company, company.id)
     assert caught.value.status_code == 502
-    assert failed_company.status == "error"
+    assert failed_company.status == "new"
     assert failed_company.history[0].event_type == "email_failed"
     assert failed_company.history[0].event_data["error"] == "Mail.ru временно отклонил отправку"

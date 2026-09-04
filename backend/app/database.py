@@ -36,6 +36,27 @@ def create_database() -> None:
         models.REMOVED_COMPANY_STATUSES,
     )
     _upgrade_discovery_cursor_schema(models.DiscoveryCursor)
+    _upgrade_search_run_schema()
+
+
+def _upgrade_search_run_schema() -> None:
+    """Preserve historical batch runs while adding observable full searches."""
+    additions = {
+        "search_scope": "VARCHAR(20) NOT NULL DEFAULT 'batch'",
+        "cancel_requested": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "active_provider": "VARCHAR(20)",
+        "search_requests": "INTEGER NOT NULL DEFAULT 0",
+        "company_requests": "INTEGER NOT NULL DEFAULT 0",
+        "progress_message": "TEXT",
+        "provider_results": "JSON NOT NULL DEFAULT '{}'",
+    }
+    with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.exec_driver_sql("SELECT pg_advisory_xact_lock(701337, 20260904)")
+        columns = {column["name"] for column in inspect(connection).get_columns("search_runs")}
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE search_runs ADD COLUMN {name} {definition}")
 
 
 def _run_postgresql_migrations() -> None:

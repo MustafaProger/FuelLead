@@ -11,11 +11,13 @@ class DiscoveryAPIError(RuntimeError):
         stop_discovery: bool = False,
         key_unavailable: bool = False,
         reason: str | None = None,
+        retry_after_seconds: float | None = None,
     ):
         super().__init__(message)
         self.stop_discovery = stop_discovery
         self.key_unavailable = key_unavailable
         self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(slots=True)

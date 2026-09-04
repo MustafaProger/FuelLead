@@ -1,3 +1,4 @@
+import { discoveryProviderLabels } from "../discoveryProviders";
 import { Ban, Building2, CheckCircle2, Fuel, Inbox, LayoutDashboard, LogOut, Mail } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
@@ -20,13 +21,7 @@ const navigation = [
 ];
 
 export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, onLogout }: AppSidebarProps) {
-  const providerLabel = mode === "combined"
-    ? "Checko → API-ФНС настроены"
-    : mode === "api_fns"
-      ? "API-ФНС настроен"
-      : mode === "checko"
-        ? "Checko настроен"
-        : "Демо-режим";
+  const providerLabel = discoveryProviderLabels[mode];
   return (
     <aside className="workspace-sidebar">
       <div className="sidebar-brand">

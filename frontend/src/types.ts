@@ -4,8 +4,7 @@ export type CompanyStatus =
   | "answered"
   | "interested"
   | "customer"
-  | "rejected"
-  | "error";
+  | "rejected";
 
 export interface EmailAddress {
   id: number;
@@ -73,7 +72,7 @@ export interface CompanyListResponse {
   stats: Stats;
 }
 
-export type DiscoveryProvider = "checko" | "api_fns" | "combined" | "demo";
+export type DiscoveryProvider = "checko" | "okvedo" | "dadata" | "api_fns" | "combined" | "demo";
 
 export interface Health {
   status: string;
@@ -81,6 +80,10 @@ export interface Health {
   checko_configured: boolean;
   checko_api_key_count: number;
   checko_state: "selected" | "standby" | "not_configured";
+  okvedo_configured: boolean;
+  dadata_configured: boolean;
+  discovery_provider_order: DiscoveryProvider[];
+  api_fns_fallback_policy: "only_after_primary_daily_limits";
   api_fns_configured: boolean;
   api_fns_request_budget_per_run: { search: number; egr: number };
   selected_discovery_provider: DiscoveryProvider;
@@ -94,8 +97,15 @@ export interface Health {
 
 export interface SearchRun {
   id: number;
-  status: "pending" | "running" | "completed" | "failed";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
   mode: DiscoveryProvider;
+  search_scope: "full" | "batch";
+  cancel_requested: boolean;
+  active_provider: DiscoveryProvider | null;
+  search_requests: number;
+  company_requests: number;
+  progress_message: string | null;
+  provider_results: Partial<Record<DiscoveryProvider, string>>;
   requested_okved_codes: string[];
   candidates_found: number;
   companies_created: number;

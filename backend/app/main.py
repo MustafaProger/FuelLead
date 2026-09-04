@@ -8,7 +8,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Req
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.auth import AUTH_COOKIE_NAME, create_session_token, credentials_match, session_email
@@ -227,7 +227,14 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "checko_configured": settings.checko_configured,
         "checko_api_key_count": len(settings.checko_api_keys),
         "checko_state": checko_state,
+        "okvedo_configured": settings.okvedo_configured,
+        "dadata_configured": settings.dadata_configured,
         "api_fns_configured": settings.api_fns_configured,
+        "discovery_provider_order": (
+            [*settings.primary_discovery_providers, *(["api_fns"] if settings.api_fns_configured else [])]
+            if selected_provider == "combined" else [selected_provider]
+        ),
+        "api_fns_fallback_policy": "only_after_primary_daily_limits",
         "api_fns_request_budget_per_run": {
             "search": settings.api_fns_max_search_requests_per_run,
             "egr": settings.api_fns_max_egr_requests_per_run,
@@ -959,17 +966,38 @@ def start_search(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
+    # Serialize competing clicks/tabs across backend processes in production.
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(701337, 90401)"))
     running = db.scalar(select(SearchRun).where(SearchRun.status.in_(("pending", "running"))))
     if running:
-        raise HTTPException(status_code=409, detail="Поиск уже выполняется")
+        return search_run_to_dict(running)
     run = SearchRun(
         requested_okved_codes=request.okved_codes,
         mode=settings.resolved_discovery_provider,
+        search_scope=request.search_scope,
     )
     db.add(run)
     db.commit()
     db.refresh(run)
     background_tasks.add_task(run_discovery, run.id, settings, request.limit_per_code)
+    return search_run_to_dict(run)
+
+
+@app.get("/api/search-runs/latest")
+def latest_search_run(db: Session = Depends(get_db)) -> dict | None:
+    run = db.scalar(select(SearchRun).order_by(SearchRun.id.desc()).limit(1))
+    return search_run_to_dict(run) if run else None
+
+
+@app.post("/api/search-runs/{run_id}/stop")
+def stop_search_run(run_id: int, db: Session = Depends(get_db)) -> dict:
+    run = db.get(SearchRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск поиска не найден")
+    if run.status in ("pending", "running"):
+        run.cancel_requested = True
+        db.commit()
     return search_run_to_dict(run)
 
 

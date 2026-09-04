@@ -16,7 +16,6 @@ const statusTabs: Array<{ value: "" | CompanyStatus; label: string }> = [
   { value: "interested", label: "Заинтересованы" },
   { value: "customer", label: "Работают с нами" },
   { value: "rejected", label: "Отказ" },
-  { value: "error", label: "Ошибки отправки" },
 ];
 
 export function FiltersBar({ filters, total, loading, onChange }: FiltersBarProps) {

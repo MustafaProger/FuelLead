@@ -30,7 +30,6 @@ const statusLabels: Record<CompanyStatus, string> = {
   interested: "Заинтересована",
   customer: "Работает с нами",
   rejected: "Отказ",
-  error: "Ошибка отправки",
 };
 
 type CompanyColumnId =

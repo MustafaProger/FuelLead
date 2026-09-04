@@ -1,3 +1,4 @@
+import { discoveryProviderLabels } from "../discoveryProviders";
 import { Fuel, RefreshCw, Search, Send } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
@@ -9,13 +10,7 @@ interface HeaderProps {
 }
 
 export function Header({ mode, searching, onOpenOutreach, onSearch }: HeaderProps) {
-  const providerLabel = mode === "combined"
-    ? "Checko → API-ФНС настроены"
-    : mode === "api_fns"
-      ? "API-ФНС настроен"
-      : mode === "checko"
-        ? "Checko настроен"
-        : "Демо-режим";
+  const providerLabel = discoveryProviderLabels[mode];
   return (
     <header className="app-header">
       <div className="header-inner">
@@ -43,10 +38,10 @@ export function Header({ mode, searching, onOpenOutreach, onSearch }: HeaderProp
             type="button"
             onClick={onSearch}
             disabled={searching}
-            aria-label={searching ? "Поиск компаний выполняется" : "Найти компании"}
+            aria-label={searching ? "Поиск компаний выполняется" : "Запустить полный поиск"}
           >
             {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
-            <span>{searching ? "Идёт поиск…" : "Найти компании"}</span>
+            <span>{searching ? "Идёт поиск…" : "Запустить полный поиск"}</span>
           </button>
         </div>
       </div>

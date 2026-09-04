@@ -102,8 +102,10 @@ class CheckoClient:
         self.api_keys = tuple(dict.fromkeys(key.strip() for key in raw_keys if key.strip()))
         if not self.api_keys:
             raise ValueError("Checko API key is required")
-        self.active_key_index = 0
-        self.unavailable_key_reasons: dict[int, str] = {}
+        # Keep search and card limits separate: exhausting one method must not
+        # discard a key that can still serve the other method.
+        self.active_key_indices: dict[str, int] = {}
+        self.unavailable_key_reasons: dict[str, dict[int, str]] = {}
         self.client = httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=timeout_seconds,
@@ -174,7 +176,8 @@ class CheckoClient:
         return None
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        for key_index in range(self.active_key_index, len(self.api_keys)):
+        unavailable_reasons = self.unavailable_key_reasons.setdefault(path, {})
+        for key_index in range(self.active_key_indices.get(path, 0), len(self.api_keys)):
             response = self._request(path, params, self.api_keys[key_index])
 
             try:
@@ -185,26 +188,29 @@ class CheckoClient:
             error = self._response_error(response, payload)
             if error is not None:
                 if error.key_unavailable:
-                    self.unavailable_key_reasons[key_index] = error.reason or "unavailable"
+                    unavailable_reasons[key_index] = error.reason or "unavailable"
                     if key_index + 1 < len(self.api_keys):
-                        self.active_key_index = key_index + 1
+                        self.active_key_indices[path] = key_index + 1
                         continue
                 if len(self.api_keys) == 1:
                     raise error
-                if len(self.unavailable_key_reasons) == len(self.api_keys):
+                if len(unavailable_reasons) == len(self.api_keys):
                     all_daily_limits = all(
                         reason == "daily_limit"
-                        for reason in self.unavailable_key_reasons.values()
+                        for reason in unavailable_reasons.values()
                     )
                     message = (
                         "Суточный лимит Checko исчерпан на всех настроенных API-ключах."
                         if all_daily_limits
                         else "Все настроенные API-ключи Checko недоступны. Проверьте лимиты и ключи."
                     )
-                    raise CheckoAPIError(message, stop_discovery=True)
+                    raise CheckoAPIError(
+                        message, stop_discovery=True,
+                        reason="daily_limit" if all_daily_limits else "keys_unavailable",
+                    )
                 raise error
 
-            self.active_key_index = key_index
+            self.active_key_indices[path] = key_index
             data = payload.get("data")
             if not isinstance(data, dict):
                 raise CheckoAPIError("Checko вернул ответ без данных")

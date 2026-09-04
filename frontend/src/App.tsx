@@ -57,6 +57,8 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [searchRun, setSearchRun] = useState<SearchRun | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
+  const [startingSearch, setStartingSearch] = useState(false);
+  const [stoppingSearch, setStoppingSearch] = useState(false);
   const [sendingEmailId, setSendingEmailId] = useState<number | null>(null);
   const [emailSuccess, setEmailSuccess] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
@@ -97,6 +99,14 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   useEffect(() => { void loadIntegrationState(); }, [loadIntegrationState]);
 
   useEffect(() => {
+    let cancelled = false;
+    void api.latestSearchRun().then((run) => {
+      if (!cancelled) setSearchRun((current) => current ?? run);
+    }).catch(() => { /* The primary API calls report connection errors. */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     const timer = window.setTimeout(loadCompanies, filters.search ? 280 : 0);
     return () => window.clearTimeout(timer);
   }, [loadCompanies, refreshToken, filters.search]);
@@ -117,7 +127,10 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
           setRefreshToken((value) => value + 1);
         }
       } catch (requestError) {
-        if (!cancelled) setSearchError(requestError instanceof Error ? requestError.message : "Не удалось проверить поиск");
+        if (!cancelled) {
+          setSearchError(requestError instanceof Error ? requestError.message : "Не удалось проверить поиск");
+          timer = window.setTimeout(poll, 5000);
+        }
       }
     };
     timer = window.setTimeout(poll, 800);
@@ -127,7 +140,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
     };
   }, [searchRun?.id, searchRun?.status]);
 
-  const searching = searchRun?.status === "pending" || searchRun?.status === "running";
+  const searching = startingSearch || searchRun?.status === "pending" || searchRun?.status === "running";
 
   const openOutreach = (selectionFilters: Filters) => {
     setOutreachFilters(selectionFilters);
@@ -139,6 +152,8 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   }, []);
 
   const handleSearch = async () => {
+    if (searching) return;
+    setStartingSearch(true);
     try {
       setSearchError(null);
       const run = await api.startSearch(
@@ -148,6 +163,21 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
       setSearchRun(run);
     } catch (requestError) {
       setSearchError(requestError instanceof Error ? requestError.message : "Не удалось запустить поиск");
+    } finally {
+      setStartingSearch(false);
+    }
+  };
+
+  const handleStopSearch = async () => {
+    if (!searchRun || stoppingSearch) return;
+    setStoppingSearch(true);
+    try {
+      setSearchRun(await api.stopSearch(searchRun.id));
+      setSearchError(null);
+    } catch (requestError) {
+      setSearchError(requestError instanceof Error ? requestError.message : "Не удалось остановить поиск");
+    } finally {
+      setStoppingSearch(false);
     }
   };
 
@@ -240,6 +270,8 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
       />
       <main className="workspace-main">
         <SearchRunNotice
+          onStop={() => void handleStopSearch()}
+          stopping={stoppingSearch}
           error={searchError}
           run={searchRun}
           onCloseError={() => setSearchError(null)}
@@ -267,7 +299,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
                 </button>
                 <button className="button button--primary" type="button" onClick={handleSearch} disabled={Boolean(searching)}>
                   {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
-                  {searching ? "Идёт поиск…" : "Найти компании"}
+                  {searching ? "Идёт поиск…" : "Запустить полный поиск"}
                 </button>
               </div>
             </header>

@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
-from app.models import Company, CompanyEmail, EmailSuppression, OutreachCampaign, SenderAccount
+from app.models import ActivityHistory, Company, CompanyEmail, EmailSuppression, OutreachCampaign, SenderAccount
 from app.schemas import CompanyFilters
 from app.services.credentials import CredentialCipher, generate_encryption_key
 from app.services.outreach import (
@@ -103,6 +103,37 @@ def test_snapshot_filters_suppressions_and_expires_in_ten_minutes(db):
     assert campaign.sender_account_ids == [1]
     assert campaign.recipients_snapshot == [{"company_id": 1, "recipient": "first@example.ru"}]
     assert 599 <= (campaign.snapshot_expires_at - campaign.created_at).total_seconds() <= 601
+
+
+def test_resend_enabled_event_allows_a_historical_recipient_again(db):
+    settings = settings_with_key()
+    add_sender(db, settings, "one@mail.ru")
+    company = add_company(db, 1, email="again@example.ru")
+    sent_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.add(ActivityHistory(
+        company=company,
+        event_type="email_sent",
+        description="SMTP-сервер принял письмо",
+        from_status="new",
+        to_status="sent",
+        event_data={"recipient": "again@example.ru"},
+        created_at=sent_at,
+    ))
+    db.add(ActivityHistory(
+        company=company,
+        event_type="email_resend_enabled",
+        description="Разрешена повторная рассылка",
+        from_status="sent",
+        to_status="new",
+        event_data={"recipients": ["again@example.ru"]},
+        created_at=sent_at + timedelta(seconds=1),
+    ))
+    db.commit()
+
+    preflight = build_outreach_preflight(db, CompanyFilters(), settings)
+
+    assert preflight["selected_count"] == 1
+    assert preflight["skipped"]["already_contacted"] == 0
 
 
 def test_expired_snapshot_cannot_be_confirmed(db):

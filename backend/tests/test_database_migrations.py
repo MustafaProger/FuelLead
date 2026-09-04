@@ -95,11 +95,11 @@ def test_company_status_migration_preserves_rows_and_child_foreign_keys(tmp_path
             if item["name"] == "ck_companies_status"
         )
 
-    assert statuses == [(1, "new"), (2, "sent"), (3, "error")]
+    assert statuses == [(1, "new"), (2, "sent"), (3, "new")]
     assert child == (1, "lead@example.ru")
     assert foreign_key_target == "companies"
     assert "customer" in status_check["sqltext"]
-    assert "error" in status_check["sqltext"]
+    assert "error" not in status_check["sqltext"]
     assert "ready" not in status_check["sqltext"]
 
     with legacy_engine.begin() as connection:

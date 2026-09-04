@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+import time
+from collections.abc import Callable
+from typing import TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,6 +22,8 @@ from app.models import (
 from app.services.api_fns import ApiFnsClient
 from app.services.checko import CheckoClient
 from app.services.demo_data import DEMO_COMPANIES
+from app.services.okvedo import OkvedoClient
+from app.services.dadata import DaDataClient
 from app.services.provider import (
     CompanyPayload,
     DiscoveryAPIError,
@@ -37,6 +42,55 @@ CATEGORY_RULES = [
     ("construction", ("41.20", "43.11", "43.12")),
 ]
 MAX_SEARCH_PAGES_PER_QUERY_RUN = 2
+PROVIDER_LABELS = {"checko": "Checko", "okvedo": "Okvedo", "dadata": "DaData", "api_fns": "API-ФНС"}
+T = TypeVar("T")
+
+
+class SearchCancelled(Exception):
+    pass
+
+
+def _check_cancelled(db: Session, run: SearchRun) -> None:
+    # Refresh only the flag so an API stop cannot be overwritten by stale state.
+    db.refresh(run, attribute_names=["cancel_requested"])
+    if run.cancel_requested:
+        raise SearchCancelled()
+
+
+def _wait_for_provider(db: Session, run: SearchRun, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while (remaining := deadline - time.monotonic()) > 0:
+        _check_cancelled(db, run)
+        time.sleep(min(remaining, 1))
+
+
+def _provider_call(db: Session, run: SearchRun, operation: str, call: Callable[[], T]) -> T:
+    """Pace full runs and retry temporary throttles without restarting discovery."""
+    full = run.search_scope == "full"
+    message = run.progress_message
+    for attempt in range(4):
+        _check_cancelled(db, run)
+        if full:
+            # Below Okvedo free tier's 60 requests/minute, including search/cards.
+            _wait_for_provider(db, run, 1.05)
+        setattr(run, operation, getattr(run, operation) + 1)
+        run.progress_message = message
+        db.commit()
+        try:
+            return call()
+        except DiscoveryAPIError as exc:
+            if not full or exc.reason != "rate_limit" or attempt == 3:
+                raise
+            delay = max(60 * (attempt + 1), exc.retry_after_seconds or 0)
+            run.progress_message = f"Провайдер ограничил частоту. Продолжим автоматически через {delay:g} сек."
+            db.commit()
+            _wait_for_provider(db, run, delay)
+    raise AssertionError("Unreachable")
+
+
+def _record_provider_result(db: Session, run: SearchRun, provider: str, reason: str) -> None:
+    run.provider_results = {**run.provider_results, provider: reason}
+    db.commit()
 
 
 def utcnow() -> datetime:
@@ -310,6 +364,7 @@ def discover_new_companies(
     source: str = "Checko API",
     max_search_requests: int | None = None,
     max_company_requests: int | None = None,
+    propagate_stop_errors: bool = False,
 ) -> bool:
     """Discover unknown INNs while continuing through persistent provider pages.
 
@@ -318,7 +373,11 @@ def discover_new_companies(
     known_inns = set(db.scalars(select(Company.inn)).all())
     known_inns.update(db.scalars(select(ExcludedCompany.inn)).all())
     seen_inns: set[str] = set()
-    cursor_page_size = getattr(client, "fixed_page_size", None) or limit_per_code
+    full = run.search_scope == "full"
+    page_size = (getattr(client, "fixed_page_size", None) or 100) if full else limit_per_code
+    cursor_page_size = getattr(client, "fixed_page_size", None) or page_size
+    run.active_provider = provider
+    db.commit()
     search_requests = 0
     company_requests = 0
 
@@ -333,12 +392,20 @@ def discover_new_companies(
             )
             candidate_attempts = 0
             pages_scanned = 0
+            visited_pages: set[int] = set()
+            page_fingerprints: set[tuple[str, ...]] = set()
 
             while (
-                candidate_attempts < limit_per_code
-                and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN
+                full or (candidate_attempts < limit_per_code
+                and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN)
             ):
+                _check_cancelled(db, run)
                 requested_page = cursor.next_page
+                if requested_page in visited_pages:
+                    raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
+                                            stop_discovery=True, reason="pagination_stalled")
+                run.progress_message = f"{PROVIDER_LABELS[provider]} · ОКВЭД {code} · регион {region_code} · страница {requested_page}"
+                db.commit()
                 if max_search_requests is not None and search_requests >= max_search_requests:
                     run.errors_count += 1
                     run.error_message = (
@@ -350,13 +417,13 @@ def discover_new_companies(
                     return True
                 search_requests += 1
                 try:
-                    search_page = client.search_by_okved(
-                        code,
-                        region_code=region_code,
-                        limit=limit_per_code,
-                        page=requested_page,
-                    )
+                    search_page = _provider_call(db, run, "search_requests", lambda: client.search_by_okved(
+                        code, region_code=region_code, limit=page_size, page=requested_page,
+                    ))
                 except DiscoveryAPIError as exc:
+                    if exc.stop_discovery and propagate_stop_errors:
+                        db.commit()
+                        raise
                     run.errors_count += 1
                     run.error_message = str(exc)
                     db.commit()
@@ -365,6 +432,15 @@ def discover_new_companies(
                     break
 
                 pages_scanned += 1
+                fingerprint = tuple(str(record.get("ИНН") or "") for record in search_page.records)
+                if full and fingerprint and fingerprint in page_fingerprints:
+                    raise DiscoveryAPIError("Провайдер повторяет содержимое страницы. Позиция сохранена.",
+                                            stop_discovery=True, reason="pagination_stalled")
+                page_fingerprints.add(fingerprint)
+                if search_page.current_page in visited_pages:
+                    raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
+                                            stop_discovery=True, reason="pagination_stalled")
+                visited_pages.add(search_page.current_page)
                 if search_page.current_page != requested_page:
                     cursor.next_page = search_page.current_page
                     cursor.next_record_index = 0
@@ -393,9 +469,6 @@ def discover_new_companies(
                         )
                         continue
 
-                    seen_inns.add(inn)
-                    run.candidates_found += 1
-                    candidate_attempts += 1
                     if max_company_requests is not None and company_requests >= max_company_requests:
                         run.errors_count += 1
                         run.error_message = (
@@ -405,9 +478,13 @@ def discover_new_companies(
                         )
                         db.commit()
                         return True
+                    _check_cancelled(db, run)
+                    seen_inns.add(inn)
+                    run.candidates_found += 1
+                    candidate_attempts += 1
                     company_requests += 1
                     try:
-                        payload = client.get_company(inn)
+                        payload = _provider_call(db, run, "company_requests", lambda: client.get_company(inn))
                         if not payload.is_active:
                             run.skipped_inactive += 1
                         elif is_target_region(payload):
@@ -423,10 +500,23 @@ def discover_new_companies(
                                 known_inns.add(inn)
                             _update_run_counter(db, run, created=created)
                             wrapped_cycle = cursor.next_page == 1 and cursor.next_record_index == 0
-                            if candidate_attempts >= limit_per_code:
+                            if not full and candidate_attempts >= limit_per_code:
                                 break
                             continue
                     except DiscoveryAPIError as exc:
+                        if exc.reason == "not_found":
+                            # A permanently absent card must not pin this query
+                            # to the same INN on every subsequent click.
+                            run.errors_count += 1
+                            run.error_message = str(exc)
+                            wrapped_cycle = _advance_cursor_after_record(cursor, search_page, record_index + 1)
+                            db.commit()
+                            if not full and candidate_attempts >= limit_per_code:
+                                break
+                            continue
+                        if exc.stop_discovery and propagate_stop_errors:
+                            db.commit()
+                            raise
                         run.errors_count += 1
                         run.error_message = str(exc)
                         db.commit()
@@ -448,7 +538,7 @@ def discover_new_companies(
                         cursor, search_page, record_index + 1
                     )
                     db.commit()
-                    if candidate_attempts >= limit_per_code:
+                    if not full and candidate_attempts >= limit_per_code:
                         break
 
                 if retry_current_record:
@@ -459,7 +549,7 @@ def discover_new_companies(
                     db.commit()
                     break
                 db.commit()
-                if candidate_attempts >= limit_per_code or wrapped_cycle:
+                if (not full and candidate_attempts >= limit_per_code) or wrapped_cycle:
                     break
 
     return False
@@ -490,6 +580,27 @@ def _run_provider_discovery(
                 limit_per_code,
                 provider="checko",
                 source="Checko API",
+                propagate_stop_errors=True,
+            )
+
+    if provider in ("okvedo", "dadata"):
+        label = "Okvedo" if provider == "okvedo" else "DaData"
+        if not getattr(settings, f"{provider}_configured"):
+            raise DiscoveryAPIError(
+                f"Выбран {label}, но {provider.upper()}_API_KEY не настроен в локальном .env.",
+                stop_discovery=True,
+            )
+        client_type = OkvedoClient if provider == "okvedo" else DaDataClient
+        options = {"secret_key": settings.dadata_secret_key} if provider == "dadata" else {}
+        with client_type(
+            getattr(settings, f"{provider}_api_key"),
+            getattr(settings, f"{provider}_base_url"),
+            getattr(settings, f"{provider}_timeout_seconds"),
+            **options,
+        ) as client:
+            return discover_new_companies(
+                db, run, client, limit_per_code,
+                provider=provider, source=f"{label} API", propagate_stop_errors=True,
             )
 
     if provider == "api_fns":
@@ -512,8 +623,9 @@ def _run_provider_discovery(
                 limit_per_code,
                 provider="api_fns",
                 source="API-ФНС",
-                max_search_requests=settings.api_fns_max_search_requests_per_run,
-                max_company_requests=settings.api_fns_max_egr_requests_per_run,
+                max_search_requests=None if run.search_scope == "full" else settings.api_fns_max_search_requests_per_run,
+                max_company_requests=None if run.search_scope == "full" else settings.api_fns_max_egr_requests_per_run,
+                propagate_stop_errors=True,
             )
 
     raise ValueError(f"Unsupported discovery provider: {provider}")
@@ -525,35 +637,59 @@ def _run_combined_discovery(
     settings: Settings,
     limit_per_code: int,
 ) -> bool:
-    """Run both paid providers in a deterministic Checko -> API-FNS order."""
+    """Use API-FNS only after every configured primary reports exhausted quota.
+
+    Empty results, a per-run budget, bad credentials and transient failures are
+    not proof of exhausted quota. Checko must exhaust every configured key.
+    """
+    labels = {"checko": "Checko", "okvedo": "Okvedo", "dadata": "DaData", "api_fns": "API-ФНС"}
     error_messages: list[str] = []
     successful_stages = 0
+    all_primary_quotas_exhausted = True
+    providers = list(settings.primary_discovery_providers)
+    if settings.api_fns_configured:
+        providers.append("api_fns")
+    if not providers:
+        raise DiscoveryAPIError("Не настроен ни один API. Добавьте ключи в локальный .env.")
 
-    for provider, label in (("checko", "Checko"), ("api_fns", "API-ФНС")):
+    for provider in providers:
+        _check_cancelled(db, run)
+        if provider == "api_fns" and not all_primary_quotas_exhausted:
+            _record_provider_result(db, run, provider, "reserve_not_needed")
+            continue
+        run.active_provider = provider
+        run.progress_message = f"Подключаем {PROVIDER_LABELS[provider]}"
+        db.commit()
         errors_before = run.errors_count
         run.error_message = None
         try:
             _run_provider_discovery(db, run, settings, limit_per_code, provider)
         except DiscoveryAPIError as exc:
             run.errors_count += 1
-            error_messages.append(f"{label}: {exc}")
+            error_messages.append(f"{labels[provider]}: {exc}")
+            if provider != "api_fns" and exc.reason != "daily_limit":
+                all_primary_quotas_exhausted = False
             db.commit()
+            _record_provider_result(db, run, provider, exc.reason or "error")
             continue
 
+        if provider != "api_fns":
+            all_primary_quotas_exhausted = False
         if run.errors_count == errors_before:
             successful_stages += 1
         elif run.error_message:
-            error_messages.append(f"{label}: {run.error_message}")
+            error_messages.append(f"{labels[provider]}: {run.error_message}")
+        _record_provider_result(db, run, provider, "results_exhausted" if run.errors_count == errors_before else "partial")
 
     run.error_message = "\n".join(error_messages) or None
     db.commit()
-    return successful_stages > 0
+    return successful_stages > 0 or (run.companies_created + run.companies_updated) > 0
 
 
 def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
     db = SessionLocal()
     run = db.get(SearchRun, run_id)
-    if run is None:
+    if run is None or run.status != "pending":
         db.close()
         return
 
@@ -564,14 +700,18 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
     db.commit()
 
     try:
+        _check_cancelled(db, run)
         if provider == "demo":
             run.mode = "demo"
             excluded_inns = set(db.scalars(select(ExcludedCompany.inn)).all())
             demo_items = [
                 payload for payload in DEMO_COMPANIES if payload.inn not in excluded_inns
-            ][:limit_per_code]
+            ]
+            if run.search_scope != "full":
+                demo_items = demo_items[:limit_per_code]
             run.candidates_found = len(demo_items)
             for payload in demo_items:
+                _check_cancelled(db, run)
                 _, created = upsert_company(
                     db,
                     payload,
@@ -588,11 +728,20 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
             )
             run.status = "completed" if combined_succeeded else "failed"
         else:
+            run.active_provider = provider
             _run_provider_discovery(db, run, settings, limit_per_code, provider)
+            _record_provider_result(db, run, provider, "results_exhausted" if run.errors_count == 0 else "partial")
 
         if provider != "combined":
             has_processed_companies = (run.companies_created + run.companies_updated) > 0
             run.status = "completed" if has_processed_companies or run.errors_count == 0 else "failed"
+    except SearchCancelled:
+        run.status = "cancelled"
+    except DiscoveryAPIError as exc:
+        run.errors_count += 1
+        run.error_message = str(exc)
+        run.status = "completed" if run.companies_created + run.companies_updated else "failed"
+        _record_provider_result(db, run, provider, exc.reason or "error")
     except Exception as exc:  # keep the background task observable via the run record
         db.rollback()
         run = db.get(SearchRun, run_id)
@@ -602,6 +751,14 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
             run.error_message = redact_sensitive_url(str(exc))
     finally:
         if run is not None:
+            db.refresh(run, attribute_names=["cancel_requested"])
+            if run.cancel_requested:
+                run.status = "cancelled"
+            run.progress_message = (
+                "Поиск остановлен. Найденные компании и позиция сохранены."
+                if run.status == "cancelled" else "Проход завершён. Следующий запуск продолжит с сохранённых позиций."
+            )
+            run.active_provider = None
             run.completed_at = utcnow()
             db.commit()
         db.close()

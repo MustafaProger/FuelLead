@@ -118,9 +118,11 @@ export const api = {
   startSearch: (okvedCodes: string[], limitPerCode = 10) =>
     request<SearchRun>("/search-runs", {
       method: "POST",
-      body: JSON.stringify({ okved_codes: okvedCodes, limit_per_code: limitPerCode }),
+      body: JSON.stringify({ okved_codes: okvedCodes, limit_per_code: limitPerCode, search_scope: "full" }),
     }),
   searchRun: (id: number) => request<SearchRun>(`/search-runs/${id}`),
+  latestSearchRun: () => request<SearchRun | null>("/search-runs/latest"),
+  stopSearch: (id: number) => request<SearchRun>(`/search-runs/${id}/stop`, { method: "POST" }),
   emailTemplate: () => request<EmailTemplate>("/email-template"),
   saveEmailTemplate: (subjectTemplate: string, bodyTemplate: string) =>
     request<EmailTemplate>("/email-template", {

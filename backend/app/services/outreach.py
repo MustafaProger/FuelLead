@@ -85,21 +85,58 @@ def mark_company_send_failed(db: Session, company_id: int | None, recipient: str
         return None
     timestamp = _aware(occurred_at) or datetime.now(timezone.utc)
     previous_status = company.status
-    company.status = "error"
     company.last_updated_at = timestamp
     event_data: dict[str, object] = {"recipient": recipient, "error": reason}
     if campaign_id is not None:
         event_data["campaign_id"] = campaign_id
-    db.add(ActivityHistory(company=company, event_type="email_failed", description=f"Ошибка отправки на {recipient}: {reason}", from_status=previous_status, to_status="error", event_data=event_data, created_at=timestamp))
+    db.add(ActivityHistory(company=company, event_type="email_failed", description=f"Ошибка отправки на {recipient}: {reason}", from_status=previous_status, to_status=previous_status, event_data=event_data, created_at=timestamp))
     return company
 
 
 def _previously_contacted_addresses(db: Session) -> set[str]:
-    addresses = {normalize_email(recipient) for recipient in db.scalars(select(OutreachDelivery.recipient).where(OutreachDelivery.status.in_(("accepted", "bounced", "uncertain")))).all() if recipient}
-    for event_data in db.scalars(select(ActivityHistory.event_data).where(ActivityHistory.event_type == "email_sent")).all():
+    reset_at: dict[str, datetime] = {}
+    resets = db.execute(
+        select(ActivityHistory.event_data, ActivityHistory.created_at).where(
+            ActivityHistory.event_type == "email_resend_enabled"
+        )
+    ).all()
+    for event_data, created_at in resets:
+        if not isinstance(event_data, dict):
+            continue
+        for value in event_data.get("recipients") or []:
+            if recipient := normalize_email(str(value)):
+                normalized_at = _aware(created_at) or datetime.min.replace(tzinfo=timezone.utc)
+                reset_at[recipient] = max(reset_at.get(recipient, normalized_at), normalized_at)
+
+    addresses: set[str] = set()
+    deliveries = db.execute(
+        select(
+            OutreachDelivery.recipient,
+            func.coalesce(
+                OutreachDelivery.accepted_at,
+                OutreachDelivery.sent_at,
+                OutreachDelivery.created_at,
+            ),
+        ).where(
+            OutreachDelivery.status.in_(("accepted", "bounced", "uncertain"))
+        )
+    ).all()
+    for value, contacted_at in deliveries:
+        recipient = normalize_email(value or "")
+        normalized_at = _aware(contacted_at) or datetime.min.replace(tzinfo=timezone.utc)
+        if recipient and normalized_at > reset_at.get(recipient, datetime.min.replace(tzinfo=timezone.utc)):
+            addresses.add(recipient)
+    events = db.execute(
+        select(ActivityHistory.event_data, ActivityHistory.created_at).where(
+            ActivityHistory.event_type == "email_sent"
+        )
+    ).all()
+    for event_data, contacted_at in events:
         if isinstance(event_data, dict):
             if recipient := normalize_email(str(event_data.get("recipient") or "")):
-                addresses.add(recipient)
+                normalized_at = _aware(contacted_at) or datetime.min.replace(tzinfo=timezone.utc)
+                if normalized_at > reset_at.get(recipient, datetime.min.replace(tzinfo=timezone.utc)):
+                    addresses.add(recipient)
     return addresses
 
 

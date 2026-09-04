@@ -1,4 +1,5 @@
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -67,6 +68,7 @@ class ContactCreate(BaseModel):
 
 
 class SearchRunCreate(BaseModel):
+    search_scope: Literal["full", "batch"] = "full"
     okved_codes: list[str] = Field(default_factory=lambda: DEFAULT_OKVED_CODES.copy(), min_length=1, max_length=30)
     limit_per_code: int = Field(default=10, ge=1, le=100)
 

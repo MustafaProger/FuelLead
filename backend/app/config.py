@@ -34,11 +34,18 @@ class Settings(BaseSettings):
 
     app_name: str = "FuelLead"
     database_url: str = "sqlite:///./fuellead.sqlite3"
-    discovery_provider: Literal["auto", "demo", "checko", "api_fns", "combined"] = "auto"
+    discovery_provider: Literal["auto", "demo", "checko", "okvedo", "dadata", "api_fns", "combined"] = "auto"
     checko_api_key: str = ""
     checko_api_key_fallbacks: str = ""
     checko_base_url: str = "https://api.checko.ru/v2"
     checko_timeout_seconds: float = 30.0
+    okvedo_api_key: str = ""
+    okvedo_base_url: str = "https://okvedo.ru/api/v1"
+    okvedo_timeout_seconds: float = 30.0
+    dadata_api_key: str = ""
+    dadata_secret_key: str = ""
+    dadata_base_url: str = "https://suggestions.dadata.ru/suggestions/api/4_1/rs"
+    dadata_timeout_seconds: float = 30.0
     api_fns_key: str = ""
     api_fns_base_url: str = "https://api-fns.ru/api"
     api_fns_timeout_seconds: float = 30.0
@@ -90,13 +97,34 @@ class Settings(BaseSettings):
         return tuple(dict.fromkeys(value.strip() for value in candidates if value.strip()))
 
     @property
+    def okvedo_configured(self) -> bool:
+        return bool(self.okvedo_api_key.strip())
+
+    @property
+    def dadata_configured(self) -> bool:
+        return bool(self.dadata_api_key.strip())
+
+    @property
+    def primary_discovery_providers(self) -> tuple[str, ...]:
+        return tuple(
+            provider for provider in ("checko", "okvedo", "dadata")
+            if getattr(self, f"{provider}_configured")
+        )
+
+    @property
     def api_fns_configured(self) -> bool:
         return bool(self.api_fns_key.strip())
 
     @property
-    def resolved_discovery_provider(self) -> Literal["demo", "checko", "api_fns", "combined"]:
-        if self.discovery_provider == "auto":
-            return "checko" if self.checko_configured else "demo"
+    def resolved_discovery_provider(self) -> str:
+        # API-FNS must not bypass configured primary providers, even in auto mode.
+        if self.discovery_provider in ("auto", "api_fns"):
+            primary = self.primary_discovery_providers
+            if primary:
+                if len(primary) > 1 or self.api_fns_configured:
+                    return "combined"
+                return primary[0]
+            return "api_fns" if self.api_fns_configured or self.discovery_provider == "api_fns" else "demo"
         return self.discovery_provider
 
     @property

@@ -1,6 +1,5 @@
 import {
   ArrowRight,
-  AlertTriangle,
   Building2,
   CheckCircle2,
   Handshake,
@@ -30,7 +29,6 @@ const statusLabels: Record<CompanyStatus, string> = {
   interested: "Заинтересована",
   customer: "Работает с нами",
   rejected: "Отказ",
-  error: "Ошибка отправки",
 };
 
 const funnel = [
@@ -39,7 +37,6 @@ const funnel = [
   { key: "answered" as const, label: "Ответили", tone: "teal", icon: Mail },
   { key: "interested" as const, label: "Заинтересованы", tone: "amber", icon: CheckCircle2 },
   { key: "customer" as const, label: "Работают с нами", tone: "green", icon: Handshake },
-  { key: "error" as const, label: "Ошибки отправки", tone: "red", icon: AlertTriangle },
 ];
 
 function formatShortDate(value: string) {
@@ -154,7 +151,7 @@ export function DashboardPage({
           </button>
           <button className="button button--primary" type="button" onClick={onSearch} disabled={searching}>
             {searching ? <RefreshCw className="spin" size={17} /> : <Search size={17} />}
-            {searching ? "Идёт поиск…" : "Найти компании"}
+            {searching ? "Идёт поиск…" : "Запустить полный поиск"}
           </button>
         </div>
       </header>

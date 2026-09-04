@@ -44,9 +44,8 @@ def test_email_provider_filter_rejects_unknown_value():
 def test_company_statuses_use_simplified_pipeline():
     assert StatusUpdate(status="customer").status == "customer"
     assert CompanyFilters(status="CUSTOMER").status == "customer"
-    assert StatusUpdate(status="error").status == "error"
 
-    for removed in ("checked", "ready"):
+    for removed in ("checked", "ready", "error"):
         with pytest.raises(ValueError, match="Status must be one of"):
             StatusUpdate(status=removed)
         with pytest.raises(ValueError, match="Status must be one of"):

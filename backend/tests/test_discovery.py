@@ -487,7 +487,7 @@ def test_api_fns_request_budget_stops_before_second_egr(db):
     assert "Лимит egr на один запуск: 1" in run.error_message
 
 
-def test_combined_run_uses_checko_before_api_fns(db, monkeypatch):
+def test_combined_run_keeps_api_fns_unused_while_checko_has_quota(db, monkeypatch):
     run = SearchRun(status="pending", requested_okved_codes=["49.41"])
     db.add(run)
     db.commit()
@@ -525,15 +525,10 @@ def test_combined_run_uses_checko_before_api_fns(db, monkeypatch):
         "checko_get_7701000001",
         "checko_search_50",
         "checko_exit",
-        "api_fns_enter",
-        "api_fns_search_77",
-        "api_fns_get_7701000002",
-        "api_fns_search_50",
-        "api_fns_exit",
     ]
     assert stored_run.mode == "combined"
     assert stored_run.status == "completed"
-    assert stored_run.companies_created == 2
+    assert stored_run.companies_created == 1
     assert stored_run.errors_count == 0
 
 
@@ -565,5 +560,5 @@ def test_combined_run_continues_with_api_fns_when_checko_key_is_missing(db, monk
     assert events[:2] == ["api_fns_enter", "api_fns_search_77"]
     assert stored_run.status == "completed"
     assert stored_run.companies_created == 1
-    assert stored_run.errors_count == 1
-    assert stored_run.error_message.startswith("Checko: Выбран провайдер Checko")
+    assert stored_run.errors_count == 0
+    assert stored_run.error_message is None

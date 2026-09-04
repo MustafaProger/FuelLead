@@ -30,9 +30,8 @@ ALL_STATUSES = (
     "interested",
     "customer",
     "rejected",
-    "error",
 )
-REMOVED_COMPANY_STATUSES = ("checked", "ready")
+REMOVED_COMPANY_STATUSES = ("checked", "ready", "error")
 COMPANY_STATUS_LABELS = {
     "new": "Новая",
     "sent": "Письмо отправлено",
@@ -40,7 +39,6 @@ COMPANY_STATUS_LABELS = {
     "interested": "Заинтересована",
     "customer": "Работает с нами",
     "rejected": "Отказ",
-    "error": "Ошибка отправки",
 }
 CONTACT_TYPES = ("phone", "whatsapp", "telegram")
 OUTREACH_CAMPAIGN_STATUSES = (
@@ -76,7 +74,7 @@ class Company(Base):
     __tablename__ = "companies"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('new','sent','answered','interested','customer','rejected','error')",
+            "status IN ('new','sent','answered','interested','customer','rejected')",
             name="ck_companies_status",
         ),
     )
@@ -199,6 +197,13 @@ class SearchRun(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
     mode: Mapped[str] = mapped_column(String(20), default="checko", nullable=False)
+    search_scope: Mapped[str] = mapped_column(String(20), default="batch", nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    active_provider: Mapped[str | None] = mapped_column(String(20))
+    search_requests: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    company_requests: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    progress_message: Mapped[str | None] = mapped_column(Text)
+    provider_results: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     requested_okved_codes: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     candidates_found: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     companies_created: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
