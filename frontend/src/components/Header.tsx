@@ -1,5 +1,5 @@
 import { discoveryProviderLabels } from "../discoveryProviders";
-import { Fuel, RefreshCw, Search, Send } from "lucide-react";
+import { RefreshCw, Search, Send } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
 interface HeaderProps {
@@ -16,7 +16,7 @@ export function Header({ mode, searching, onOpenOutreach, onSearch }: HeaderProp
       <div className="header-inner">
         <div className="brand-block">
           <span className="brand-mark" aria-hidden="true">
-            <Fuel size={22} strokeWidth={2.2} />
+            <img className="app-icon" src="/icons/fuellead-192.png" alt="" width={48} height={48} />
           </span>
           <div>
             <div className="brand-name">FuelLead</div>

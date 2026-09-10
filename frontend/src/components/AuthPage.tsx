@@ -3,7 +3,6 @@ import {
   BarChart3,
   Eye,
   EyeOff,
-  Fuel,
   LockKeyhole,
   Mail,
   ShieldCheck,
@@ -42,7 +41,7 @@ export function AuthPage({ onAuthenticated }: AuthPageProps) {
         <div className="auth-story-rings" aria-hidden="true" />
         <div className="auth-story-content">
           <div className="auth-brand auth-brand--dark">
-            <span className="auth-brand-mark" aria-hidden="true"><Fuel size={25} strokeWidth={2.25} /></span>
+            <span className="auth-brand-mark" aria-hidden="true"><img className="app-icon" src="/icons/fuellead-192.png" alt="" width={48} height={48} /></span>
             <span>
               <strong>FuelLead</strong>
               <small>поиск клиентов для топливных карт</small>
@@ -50,7 +49,7 @@ export function AuthPage({ onAuthenticated }: AuthPageProps) {
           </div>
 
           <div className="auth-story-copy">
-            <h1>Клиенты с высоким<br />расходом топлива</h1>
+            <h1>Клиенты с высоким<br /><em>расходом топлива</em></h1>
             <p>Находите компании по целевым ОКВЭД, проверяйте контакты и ведите продажи в одном рабочем пространстве.</p>
           </div>
 
@@ -65,7 +64,7 @@ export function AuthPage({ onAuthenticated }: AuthPageProps) {
       <section className="auth-form-side">
         <div className="auth-mobile-brand">
           <div className="auth-brand">
-            <span className="auth-brand-mark" aria-hidden="true"><Fuel size={22} strokeWidth={2.25} /></span>
+            <span className="auth-brand-mark" aria-hidden="true"><img className="app-icon" src="/icons/fuellead-192.png" alt="" width={48} height={48} /></span>
             <span><strong>FuelLead</strong><small>внутренняя рабочая система</small></span>
           </div>
         </div>
