@@ -85,6 +85,8 @@ class OkvedoClient:
             raise ValueError("Okvedo API key is required")
         self.client = httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout_seconds,
                                    headers={"X-Api-Key": api_key.strip(), "Accept": "application/json"}, transport=transport)
+        # Keep only the current page's explicit provider data, keyed by INN.
+        self._search_regions: dict[str, tuple[str | None, str | None]] = {}
 
     def __enter__(self):
         return self
@@ -126,6 +128,7 @@ class OkvedoClient:
         return payload
 
     def search_by_okved(self, code: str, *, region_code: str, limit: int = 10, page: int = 1) -> SearchPage:
+        self._search_regions.clear()
         if region_code not in REGION_NAMES:
             raise ValueError("Okvedo: неподдерживаемый регион поиска.")
         payload = self._get("/companies", {"okved": code, "region": REGION_NAMES[region_code],
@@ -136,7 +139,9 @@ class OkvedoClient:
         for item in payload["data"]:
             if isinstance(item, dict) and re.fullmatch(r"\d{10}", str(item.get("inn") or "")):
                 actual_region, _ = _region(item)
-                records.append({"ИНН": item["inn"], "РегионКод": actual_region or ""})
+                inn = str(item["inn"])
+                self._search_regions[inn] = _region(item)
+                records.append({"ИНН": inn, "РегионКод": actual_region or ""})
         meta = payload.get("meta") or {}
         return SearchPage(records, max(int(meta.get("page") or page), 1), max(int(meta.get("pages") or page), 1))
 
@@ -146,4 +151,10 @@ class OkvedoClient:
         data = self._get(f"/companies/{inn}")["data"]
         if not isinstance(data, dict) or str(data.get("inn")) != inn:
             raise DiscoveryAPIError("Okvedo вернул карточку с другим ИНН.")
-        return parse_okvedo_company_payload(data)
+        payload = parse_okvedo_company_payload(data)
+        # Some cards omit all location fields even though /companies explicitly
+        # supplies a region for that same INN. Use that evidence only for empty
+        # cards; any card address/region/city takes precedence, even if unknown.
+        if not any(data.get(field) for field in ("region", "region_code", "city", "addresses")):
+            payload.region_code, payload.region_name = self._search_regions.get(inn, (None, None))
+        return payload

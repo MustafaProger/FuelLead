@@ -43,6 +43,16 @@ function stageSummary(run: SearchRun) {
   ).join(" ");
 }
 
+function skippedSummary(run: SearchRun) {
+  const reasons = [
+    `уже в базе или исключениях — ${run.skipped_known ?? 0}`,
+    run.skipped_inactive ? `недействующие — ${run.skipped_inactive}` : "",
+    run.skipped_region ? `другой регион — ${run.skipped_region}` : "",
+    run.skipped_unknown_region ? `регион не указан — ${run.skipped_unknown_region}` : "",
+  ].filter(Boolean);
+  return `Пропущено: ${reasons.join("; ")}.`;
+}
+
 function progressDescription(run: SearchRun) {
   if (run.status === "pending") {
     return "Запуск принят. Ожидаем начало обработки.";
@@ -56,7 +66,7 @@ function progressDescription(run: SearchRun) {
     : "";
 
   if (run.search_scope === "full") {
-    return `${run.progress_message ?? "Последовательно обрабатываем доступную выдачу."} Поисковых вызовов: ${run.search_requests}, запросов карточек: ${run.company_requests}. Добавлено: ${run.companies_created}.${errors}`;
+    return `${run.progress_message ?? "Последовательно обрабатываем доступную выдачу."} Поисковых вызовов: ${run.search_requests}, запросов карточек: ${run.company_requests}. ${skippedSummary(run)}${errors}`;
   }
 
   if (!run.candidates_found) {
@@ -66,11 +76,11 @@ function progressDescription(run: SearchRun) {
     return `${stage}${errors}`;
   }
 
-  return `Найдено кандидатов: ${run.candidates_found}. Обработано: ${processed}.${errors}`;
+  return `Кандидатов: ${run.candidates_found}. Обработано: ${processed}. ${skippedSummary(run)}${errors}`;
 }
 
 function completedDescription(run: SearchRun) {
-  const summary = `Найдено ${run.candidates_found}, добавлено ${run.companies_created}, обновлено ${run.companies_updated}. ${stageSummary(run)}`;
+  const summary = `Кандидатов ${run.candidates_found}, добавлено ${run.companies_created}, обновлено ${run.companies_updated}. ${skippedSummary(run)} ${stageSummary(run)}`;
   if (!run.errors_count) return summary;
 
   const errorDetails = run.error_message ? ` Последняя ошибка ${providerName(run)}: ${run.error_message}` : "";
@@ -80,7 +90,6 @@ function completedDescription(run: SearchRun) {
 export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, stopping }: SearchRunNoticeProps) {
   const searching = run?.status === "pending" || run?.status === "running";
   const failedResult = run?.error_message ? splitMessage(run.error_message) : null;
-  const processed = run ? run.companies_created + run.companies_updated : 0;
 
   return (
     <>
@@ -105,8 +114,8 @@ export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, 
               </button>
             </div>
             <div className="search-run-counters" aria-label="Прогресс поиска">
-              <span><small>Найдено</small><strong>{run.candidates_found}</strong></span>
-              <span><small>Обработано</small><strong>{processed}</strong></span>
+              <span><small>Кандидаты</small><strong>{run.candidates_found}</strong></span>
+              <span><small>Добавлено</small><strong>{run.companies_created}</strong></span>
             </div>
           </section>
         </div>

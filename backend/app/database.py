@@ -49,6 +49,9 @@ def _upgrade_search_run_schema() -> None:
         "company_requests": "INTEGER NOT NULL DEFAULT 0",
         "progress_message": "TEXT",
         "provider_results": "JSON NOT NULL DEFAULT '{}'",
+        "skipped_known": "INTEGER NOT NULL DEFAULT 0",
+        "skipped_region": "INTEGER NOT NULL DEFAULT 0",
+        "skipped_unknown_region": "INTEGER NOT NULL DEFAULT 0",
     }
     with engine.begin() as connection:
         if connection.dialect.name == "postgresql":

@@ -459,11 +459,14 @@ def discover_new_companies(
                     inn = str(record.get("ИНН") or "").strip()
 
                     if record_region and record_region not in TARGET_REGION_CODES:
+                        run.skipped_region += 1
                         wrapped_cycle = _advance_cursor_after_record(
                             cursor, search_page, record_index + 1
                         )
                         continue
                     if not inn or inn in known_inns or inn in seen_inns:
+                        if inn in known_inns:
+                            run.skipped_known += 1
                         wrapped_cycle = _advance_cursor_after_record(
                             cursor, search_page, record_index + 1
                         )
@@ -503,6 +506,10 @@ def discover_new_companies(
                             if not full and candidate_attempts >= limit_per_code:
                                 break
                             continue
+                        elif payload.region_code or payload.region_name:
+                            run.skipped_region += 1
+                        else:
+                            run.skipped_unknown_region += 1
                     except DiscoveryAPIError as exc:
                         if exc.reason == "not_found":
                             # A permanently absent card must not pin this query

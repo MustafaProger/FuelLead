@@ -111,6 +111,9 @@ export interface SearchRun {
   companies_created: number;
   companies_updated: number;
   skipped_inactive: number;
+  skipped_known: number;
+  skipped_region: number;
+  skipped_unknown_region: number;
   errors_count: number;
   error_message: string | null;
 }

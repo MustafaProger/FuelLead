@@ -180,31 +180,89 @@ def test_confirmed_snapshot_keeps_interval_and_sender_limit(db):
     assert [sender for sender, _ in RecordingSMTP.sent[-2:]] == ["one@mail.ru", "two@mail.ru"]
 
 
-def test_three_senders_rotate_by_five_then_persist_round_rest(db):
+def test_new_campaign_clears_only_snapshotted_sender_blocks_and_preserves_accounting(db):
+    settings = settings_with_key()
+    included = add_sender(db, settings, "included@mail.ru", successes=4)
+    excluded = add_sender(db, settings, "unverified@mail.ru")
+    excluded.verification_status = "temporary_error"
+    included.blocked_until_round = 23
+    excluded.blocked_until_round = 26
+    included.block_reason = excluded.block_reason = "Предыдущее временное ограничение"
+    included.sent_today = 17
+    included.sent_today_date = datetime.now(timezone.utc).astimezone(settings.timezone).date()
+    included.last_sent_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    db.commit()
+    db.refresh(included)
+    accounting = (included.sent_today, included.sent_today_date, included.last_sent_at, included.successful_full_batches, included.current_batch_size, included.daily_limit)
+    add_company(db, 1, email="lead@example.ru")
+    preflight = build_outreach_preflight(db, CompanyFilters(), settings)
+    assert included.blocked_until_round == 23
+    added_later = add_sender(db, settings, "later@mail.ru")
+    added_later.blocked_until_round = 22
+    added_later.block_reason = "Предыдущее временное ограничение"
+    db.commit()
+
+    campaign = confirm_outreach_campaign(db, preflight["snapshot_id"], settings)
+    db.expire_all()
+
+    assert campaign.current_round == 1
+    assert campaign.sender_account_ids == [included.id]
+    assert included.blocked_until_round is None
+    assert included.block_reason is None
+    assert (included.sent_today, included.sent_today_date, included.last_sent_at, included.successful_full_batches, included.current_batch_size, included.daily_limit) == accounting
+    assert excluded.verification_status == "temporary_error"
+    assert excluded.blocked_until_round == 26
+    assert added_later.blocked_until_round == 22
+    assert excluded.block_reason == added_later.block_reason == "Предыдущее временное ограничение"
+
+
+@pytest.mark.parametrize("stale_blocks", [False, True])
+def test_three_senders_rotate_all_batches_before_rest_across_rounds(db, stale_blocks):
     RecordingSMTP.sent = []
     settings = settings_with_key()
-    for email in ("one@mail.ru", "two@mail.ru", "three@mail.ru"):
-        add_sender(db, settings, email)
-    for index in range(1, 17):
+    emails = ("one@mail.ru", "two@mail.ru", "three@mail.ru")
+    for index, email in enumerate(emails):
+        account = add_sender(db, settings, email)
+        if stale_blocks and index:
+            account.blocked_until_round = 22 + index
+    db.commit()
+    for index in range(1, 50):
         add_company(db, index, email=f"lead{index}@example.ru")
     campaign = confirmed_campaign(db, settings)
     now = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
     campaign.next_send_at = now
     db.commit()
 
-    for _ in range(15):
-        tick_at_schedule(db, settings, RecordingSMTP, now)
-    assert [sender for sender, _ in RecordingSMTP.sent] == ["one@mail.ru"] * 5 + ["two@mail.ru"] * 5 + ["three@mail.ru"] * 5
-
-    tick_at_schedule(db, settings, RecordingSMTP, now, random_value=77)
-    current = db.get(OutreachCampaign, campaign.id)
-    assert current.status == "cooldown"
-    assert current.round_rest_until == current.next_send_at
-    assert 77 * 60 <= (current.next_send_at.replace(tzinfo=timezone.utc) - now).total_seconds()
-    tick_at_schedule(db, settings, RecordingSMTP, now, random_value=77)
-    current = db.get(OutreachCampaign, campaign.id)
-    assert current.current_round == 2
-    assert RecordingSMTP.sent[-1][0] == "one@mail.ru"
+    expected = []
+    for round_number, batch_size in enumerate((5, 5, 6), start=1):
+        for email in emails:
+            for _ in range(batch_size):
+                tick_at_schedule(db, settings, RecordingSMTP, now)
+                expected.append(email)
+                current = db.get(OutreachCampaign, campaign.id)
+                assert [sender for sender, _ in RecordingSMTP.sent] == expected
+                assert current.current_round == round_number
+                assert current.status == "running"
+        rest_started = tick_at_schedule(db, settings, RecordingSMTP, now, random_value=77)
+        current = db.get(OutreachCampaign, campaign.id)
+        assert current.status == "cooldown"
+        assert current.round_rest_until == current.next_send_at
+        rest_until = current.next_send_at.replace(tzinfo=timezone.utc)
+        assert rest_until - rest_started == timedelta(minutes=77)
+        process_outreach_tick(
+            settings,
+            sender_factory=RecordingSMTP,
+            session_factory=sessionmaker(bind=db.get_bind(), expire_on_commit=False),
+            now=rest_until - timedelta(seconds=1),
+        )
+        db.expire_all()
+        assert [sender for sender, _ in RecordingSMTP.sent] == expected
+        assert db.get(OutreachCampaign, campaign.id).status == "cooldown"
+    assert len({recipient for _, recipient in RecordingSMTP.sent}) == 48
+    for account in db.query(SenderAccount).all():
+        assert account.sent_today == 16
+        assert account.successful_full_batches == 3
+        assert account.current_batch_size == 6
 
 
 def test_batch_growth_only_after_two_full_successful_batches_and_survives_campaigns(db):
@@ -272,27 +330,53 @@ def test_stop_is_irreversible_and_cancels_queued(db):
 
 
 def test_temporary_sender_error_stops_batch_blocks_three_rounds_and_next_sender_continues(db):
+    RecordingSMTP.sent = []
     settings = settings_with_key()
     first = add_sender(db, settings, "one@mail.ru")
     add_sender(db, settings, "two@mail.ru")
-    add_company(db, 1, email="one@example.ru")
-    add_company(db, 2, email="two@example.ru")
+    for index in range(1, 41):
+        add_company(db, index, email=f"temporary{index}@example.ru")
     campaign = confirmed_campaign(db, settings)
     now = datetime(2026, 9, 3, 9, 0, tzinfo=timezone.utc)
     campaign.next_send_at = now
     db.commit()
 
     class FirstFails(RecordingSMTP):
+        failed_once = False
+
         def send(self, recipient, *_args, **_kwargs):
-            if self.account.email == "one@mail.ru":
+            if self.account.email == "one@mail.ru" and not self.__class__.failed_once:
+                self.__class__.failed_once = True
                 raise SMTPDeliveryError("Временное ограничение Mail.ru", category="temporary", smtp_code="4.7.0")
             return super().send(recipient, *_args, **_kwargs)
 
     tick_at_schedule(db, settings, FirstFails, now)
     db.expire_all()
     assert db.get(SenderAccount, first.id).blocked_until_round == 4
+    current = db.get(OutreachCampaign, campaign.id)
+    pause_outreach_campaign(db, current)
+    resume_outreach_campaign(db, current)
+    db.expire_all()
+    assert db.get(SenderAccount, first.id).blocked_until_round == 4
+    assert db.get(SenderAccount, first.id).verification_status == "temporary_error"
     tick_at_schedule(db, settings, FirstFails, now)
     assert RecordingSMTP.sent[-1][0] == "two@mail.ru"
+
+    for _ in range(40):
+        tick_at_schedule(db, settings, FirstFails, now)
+        current = db.get(OutreachCampaign, campaign.id)
+        if current.current_round == 5:
+            break
+        assert current.current_round <= 4
+        assert all(sender == "two@mail.ru" for sender, _ in RecordingSMTP.sent)
+        assert db.get(SenderAccount, first.id).blocked_until_round == 4
+    else:
+        pytest.fail("Campaign did not reach the first unblocked round")
+
+    assert RecordingSMTP.sent[-1][0] == "one@mail.ru"
+    assert db.get(SenderAccount, first.id).verification_status == "verified"
+    assert db.get(SenderAccount, first.id).blocked_until_round is None
+    assert db.get(SenderAccount, first.id).block_reason is None
 
 
 def test_permanent_recipient_bounce_is_suppressed_and_campaign_continues(db):

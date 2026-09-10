@@ -1,3 +1,7 @@
+from datetime import datetime, timezone
+
+import pytest
+
 from app.config import Settings
 from app.models import OutreachCampaign, SenderAccount
 from app.schemas import SenderAccountCreate, SenderAccountUpdate
@@ -12,7 +16,8 @@ from app.services.sender_accounts import (
     update_sender_account,
     verify_sender_account,
 )
-from app.services.smtp import SMTPAccepted
+from app.services.imap_bounces import IMAPCollectorError
+from app.services.smtp import SMTPAccepted, SMTPDeliveryError
 
 
 def settings():
@@ -59,6 +64,83 @@ def test_connection_verification_uses_login_only(db):
     verify_sender_account(db, account, app_settings, smtp_client_factory=VerifyOnly)
     assert calls == ["verify"]
     assert account.verification_status == "verified"
+
+
+@pytest.mark.parametrize("imap_enabled", [False, True])
+def test_successful_verification_clears_round_block_and_preserves_accounting(db, imap_enabled):
+    app_settings = settings()
+    account = create_sender_account(
+        db,
+        SenderAccountCreate(email="owner@mail.ru", password="secret", imap_enabled=imap_enabled),
+        app_settings,
+    )
+    account.blocked_until_round = 26
+    account.block_reason = "Предыдущее временное ограничение"
+    account.verification_status = "temporary_error"
+    account.verification_error = account.block_reason
+    account.sent_today = 17
+    account.sent_today_date = datetime.now(timezone.utc).date()
+    account.successful_full_batches = 4
+    account.current_batch_size = 7
+    db.commit()
+    accounting = (account.sent_today, account.sent_today_date, account.successful_full_batches, account.current_batch_size)
+    calls = []
+
+    class SMTPVerifyOnly:
+        def __init__(self, *_args, **_kwargs): pass
+        def verify(self): calls.append("smtp")
+
+    class IMAPVerifyOnly:
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): calls.append("imap"); return self
+        def __exit__(self, *_args): pass
+
+    verify_sender_account(
+        db, account, app_settings,
+        smtp_client_factory=SMTPVerifyOnly,
+        imap_client_factory=IMAPVerifyOnly,
+    )
+    db.expire_all()
+    assert calls == (["smtp", "imap"] if imap_enabled else ["smtp"])
+    assert account.verification_status == "verified"
+    assert account.verification_error is None
+    assert account.blocked_until_round is None
+    assert account.block_reason is None
+    assert (account.sent_today, account.sent_today_date, account.successful_full_batches, account.current_batch_size) == accounting
+
+
+@pytest.mark.parametrize("failure", ["temporary", "auth", "imap"])
+def test_failed_verification_preserves_round_block(db, failure):
+    app_settings = settings()
+    account = create_sender_account(
+        db,
+        SenderAccountCreate(email="owner@mail.ru", password="secret", imap_enabled=failure == "imap"),
+        app_settings,
+    )
+    account.blocked_until_round = 26
+    account.block_reason = "Предыдущее временное ограничение"
+    db.commit()
+
+    class SMTPVerification:
+        def __init__(self, *_args, **_kwargs): pass
+        def verify(self):
+            if failure != "imap":
+                raise SMTPDeliveryError("Проверка отклонена", category=failure)
+
+    class FailedIMAPVerification:
+        def __init__(self, *_args, **_kwargs): pass
+        def __enter__(self): raise IMAPCollectorError("Проверка отклонена")
+        def __exit__(self, *_args): pass
+
+    verify_sender_account(
+        db, account, app_settings,
+        smtp_client_factory=SMTPVerification,
+        imap_client_factory=FailedIMAPVerification,
+    )
+    db.expire_all()
+    assert account.verification_status == {"temporary": "temporary_error", "auth": "blocked", "imap": "failed"}[failure]
+    assert account.blocked_until_round == 26
+    assert account.block_reason == "Предыдущее временное ограничение"
 
 
 def test_test_message_sends_exactly_once_to_confirmed_address(db):

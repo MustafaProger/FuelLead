@@ -167,6 +167,7 @@ def verify_sender_account(
     else:
         account.verification_status = "verified"
         account.verification_error = None
+        account.blocked_until_round = None
         account.block_reason = None
     account.verification_checked_at = timestamp
     account.updated_at = timestamp

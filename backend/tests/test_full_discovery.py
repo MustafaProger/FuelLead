@@ -1,5 +1,6 @@
 """Regression coverage for one-click exhaustive search, using no external APIs."""
 from fastapi import BackgroundTasks
+import httpx
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 import pytest
@@ -9,6 +10,8 @@ from app.main import latest_search_run, start_search, stop_search_run
 from app.models import Company, DiscoveryCursor, ExcludedCompany, SearchRun
 from app.schemas import SearchRunCreate
 from app.services.discovery import discover_new_companies, run_discovery
+from app.services.okvedo import OkvedoClient
+from app.serializers import search_run_to_dict
 from app.services.provider import CompanyPayload, DiscoveryAPIError, OkvedItem, SearchPage
 
 
@@ -73,6 +76,71 @@ def test_full_search_passes_known_pages_and_exclusions_without_fetching_cards(db
     discover_new_companies(db, run, client, 1)
     assert client.cards == client.inns[300:]
     assert run.companies_created == 5
+
+
+def test_okvedo_passes_existing_pages_adds_empty_region_cards_and_skips_them_next_run(db):
+    inns = [str(7701000000 + i) for i in range(210)]
+    db.add_all([Company(inn=inn, name="Существующая") for inn in inns[:205]])
+    db.add(ExcludedCompany(inn=inns[205], name="Исключена"))
+    db.commit()
+    cards = []
+    pages = []
+
+    def handler(request):
+        if request.url.path.endswith("/companies"):
+            page = int(request.url.params["page"])
+            pages.append(page)
+            records = [{"inn": inn, "region": "Москва"} for inn in inns[(page - 1) * 100:page * 100]]
+            if request.url.params["region"] != "Москва":
+                records = []
+            return httpx.Response(200, json={"data": records, "meta": {"page": page, "pages": 3}})
+        inn = request.url.path.rsplit("/", 1)[-1]
+        cards.append(inn)
+        return httpx.Response(200, json={"data": {
+            "inn": inn, "name_short": "Новая", "status": "active", "region": None, "addresses": [],
+        }})
+
+    with OkvedoClient("test", transport=httpx.MockTransport(handler)) as client:
+        first = full_run(db)
+        discover_new_companies(db, first, client, 1, provider="okvedo")
+        assert first.companies_created == 4
+        assert first.skipped_known == 206
+        assert first.skipped_unknown_region == 0
+        assert pages == [1, 2, 3, 1]
+        assert cards == inns[206:]
+        second = full_run(db)
+        discover_new_companies(db, second, client, 1, provider="okvedo")
+    assert second.skipped_known == 210
+    assert second.company_requests == second.companies_created == second.companies_updated == 0
+    assert cards == inns[206:]
+    assert db.scalar(select(func.count(Company.id))) == 209
+    assert db.scalar(select(func.count(Company.id)).where(Company.name == "Существующая")) == 205
+
+
+def test_full_search_reports_reasons_for_skipping_candidates(db):
+    client = Pages(5)
+    original = client.get_company
+    db.add(Company(inn=client.inns[0], name="В базе"))
+    db.commit()
+
+    def get_company(inn):
+        card = original(inn)
+        if inn == client.inns[1]:
+            card.is_active = False
+        if inn == client.inns[2]:
+            card.region_code = "71"
+        if inn == client.inns[3]:
+            card.region_code = None
+        return card
+
+    client.get_company = get_company
+    run = full_run(db)
+    discover_new_companies(db, run, client, 1)
+    result = search_run_to_dict(run)
+    assert result["companies_created"] == 1
+    assert result["candidates_found"] == result["company_requests"] == 4
+    for key in ("skipped_known", "skipped_inactive", "skipped_region", "skipped_unknown_region"):
+        assert result[key] == 1
 
 
 def test_full_fns_ignores_legacy_five_request_batch_caps(db, monkeypatch):
@@ -205,8 +273,8 @@ def test_search_schema_upgrade_keeps_old_runs_and_is_idempotent(monkeypatch):
     database._upgrade_search_run_schema()
     database._upgrade_search_run_schema()
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT id, status, search_scope, cancel_requested, search_requests FROM search_runs")).one()
-    assert tuple(row) == (7, "completed", "batch", 0, 0)
+        row = conn.execute(text("SELECT id, status, search_scope, cancel_requested, search_requests, skipped_known, skipped_region, skipped_unknown_region FROM search_runs")).one()
+    assert tuple(row) == (7, "completed", "batch", 0, 0, 0, 0, 0)
 
 
 def test_missing_card_does_not_block_remaining_candidates(db):

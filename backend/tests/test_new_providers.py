@@ -131,6 +131,46 @@ def test_okvedo_search_passes_filters_pagination_and_skips_non_legal_inns():
     assert (page.current_page, page.total_pages) == (3, 12)
 
 
+@pytest.mark.parametrize("list_data,card_data,expected", [
+    ({"region": "Москва"}, {"region": None, "addresses": []}, "77"),
+    ({"region": "Московская область"}, {}, "50"),
+    ({}, {}, None),  # The requested region is not evidence.
+    ({"inn": "7701000002", "region": "Москва"}, {}, None),
+    ({"region": "Москва"}, {"region": "Московская область"}, "50"),
+    ({"region": "Москва"}, {"region_code": "71"}, "71"),
+    ({"region": "Москва"}, {"region": "Калужская область"}, None),
+    ({"region": "Москва"}, {"addresses": [{"raw": "г. Тула, ул. Московская"}]}, None),
+    ({"region": "Москва"}, {"city": "Тула"}, None),
+    ({"region": "Москва"}, {"addresses": [{"raw": "Московская область, г. Мытищи"}]}, "50"),
+])
+def test_okvedo_empty_card_can_use_only_same_inn_explicit_search_region(list_data, card_data, expected):
+    def handler(request):
+        if request.url.path.endswith("/companies"):
+            return httpx.Response(200, json={"data": [{"inn": "7701000001", **list_data}]})
+        return httpx.Response(200, json={"data": {"inn": "7701000001", "status": "active", **card_data}})
+
+    with OkvedoClient("secret", transport=httpx.MockTransport(handler)) as client:
+        client.search_by_okved("42.11", region_code="77")
+        card = client.get_company("7701000001")
+    assert card.region_code == expected
+    assert card.is_active
+
+
+def test_okvedo_search_region_cache_is_limited_to_current_page():
+    def handler(request):
+        if request.url.path.endswith("/companies"):
+            records = [{"inn": "7701000001", "region": "Москва"}] if request.url.params["page"] == "1" else []
+            return httpx.Response(200, json={"data": records})
+        return httpx.Response(200, json={"data": {"inn": "7701000001"}})
+
+    with OkvedoClient("secret", transport=httpx.MockTransport(handler)) as client:
+        assert client.get_company("7701000001").region_code is None
+        client.search_by_okved("42.11", region_code="77", page=1)
+        assert client.get_company("7701000001").region_code == "77"
+        client.search_by_okved("42.11", region_code="77", page=2)
+        assert client.get_company("7701000001").region_code is None
+
+
 @pytest.mark.parametrize("message,reason", [("Превышен предел 60 запросов в минуту", "rate_limit"), ("Превышен предел 5000 запросов в сутки", "daily_limit"), ("Daily request limit exceeded", "daily_limit"), ("Too many requests", "rate_limit")])
 def test_okvedo_rate_limit_is_distinct_from_daily_quota(message, reason):
     with OkvedoClient("secret", transport=httpx.MockTransport(lambda _: httpx.Response(429, json={"detail": message}))) as client:

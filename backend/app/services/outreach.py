@@ -263,9 +263,15 @@ def confirm_outreach_campaign(db: Session, snapshot_id: int, settings: Settings,
         raise OutreachPolicyError("Снимок устарел. Выполните предварительную проверку снова")
     if active_outreach_campaign(db):
         raise OutreachPolicyError("Другая рассылка уже выполняется или требует решения")
-    available_ids = {sender.id for sender in _verified_senders(db)}
-    if not snapshot.sender_account_ids or not all(sender_id in available_ids for sender_id in snapshot.sender_account_ids):
+    available_senders = {sender.id: sender for sender in _verified_senders(db)}
+    if not snapshot.sender_account_ids or not all(sender_id in available_senders for sender_id in snapshot.sender_account_ids):
         raise OutreachPolicyError("Один из ящиков снимка больше не активен или не проверен")
+    for sender_id in snapshot.sender_account_ids:
+        # Round numbers belong to a campaign; daily usage and warm-up belong
+        # to the account and must survive starting a new campaign.
+        account = available_senders[sender_id]
+        account.blocked_until_round = None
+        account.block_reason = None
     snapshot.status = "running"
     snapshot.confirmed_at = timestamp
     snapshot.started_at = timestamp
@@ -513,6 +519,7 @@ def _sender_for_current_position(db: Session, campaign: OutreachCampaign, settin
             if account.verification_status == "temporary_error" and account.blocked_until_round is not None and campaign.current_round > account.blocked_until_round:
                 account.verification_status = "verified"
                 account.verification_error = None
+                account.blocked_until_round = None
                 account.block_reason = None
         daily_limit = _snapshot_sender_limit(campaign, account) if account else 0
         eligible = bool(account and account.is_active and account.smtp_enabled and account.verification_status == "verified" and account.encrypted_password and account.sent_today < daily_limit and not (account.blocked_until_round is not None and campaign.current_round <= account.blocked_until_round))
