@@ -4,6 +4,7 @@ import logging
 import re
 import socket
 import ssl
+import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from email import policy
@@ -36,7 +37,9 @@ IMAP_LIST_RE = re.compile(
 
 
 class IMAPCollectorError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, category: str = "protocol"):
+        super().__init__(message)
+        self.category = category
 
 
 class MailruIMAPClient:
@@ -47,14 +50,28 @@ class MailruIMAPClient:
         *,
         timeout_seconds: float,
         imap_factory=imaplib.IMAP4_SSL,
+        connect_attempts: int = 2,
+        sleep_func=time.sleep,
     ):
         self.account = account
         self.password = password
         self.timeout_seconds = timeout_seconds
         self.imap_factory = imap_factory
         self.client = None
+        self.connect_attempts = max(1, connect_attempts)
+        self.sleep_func = sleep_func
 
     def __enter__(self):
+        for attempt in range(self.connect_attempts):
+            try:
+                return self._connect()
+            except IMAPCollectorError as exc:
+                if exc.category not in ("connection", "timeout", "temporary") or attempt + 1 == self.connect_attempts:
+                    raise
+                self.sleep_func(attempt + 1)
+
+    def _connect(self):
+        stage = "connect"
         try:
             context = ssl.create_default_context()
             self.client = self.imap_factory(
@@ -63,15 +80,38 @@ class MailruIMAPClient:
                 ssl_context=context,
                 timeout=self.timeout_seconds,
             )
+            stage = "login"
             self.client.login(self.account.email, self.password)
+            stage = "select"
             status, _ = self.client.select("INBOX", readonly=True)
             if status != "OK":
                 raise IMAPCollectorError("Mail.ru не открыл папку входящих сообщений")
             return self
-        except (imaplib.IMAP4.error, ssl.SSLError, socket.timeout, OSError) as exc:
-            raise IMAPCollectorError(
-                "Не удалось безопасно подключиться к IMAP Mail.ru"
-            ) from exc
+        except Exception as exc:
+            # __exit__ is not invoked when __enter__ fails. Close the socket
+            # here, otherwise repeated checks leak authenticated connections.
+            if self.client is not None:
+                with suppress(Exception):
+                    self.client.shutdown()
+            self.client = None
+            if isinstance(exc, IMAPCollectorError):
+                raise
+            if isinstance(exc, (socket.timeout, TimeoutError)):
+                category, message = "timeout", "IMAP Mail.ru не ответил вовремя; SMTP проверяется отдельно"
+            elif isinstance(exc, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+                category, message = "connection", "Соединение TLS с IMAP Mail.ru прервано; проверка повторится позже"
+            elif isinstance(exc, ssl.SSLError):
+                category, message = "tls", "Ошибка TLS-соединения с IMAP Mail.ru; проверьте сеть, сертификаты и время системы"
+            elif isinstance(exc, (imaplib.IMAP4.abort, OSError)):
+                category, message = "connection", "Соединение с IMAP Mail.ru прервано; SMTP проверяется отдельно"
+            elif isinstance(exc, imaplib.IMAP4.error) and stage == "login":
+                if any(marker in str(exc).upper() for marker in ("UNAVAILABLE", "LIMIT", "TRY AGAIN")):
+                    category, message = "temporary", "Mail.ru временно ограничил IMAP-подключения; проверка повторится позже"
+                else:
+                    category, message = "auth", "IMAP Mail.ru отклонил вход. Проверьте доступ по IMAP и пароль приложения в Mail.ru"
+            else:
+                category, message = "protocol", "Не удалось выполнить IMAP-операцию Mail.ru"
+            raise IMAPCollectorError(message, category=category) from exc
 
     def __exit__(self, *_):
         if self.client is None:
@@ -82,15 +122,26 @@ class MailruIMAPClient:
             self.client.logout()
 
     def messages_after(self, last_uid: int, limit: int) -> list[tuple[int, bytes]]:
+        try:
+            return self._messages_after(last_uid, limit)
+        except IMAPCollectorError:
+            raise
+        except (imaplib.IMAP4.error, OSError) as exc:
+            raise IMAPCollectorError("Не удалось получить новые сообщения IMAP Mail.ru; проверка повторится позже", category="connection") from exc
+
+    def _messages_after(self, last_uid: int, limit: int) -> list[tuple[int, bytes]]:
         assert self.client is not None
         status, values = self.client.uid("search", None, f"UID {last_uid + 1}:*")
         if status != "OK":
-            raise IMAPCollectorError("Mail.ru не вернул список новых сообщений")
+            raise IMAPCollectorError("Mail.ru не вернул список новых сообщений", category="temporary")
         raw_uids = values[0].split() if values and values[0] else []
+        # IMAP ranges are inclusive in both directions: N:* may return the
+        # last existing UID even when it is below N.
+        raw_uids = [uid for uid in raw_uids if int(uid) > last_uid]
         result: list[tuple[int, bytes]] = []
         for raw_uid in raw_uids[:limit]:
             uid = int(raw_uid)
-            status, payload = self.client.uid("fetch", raw_uid, "(RFC822)")
+            status, payload = self.client.uid("fetch", raw_uid, "(BODY.PEEK[])")
             if status != "OK":
                 continue
             raw_message = next(
@@ -252,10 +303,12 @@ def process_imap_tick(
                     SenderAccount.is_active.is_(True),
                     SenderAccount.imap_enabled.is_(True),
                     SenderAccount.encrypted_password.is_not(None),
+                    SenderAccount.imap_verification_status != "failed",
                 )
             ).all()
         )
         for account in accounts:
+            original_password = account.encrypted_password
             try:
                 password = cipher.decrypt(account.encrypted_password)
                 with client_factory(
@@ -267,15 +320,34 @@ def process_imap_tick(
                         account.imap_last_uid,
                         settings.mail_imap_max_messages_per_tick,
                     )
+                db.refresh(account, with_for_update=True)
+                if account.encrypted_password != original_password or not account.is_active or not account.imap_enabled:
+                    db.rollback()
+                    continue
+                account.imap_verification_status = "verified"
+                account.imap_verification_error = None
+                account.imap_verification_checked_at = datetime.now(timezone.utc)
+                db.commit()
                 for uid, raw_message in messages:
                     apply_dsn_bounce(db, account, uid, raw_message)
-            except (CredentialEncryptionError, IMAPCollectorError):
-                logger.warning("imap_account_check_failed account_id=%s", account.id)
+            except (CredentialEncryptionError, IMAPCollectorError) as exc:
+                db.refresh(account, with_for_update=True)
+                if account.encrypted_password != original_password or not account.is_active or not account.imap_enabled:
+                    db.rollback()
+                    continue
+                category = exc.category if isinstance(exc, IMAPCollectorError) else "credentials"
+                account.imap_verification_status = "temporary_error" if category in ("connection", "timeout", "temporary") else "failed"
+                account.imap_verification_error = str(exc)
+                account.imap_verification_checked_at = datetime.now(timezone.utc)
+                db.commit()
+                logger.warning("imap_account_check_failed account_id=%s category=%s", account.id, category)
 
 
 async def run_imap_worker(settings: Settings) -> None:
     while True:
         try:
+            from app.services.sender_accounts import recover_temporary_sender_accounts
+            await asyncio.to_thread(recover_temporary_sender_accounts, settings)
             await asyncio.to_thread(process_imap_tick, settings)
         except CredentialEncryptionError:
             pass

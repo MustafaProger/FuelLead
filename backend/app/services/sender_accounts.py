@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from sqlalchemy import select
@@ -44,6 +44,11 @@ def sender_account_to_dict(account: SenderAccount) -> dict:
         "password_saved": bool(account.encrypted_password),
         "verification_status": account.verification_status,
         "verification_error": account.verification_error,
+        "verification_error_category": account.verification_error_category,
+        "verification_retry_at": account.verification_retry_at.isoformat() if account.verification_retry_at else None,
+        "imap_verification_status": account.imap_verification_status if account.imap_enabled else "disabled",
+        "imap_verification_error": account.imap_verification_error if account.imap_enabled else None,
+        "imap_verification_checked_at": account.imap_verification_checked_at.isoformat() if account.imap_verification_checked_at else None,
         "verification_checked_at": account.verification_checked_at.isoformat()
         if account.verification_checked_at
         else None,
@@ -110,12 +115,19 @@ def update_sender_account(
         account.smtp_enabled = data.smtp_enabled
     if data.imap_enabled is not None:
         account.imap_enabled = data.imap_enabled
+        account.imap_verification_status = "unverified"
+        account.imap_verification_error = None
     if data.is_active is not None:
         account.is_active = data.is_active
     if changed_credentials:
         account.verification_status = "unverified"
         account.verification_error = None
         account.verification_checked_at = None
+        account.verification_error_category = None
+        account.verification_retry_at = None
+        account.imap_verification_status = "unverified"
+        account.imap_verification_error = None
+        account.imap_verification_checked_at = None
     account.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(account)
@@ -136,7 +148,9 @@ def verify_sender_account(
     smtp_client_factory: Callable = MailruSMTPClient,
     imap_client_factory: Callable = MailruIMAPClient,
 ) -> SenderAccount:
-    timestamp = datetime.now(timezone.utc)
+    original_updated_at = account.updated_at
+    status, error, category = "verified", None, None
+    imap_status, imap_error = "disabled", None
     try:
         password = _password(account, settings)
         smtp_client_factory(
@@ -144,29 +158,37 @@ def verify_sender_account(
             password,
             timeout_seconds=settings.mail_smtp_timeout_seconds,
         ).verify()
-        if account.imap_enabled:
-            with imap_client_factory(
-                account,
-                password,
-                timeout_seconds=settings.mail_imap_timeout_seconds,
-            ):
-                pass
     except SMTPDeliveryError as exc:
-        account.verification_status = (
+        status = (
             "blocked" if exc.category == "auth" else "temporary_error"
-            if exc.category in ("timeout", "temporary", "connection", "tls")
+            if exc.category in ("timeout", "temporary", "connection")
             else "failed"
         )
-        account.verification_error = exc.safe_message
-    except IMAPCollectorError:
-        account.verification_status = "failed"
-        account.verification_error = "SMTP работает, но IMAP Mail.ru не прошёл проверку"
+        error, category = exc.safe_message, exc.category
     except CredentialEncryptionError as exc:
-        account.verification_status = "failed"
-        account.verification_error = str(exc)
-    else:
-        account.verification_status = "verified"
-        account.verification_error = None
+        status, error, category = "failed", str(exc), "credentials"
+    if account.imap_enabled and category != "credentials":
+        try:
+            with imap_client_factory(account, password, timeout_seconds=settings.mail_imap_timeout_seconds):
+                pass
+            imap_status = "verified"
+        except IMAPCollectorError as exc:
+            imap_status, imap_error = ("temporary_error" if exc.category in ("connection", "timeout", "temporary") else "failed"), str(exc)
+    elif account.imap_enabled:
+        imap_status, imap_error = "failed", error
+    # A password replacement or send finishing during a slow check wins.
+    db.refresh(account, with_for_update=True)
+    if account.updated_at.replace(tzinfo=None) != original_updated_at.replace(tzinfo=None):
+        return account
+    timestamp = datetime.now(timezone.utc)
+    account.verification_status = status
+    account.verification_error = error
+    account.verification_error_category = category
+    account.verification_retry_at = timestamp + timedelta(minutes=5) if status == "temporary_error" else None
+    account.imap_verification_status = imap_status
+    account.imap_verification_error = imap_error
+    account.imap_verification_checked_at = timestamp if account.imap_enabled else None
+    if status == "verified":
         account.blocked_until_round = None
         account.block_reason = None
     account.verification_checked_at = timestamp
@@ -174,6 +196,24 @@ def verify_sender_account(
     db.commit()
     db.refresh(account)
     return account
+
+
+def recover_temporary_sender_accounts(settings: Settings, *, session_factory=None, smtp_client_factory=MailruSMTPClient, imap_client_factory=MailruIMAPClient) -> None:
+    """Login-only recovery outside active campaign cooldowns; never send or requeue."""
+    from app.database import SessionLocal
+    with (session_factory or SessionLocal)() as db:
+        now = datetime.now(timezone.utc)
+        accounts = list(db.scalars(select(SenderAccount).where(
+            SenderAccount.provider == "mailru_smtp",
+            SenderAccount.is_active.is_(True), SenderAccount.smtp_enabled.is_(True),
+            SenderAccount.verification_status == "temporary_error",
+            SenderAccount.verification_error_category.in_(("connection", "timeout", "temporary")),
+            SenderAccount.verification_retry_at <= now,
+        )).all())
+        for account in accounts:
+            if sender_used_by_active_campaign(db, account.id):
+                continue
+            verify_sender_account(db, account, settings, smtp_client_factory=smtp_client_factory, imap_client_factory=imap_client_factory)
 
 
 def send_test_message(

@@ -136,3 +136,49 @@ def test_unrecognized_message_is_not_deleted_or_reprocessed(db):
     assert apply_dsn_bounce(db, account, 7, raw) is False
     assert apply_dsn_bounce(db, account, 7, raw) is False
     assert account.imap_last_uid == 7
+
+
+def test_failed_imap_login_closes_socket_without_retrying_password():
+    import imaplib
+    import pytest
+    from app.services.imap_bounces import IMAPCollectorError
+    class Rejected(FakeIMAPTransport):
+        instances = []
+        def login(self, email, password): raise imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+        def shutdown(self): self.commands.append("SHUTDOWN")
+    account = SenderAccount(email="sender@mail.ru", imap_host="imap.mail.ru", imap_port=993)
+    with pytest.raises(IMAPCollectorError) as caught:
+        with MailruIMAPClient(account, "secret", timeout_seconds=30, imap_factory=Rejected): pass
+    assert caught.value.category == "auth"
+    assert len(Rejected.instances) == 1
+    assert Rejected.instances[0].commands == ["SHUTDOWN"]
+
+
+def test_imap_retry_after_connection_failure_and_ignore_old_uid():
+    attempts = []
+    class Transport(FakeIMAPTransport):
+        def uid(self, command, *args):
+            if command == "search": return "OK", [b"10 11"]
+            assert args == (b"11", "(BODY.PEEK[])")
+            return "OK", [(b"11", b"Message body")]
+    def factory(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1: raise ConnectionResetError()
+        return Transport(*args, **kwargs)
+    account = SenderAccount(email="sender@mail.ru", imap_host="imap.mail.ru", imap_port=993)
+    with MailruIMAPClient(account, "secret", timeout_seconds=30, imap_factory=factory, sleep_func=lambda _: None) as imap:
+        assert imap.messages_after(10, 50) == [(11, b"Message body")]
+    assert len(attempts) == 2
+
+
+def test_imap_read_disconnect_is_safe_and_recoverable():
+    import imaplib
+    import pytest
+    from app.services.imap_bounces import IMAPCollectorError
+    class Disconnected(FakeIMAPTransport):
+        def uid(self, *_): raise imaplib.IMAP4.abort("private provider details")
+    account = SenderAccount(email="sender@mail.ru", imap_host="imap.mail.ru", imap_port=993)
+    with MailruIMAPClient(account, "secret", timeout_seconds=30, imap_factory=Disconnected) as imap:
+        with pytest.raises(IMAPCollectorError) as caught: imap.messages_after(0, 50)
+    assert caught.value.category == "connection"
+    assert "private provider details" not in str(caught.value)

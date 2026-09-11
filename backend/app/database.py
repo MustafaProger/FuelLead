@@ -96,6 +96,9 @@ def _run_postgresql_migrations() -> None:
         ).scalar()
         if not applied:
             connection.exec_driver_sql(migration_sql)
+        health_version = "20260910_mail_health"
+        if not connection.execute(text("SELECT 1 FROM schema_migrations WHERE version = :version"), {"version": health_version}).scalar():
+            connection.exec_driver_sql(migration_path.with_name(f"{health_version}.sql").read_text(encoding="utf-8"))
 
 
 def _upgrade_company_status_schema(company_model, statuses, removed_statuses) -> None:

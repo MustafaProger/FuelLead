@@ -33,7 +33,7 @@ class CredentialCipher:
             return self._fernet.decrypt(encrypted_password.encode("ascii")).decode("utf-8")
         except (InvalidToken, ValueError, UnicodeError) as exc:
             raise CredentialEncryptionError(
-                "Сохранённый пароль не удалось расшифровать. Замените пароль ящика"
+                "Сохранённый пароль не удалось расшифровать. Восстановите прежний MAIL_CREDENTIALS_ENCRYPTION_KEY в backend и imap-worker; смена пароля в Mail.ru не требуется"
             ) from exc
 
 

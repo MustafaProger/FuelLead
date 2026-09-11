@@ -109,7 +109,7 @@ def test_successful_verification_clears_round_block_and_preserves_accounting(db,
     assert (account.sent_today, account.sent_today_date, account.successful_full_batches, account.current_batch_size) == accounting
 
 
-@pytest.mark.parametrize("failure", ["temporary", "auth", "imap"])
+@pytest.mark.parametrize("failure", ["temporary", "auth"])
 def test_failed_verification_preserves_round_block(db, failure):
     app_settings = settings()
     account = create_sender_account(
@@ -138,7 +138,7 @@ def test_failed_verification_preserves_round_block(db, failure):
         imap_client_factory=FailedIMAPVerification,
     )
     db.expire_all()
-    assert account.verification_status == {"temporary": "temporary_error", "auth": "blocked", "imap": "failed"}[failure]
+    assert account.verification_status == {"temporary": "temporary_error", "auth": "blocked"}[failure]
     assert account.blocked_until_round == 26
     assert account.block_reason == "Предыдущее временное ограничение"
 
@@ -171,3 +171,90 @@ def test_sender_cannot_be_deleted_when_snapshotted_by_active_campaign(db):
 
 def test_batch_size_schedule():
     assert [batch_size_for_successes(value) for value in (0, 1, 2, 3, 4, 5, 14, 30)] == [5, 5, 6, 6, 7, 7, 12, 12]
+
+
+@pytest.mark.parametrize("category", ["timeout", "auth", "tls"])
+def test_imap_failure_does_not_disable_working_smtp(db, category):
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="secret", imap_enabled=True), s)
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self): pass
+    class IMAP:
+        def __init__(self, *_, **__): pass
+        def __enter__(self): raise IMAPCollectorError("IMAP failed", category=category)
+        def __exit__(self, *_): pass
+    verify_sender_account(db, a, s, smtp_client_factory=SMTP, imap_client_factory=IMAP)
+    assert a.verification_status == "verified"
+    assert a.imap_verification_status == ("temporary_error" if category == "timeout" else "failed")
+    assert a.imap_verification_error == "IMAP failed"
+
+
+def test_slow_verification_does_not_overwrite_replaced_password(db):
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="old"), s)
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self): update_sender_account(db, a, SenderAccountUpdate(password="new"), s)
+    verify_sender_account(db, a, s, smtp_client_factory=SMTP)
+    assert a.verification_status == "unverified"
+    assert CredentialCipher(s.mail_credentials_encryption_key).decrypt(a.encrypted_password) == "new"
+
+
+@pytest.mark.parametrize("active,category,due,is_active,expected", [(False,"connection",True,True,True), (True,"connection",True,True,False), (False,"auth",True,True,False), (False,"provider",True,True,False), (False,"connection",False,True,False), (False,"connection",True,False,False)])
+def test_background_recovery_only_checks_due_temporary_accounts_without_campaign(db, active, category, due, is_active, expected):
+    from contextlib import nullcontext
+    from datetime import timedelta
+    from app.services.sender_accounts import recover_temporary_sender_accounts
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="secret"), s)
+    a.verification_status = "temporary_error"
+    a.verification_error_category = category
+    a.verification_retry_at = datetime.now(timezone.utc) + timedelta(minutes=-1 if due else 10)
+    a.blocked_until_round = 17
+    a.sent_today = 23
+    a.is_active = is_active
+    if active:
+        db.add(OutreachCampaign(status="paused", filters={}, daily_limit=50, hourly_limit=0, min_interval_seconds=60, max_per_domain_per_day=0, sender_account_ids=[a.id]))
+    db.commit()
+    calls = []
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self): calls.append("login")
+    recover_temporary_sender_accounts(s, session_factory=lambda: nullcontext(db), smtp_client_factory=SMTP)
+    assert bool(calls) is expected
+    assert a.sent_today == 23
+    assert (a.verification_status == "verified") is expected
+    assert a.blocked_until_round == (None if expected else 17)
+
+
+@pytest.mark.parametrize("value", ["пароль", "a b", "\n\t ", "ab\x00cd"])
+def test_invalid_password_format_is_rejected_without_value_in_message(value):
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as caught:
+        SenderAccountCreate(email="owner@mail.ru", password=value)
+    assert value not in caught.value.errors()[0]["msg"]
+
+
+def test_password_copy_trims_only_edges_and_hides_model_repr():
+    data = SenderAccountUpdate(password=" app-password\n")
+    assert data.password == "app-password"
+    assert "app-password" not in repr(data)
+
+
+def test_api_password_save_checks_connection_automatically(db, monkeypatch):
+    from app import main
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="old"), s)
+    calls = []
+    def verify(session, account, settings):
+        calls.append(account.id)
+        assert CredentialCipher(settings.mail_credentials_encryption_key).decrypt(account.encrypted_password) == "new"
+        account.verification_status = "verified"
+        session.commit()
+        return account
+    monkeypatch.setattr(main, "verify_sender_account", verify)
+    result = main.patch_sender_account(a.id, SenderAccountUpdate(password="new"), db, s)
+    assert calls == [a.id]
+    assert result["verification_status"] == "verified"
+    assert "encrypted_password" not in result

@@ -152,3 +152,82 @@ def test_auth_error_is_safe_and_does_not_include_secret_or_auth_command():
     assert caught.value.category == "auth"
     assert "secret" not in str(caught.value)
     assert "AUTH" not in str(caught.value)
+
+
+def test_wire_message_is_crlf_and_7bit_safe_with_russian_body():
+    FakeSMTP.instances = []
+    MailruSMTPClient(account(), "secret", smtp_factory=FakeSMTP).send("lead@example.ru", "Тема", "Первая строка\n.Вторая строка\n")
+    payload = next(c[1] for c in FakeSMTP.instances[0].commands if isinstance(c, tuple) and c[0] == "DATA")
+    assert b"\n" not in payload.replace(b"\r\n", b"")
+    assert payload.isascii()
+    assert BytesParser(policy=policy.default).parsebytes(payload).get_content().replace("\r\n", "\n") == "Первая строка\n.Вторая строка\n"
+
+
+@pytest.mark.parametrize("code,reply", [(550, b"spam message rejected"), (554, b"5.7.1 policy refusal"), (450, b"4.2.0 try later")])
+def test_rcpt_policy_and_temporary_refusals_do_not_suppress_recipient(code, reply):
+    class RefusingSMTP(FakeSMTP):
+        def rcpt(self, recipient): return code, reply
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@example.ru", "Subject", "Body")
+    assert caught.value.permanent_recipient_failure is False
+    assert caught.value.smtp_response == reply.decode()
+    assert "RCPT" in caught.value.safe_message
+
+
+@pytest.mark.parametrize("raised", [False, True])
+def test_data_refusal_preserves_safe_provider_reason(raised):
+    class RefusingSMTP(FakeSMTP):
+        def data(self, payload):
+            if raised: raise smtplib.SMTPDataError(550, b"spam message rejected password=secret")
+            return 550, b"spam message rejected password=secret"
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@example.ru", "Subject", "Body")
+    assert caught.value.category == "provider"
+    assert caught.value.uncertain is False
+    assert "spam message rejected" in caught.value.smtp_response
+    assert "secret" not in caught.value.safe_message
+
+
+def test_temporary_auth_error_is_retried_and_not_reported_as_bad_password():
+    class TemporaryAuth(FakeSMTP):
+        count = 0
+        def login(self, email, password):
+            self.__class__.count += 1
+            raise smtplib.SMTPAuthenticationError(454, b"4.7.0 temporary auth failure")
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=TemporaryAuth, sleep_func=lambda _: None).verify()
+    assert TemporaryAuth.count == 3
+    assert caught.value.category == "temporary"
+
+
+def test_permanent_auth_failure_is_not_retried():
+    class BadAuth(FakeSMTP):
+        count = 0
+        def login(self, email, password):
+            self.__class__.count += 1
+            raise smtplib.SMTPAuthenticationError(535, b"AUTH secret")
+    with pytest.raises(SMTPDeliveryError):
+        MailruSMTPClient(account(), "secret", smtp_factory=BadAuth).verify()
+    assert BadAuth.count == 1
+
+
+@pytest.mark.parametrize("kind", ["reset", "timeout", "tls", "disconnect"])
+def test_every_transport_disconnect_after_data_is_uncertain_and_never_retried(kind):
+    import ssl
+    errors = {"reset": ConnectionResetError(), "timeout": TimeoutError(), "tls": ssl.SSLEOFError(), "disconnect": smtplib.SMTPServerDisconnected()}
+    class LostSMTP(FakeSMTP):
+        attempts = 0
+        def data(self, payload):
+            self.__class__.attempts += 1
+            raise errors[kind]
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=LostSMTP).send("lead@example.ru", "Subject", "Body")
+    assert caught.value.uncertain is True
+    assert LostSMTP.attempts == 1
+
+
+def test_failed_quit_does_not_undo_accepted_message():
+    class LostQuit(FakeSMTP):
+        def quit(self): raise ConnectionResetError()
+    result = MailruSMTPClient(account(), "secret", smtp_factory=LostQuit).send("lead@example.ru", "Subject", "Body")
+    assert result.smtp_code == "2.0.0"

@@ -275,6 +275,11 @@ export interface SenderAccount {
   verification_status: SenderVerificationStatus;
   verification_error: string | null;
   verification_checked_at: string | null;
+  verification_error_category: string | null;
+  verification_retry_at: string | null;
+  imap_verification_status: SenderVerificationStatus | "disabled";
+  imap_verification_error: string | null;
+  imap_verification_checked_at: string | null;
   daily_limit: number;
   sent_today: number;
   successful_full_batches: number;

@@ -1,4 +1,5 @@
 import logging
+import base64
 import re
 import smtplib
 import socket
@@ -6,6 +7,7 @@ import ssl
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email import policy
 from email.utils import format_datetime, formataddr, make_msgid
 from datetime import datetime, timezone
 
@@ -31,6 +33,8 @@ def safe_smtp_text(value: bytes | str | None, *, secret: str = "") -> str:
     text = " ".join(text.replace("\x00", " ").split())
     if secret:
         text = text.replace(secret, "[REDACTED]")
+        # LOGIN and PLAIN payloads must never survive provider error reporting.
+        text = text.replace(base64.b64encode(secret.encode()).decode(), "[REDACTED]")
     for pattern in SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text[:500]
@@ -52,6 +56,7 @@ class SMTPDeliveryError(RuntimeError):
         smtp_code: str | None = None,
         permanent_recipient_failure: bool = False,
         uncertain: bool = False,
+        smtp_response: str | None = None,
     ):
         super().__init__(safe_message)
         self.safe_message = safe_message
@@ -59,6 +64,7 @@ class SMTPDeliveryError(RuntimeError):
         self.smtp_code = smtp_code
         self.permanent_recipient_failure = permanent_recipient_failure
         self.uncertain = uncertain
+        self.smtp_response = smtp_response
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +78,15 @@ class SMTPAccepted:
 
 def _map_connect_error(exc: BaseException, *, password: str = "") -> SMTPDeliveryError:
     if isinstance(exc, smtplib.SMTPAuthenticationError):
-        code = smtp_status_code(getattr(exc, "smtp_code", None), getattr(exc, "smtp_error", None))
+        numeric_code = int(exc.smtp_code)
+        code = smtp_status_code(numeric_code, exc.smtp_error)
+        if 400 <= numeric_code < 500:
+            return SMTPDeliveryError(
+                f"Mail.ru временно отложил авторизацию (SMTP {code}). Пароль менять не требуется; проверка повторится позже",
+                category="temporary", smtp_code=code,
+            )
         return SMTPDeliveryError(
-            "Mail.ru отклонил авторизацию. Проверьте адрес и новый пароль внешнего приложения",
+            f"Mail.ru отклонил авторизацию (SMTP {code}). Проверьте доступ по IMAP/SMTP, адрес и пароль внешнего приложения в настройках Mail.ru",
             category="auth",
             smtp_code=code,
         )
@@ -83,11 +95,17 @@ def _map_connect_error(exc: BaseException, *, password: str = "") -> SMTPDeliver
             "Mail.ru не ответил вовремя. Повторите проверку позже",
             category="timeout",
         )
+    if isinstance(exc, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return SMTPDeliveryError("Соединение TLS с Mail.ru прервано до передачи письма; проверка повторится позже", category="connection")
     if isinstance(exc, (ssl.SSLError, ssl.CertificateError)):
         return SMTPDeliveryError(
             "Не удалось установить защищённое TLS-соединение с Mail.ru",
             category="tls",
         )
+    if isinstance(exc, socket.gaierror):
+        return SMTPDeliveryError("Не удалось определить адрес сервера Mail.ru (DNS). Проверьте сеть и VPN", category="connection")
+    if isinstance(exc, smtplib.SMTPServerDisconnected):
+        return SMTPDeliveryError("Mail.ru закрыл SMTP-соединение до передачи письма. Проверка повторится позже", category="connection")
     if isinstance(exc, smtplib.SMTPResponseException):
         code_value = int(getattr(exc, "smtp_code", 0) or 0)
         code = smtp_status_code(code_value, getattr(exc, "smtp_error", None))
@@ -100,11 +118,24 @@ def _map_connect_error(exc: BaseException, *, password: str = "") -> SMTPDeliver
         else:
             message = "Mail.ru отклонил SMTP-операцию"
             category = "provider"
-        return SMTPDeliveryError(message, category=category, smtp_code=code)
+        response = safe_smtp_text(getattr(exc, "smtp_error", None), secret=password) if category != "auth" else None
+        return SMTPDeliveryError(f"{message} (SMTP {code})" + (f": {response}" if response else ""), category=category, smtp_code=code, smtp_response=response)
     return SMTPDeliveryError(
         "Не удалось подключиться к Mail.ru",
         category="connection",
     )
+
+
+def _rejection(code: int, response: bytes, *, stage: str, password: str) -> SMTPDeliveryError:
+    mapped = _map_connect_error(smtplib.SMTPResponseException(code, response), password=password)
+    enhanced = smtp_status_code(code, response) or ""
+    # A 550/554 alone can mean spam/policy, not a nonexistent recipient.
+    permanent_recipient = stage == "RCPT" and enhanced.startswith(("5.1.", "5.2."))
+    if permanent_recipient:
+        mapped.category = "recipient"
+        mapped.permanent_recipient_failure = True
+    mapped.safe_message = f"{stage}: {mapped.safe_message}"
+    return mapped
 
 
 class MailruSMTPClient:
@@ -217,7 +248,7 @@ class MailruSMTPClient:
             raise ValueError("Текст письма обязателен")
 
         sent_at = datetime.now(timezone.utc)
-        message = EmailMessage()
+        message = EmailMessage(policy=policy.SMTP)
         message["To"] = target
         message["From"] = formataddr(((self.account.display_name or "").strip(), sender))
         message["Reply-To"] = sender
@@ -230,7 +261,9 @@ class MailruSMTPClient:
             message["X-FuelLead-Delivery-ID"] = str(delivery_id)
         if campaign_id is not None:
             message["X-FuelLead-Campaign-ID"] = str(campaign_id)
-        message.set_content(text_body)
+        # Always emit CRLF and a 7-bit-safe body; bytes passed to SMTP.data
+        # are not normalized and BODY=8BITMIME is not negotiated here.
+        message.set_content(text_body, cte="quoted-printable")
 
         raw_message = message.as_bytes()
         smtp = self._connect()
@@ -239,31 +272,14 @@ class MailruSMTPClient:
         try:
             code, response = smtp.mail(sender)
             if not 200 <= code < 300:
-                raise smtplib.SMTPSenderRefused(code, response, sender)
+                raise _rejection(code, response, stage="MAIL FROM", password=self.password)
             code, response = smtp.rcpt(target)
             if not 200 <= code < 300:
-                technical_code = smtp_status_code(code, response)
-                raise SMTPDeliveryError(
-                    "Адрес получателя подтверждённо отклонён почтовым сервером",
-                    category="recipient",
-                    smtp_code=technical_code,
-                    permanent_recipient_failure=500 <= code < 600,
-                )
+                raise _rejection(code, response, stage="RCPT", password=self.password)
             data_started = True
             code, response = smtp.data(raw_message)
             if not 200 <= code < 300:
-                technical_code = smtp_status_code(code, response)
-                if 500 <= code < 600:
-                    raise SMTPDeliveryError(
-                        "Почтовый сервер окончательно отклонил письмо",
-                        category="provider",
-                        smtp_code=technical_code,
-                    )
-                raise SMTPDeliveryError(
-                    "Почтовый сервер временно не принял письмо",
-                    category="temporary",
-                    smtp_code=technical_code,
-                )
+                raise _rejection(code, response, stage="DATA", password=self.password)
             accepted = SMTPAccepted(
                 message_id=message_id,
                 smtp_code=smtp_status_code(code, response) or str(code),
@@ -271,7 +287,10 @@ class MailruSMTPClient:
             )
         except SMTPDeliveryError:
             raise
-        except (smtplib.SMTPServerDisconnected, socket.timeout, TimeoutError) as exc:
+        except smtplib.SMTPDataError as exc:
+            # Explicit refusal before 354 is known not accepted.
+            raise _rejection(exc.smtp_code, exc.smtp_error, stage="DATA", password=self.password) from exc
+        except (smtplib.SMTPServerDisconnected, OSError) as exc:
             if data_started:
                 raise SMTPDeliveryError(
                     "Соединение оборвалось после начала SMTP-попытки; результат неизвестен",

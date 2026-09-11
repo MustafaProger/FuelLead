@@ -21,6 +21,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
   const [accounts, setAccounts] = useState<SenderAccount[]>([]);
   const [loading, setLoading] = useState(true);
   const [actingId, setActingId] = useState<number | null>(null);
+  const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [email, setEmail] = useState("");
@@ -50,31 +51,41 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
 
   const create = async (event: FormEvent) => {
     event.preventDefault();
+    if (creating || actingId !== null) return;
+    setCreating(true);
     setError(null);
     setNotice(null);
     try {
-      await api.createSenderAccount({ email, display_name: displayName, password, daily_limit: dailyLimit, smtp_enabled: true, imap_enabled: imapEnabled });
+      const saved = await api.createSenderAccount({ email, display_name: displayName, password, daily_limit: dailyLimit, smtp_enabled: true, imap_enabled: imapEnabled });
       setEmail("");
       setDisplayName("");
       setPassword("");
       setDailyLimit(50);
       setImapEnabled(true);
-      setNotice("Ящик сохранён. Пароль зашифрован и больше не отображается; теперь проверьте подключение.");
+      setNotice("Ящик сохранён, подключение проверено без отправки письма.");
       await load();
+      if (saved.verification_status !== "verified") setError(saved.verification_error || "Подключение требует проверки");
       onChanged();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Не удалось добавить ящик");
+    } finally {
+      setCreating(false);
     }
   };
 
   const act = async (accountId: number, action: () => Promise<unknown>, success?: string) => {
+    if (actingId !== null || creating) return;
     setActingId(accountId);
     setError(null);
     setNotice(null);
     try {
-      await action();
+      const result = await action();
       if (success) setNotice(success);
       await load();
+      if (result && typeof result === "object" && "verification_status" in result) {
+        const checked = result as SenderAccount;
+        if (checked.verification_status !== "verified" && checked.verification_error) setError(checked.verification_error);
+      }
       onChanged();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Действие не выполнено");
@@ -85,7 +96,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
 
   const replacePassword = async (account: SenderAccount) => {
     if (!replacementPassword) return;
-    await act(account.id, () => api.updateSenderAccount(account.id, { password: replacementPassword }), "Новый пароль зашифрован. Выполните проверку подключения ещё раз.");
+    await act(account.id, () => api.updateSenderAccount(account.id, { password: replacementPassword }), "Пароль сохранён. SMTP и IMAP проверены без отправки письма.");
     setReplacementPassword("");
     setReplacementId(null);
   };
@@ -126,7 +137,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
           <label><span>Дневной лимит</span><input type="number" min={1} max={500} value={dailyLimit} onChange={(event) => setDailyLimit(Number(event.target.value))} /></label>
           <label className="toggle-label"><input type="checkbox" checked={imapEnabled} onChange={(event) => setImapEnabled(event.target.checked)} /><span>IMAP: «Отправленные» и сбор возвратов</span></label>
         </div>
-        <button className="button button--primary" type="submit" disabled={!encryptionConfigured || !email || !password}><Plus size={17} /> Добавить ящик</button>
+        <button className="button button--primary" type="submit" disabled={creating || actingId !== null || !encryptionConfigured || !email || !password}><Plus size={17} /> {creating ? "Сохраняем и проверяем…" : "Добавить ящик"}</button>
       </form>
 
       <section className="mailbox-list" aria-busy={loading}>
@@ -145,23 +156,26 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
               <span><small>Полные пачки</small><strong>{account.successful_full_batches}</strong></span>
               <span><small>Последняя отправка</small><strong>{formatDateTime(account.last_sent_at)}</strong></span>
             </div>
-            <div className="mailbox-flags">
+            <div className="mailbox-flags" inert={actingId !== null || creating}>
               <button type="button" className={account.smtp_enabled ? "flag flag--on" : "flag"} onClick={() => act(account.id, () => api.updateSenderAccount(account.id, { smtp_enabled: !account.smtp_enabled }))}>SMTP {account.smtp_enabled ? "включён" : "выключен"}</button>
               <button type="button" className={account.imap_enabled ? "flag flag--on" : "flag"} onClick={() => act(account.id, () => api.updateSenderAccount(account.id, { imap_enabled: !account.imap_enabled }))}>IMAP {account.imap_enabled ? "включён" : "выключен"}</button>
               <span className="flag flag--saved"><KeyRound size={13} /> {account.password_saved ? "Пароль сохранён" : "Пароль отсутствует"}</span>
             </div>
             {account.verification_error ? <p className="mailbox-error">{account.verification_error}</p> : null}
+            {account.imap_enabled ? <p className="mailbox-checked">IMAP: {account.imap_verification_status === "disabled" ? "Выключен" : verificationLabels[account.imap_verification_status] || "Не проверен"} · {formatDateTime(account.imap_verification_checked_at)}</p> : null}
+            {account.imap_verification_error ? <p className="mailbox-error">{account.imap_verification_error}. Состояние отправки определяется проверкой SMTP.</p> : null}
+            {account.verification_retry_at ? <p className="mailbox-checked">Автопроверка подключения после {formatDateTime(account.verification_retry_at)}; во время кампании учитывается перерыв ящика.</p> : null}
             {account.blocked_until_round ? <p className="mailbox-block">Пропуск до конца круга {account.blocked_until_round}: {account.block_reason || "ошибка ящика"}</p> : null}
-            <p className="mailbox-checked">Последняя проверка: {formatDateTime(account.verification_checked_at)}</p>
-            <div className="mailbox-actions">
-              <button className="button button--secondary" type="button" disabled={actingId === account.id} onClick={() => act(account.id, () => api.verifySenderAccount(account.id), "Проверка завершена без отправки письма.")}><RefreshCw size={15} /> Проверить</button>
+            <p className="mailbox-checked">Проверка SMTP: {formatDateTime(account.verification_checked_at)}{actingId === account.id ? " · Проверяем, дождитесь результата…" : ""}</p>
+            <div className="mailbox-actions" inert={actingId !== null || creating}>
+              <button className="button button--secondary" type="button" disabled={actingId !== null || creating} onClick={() => act(account.id, () => api.verifySenderAccount(account.id), "Проверка завершена без отправки письма.")}><RefreshCw size={15} /> Проверить</button>
               <button className="button button--secondary" type="button" onClick={() => { setReplacementId(account.id); setReplacementPassword(""); }}><KeyRound size={15} /> Заменить пароль</button>
               <button className="button button--secondary" type="button" onClick={() => { setTestId(account.id); setTestRecipient(""); setTestConfirmed(false); }}><Send size={15} /> Тестовое письмо</button>
               <button className="button button--secondary" type="button" onClick={() => act(account.id, () => api.updateSenderAccount(account.id, { is_active: !account.is_active }))}>{account.is_active ? <Pause size={15} /> : <Play size={15} />}{account.is_active ? "Приостановить" : "Активировать"}</button>
               <button className="button button--danger" type="button" onClick={() => remove(account)}><Trash2 size={15} /> Удалить</button>
             </div>
-            {replacementId === account.id ? <div className="inline-mailbox-form"><label><span>Новый пароль внешнего приложения</span><input type="password" value={replacementPassword} onChange={(event) => setReplacementPassword(event.target.value)} autoComplete="new-password" /></label><button className="button button--primary" type="button" onClick={() => replacePassword(account)} disabled={!replacementPassword}>Сохранить</button><button className="button button--secondary" type="button" onClick={() => { setReplacementId(null); setReplacementPassword(""); }}>Отмена</button></div> : null}
-            {testId === account.id ? <div className="inline-mailbox-form inline-mailbox-form--test"><label><span>Куда отправить ровно одно письмо</span><input type="email" value={testRecipient} onChange={(event) => setTestRecipient(event.target.value)} placeholder="recipient@example.com" /></label><label className="toggle-label"><input type="checkbox" checked={testConfirmed} onChange={(event) => setTestConfirmed(event.target.checked)} /><span>Подтверждаю введённый адрес</span></label><button className="button button--primary" type="button" onClick={() => sendTest(account)} disabled={!testRecipient || !testConfirmed}>Отправить одно</button><button className="button button--secondary" type="button" onClick={() => setTestId(null)}>Отмена</button></div> : null}
+            {replacementId === account.id ? <div className="inline-mailbox-form"><label><span>Новый пароль внешнего приложения</span><input type="password" value={replacementPassword} onChange={(event) => setReplacementPassword(event.target.value)} autoComplete="new-password" /></label><button className="button button--primary" type="button" onClick={() => replacePassword(account)} disabled={actingId !== null || creating || !replacementPassword}>Сохранить</button><button className="button button--secondary" type="button" onClick={() => { setReplacementId(null); setReplacementPassword(""); }}>Отмена</button></div> : null}
+            {testId === account.id ? <div className="inline-mailbox-form inline-mailbox-form--test"><label><span>Куда отправить ровно одно письмо</span><input type="email" value={testRecipient} onChange={(event) => setTestRecipient(event.target.value)} placeholder="recipient@example.com" /></label><label className="toggle-label"><input type="checkbox" checked={testConfirmed} onChange={(event) => setTestConfirmed(event.target.checked)} /><span>Подтверждаю введённый адрес</span></label><button className="button button--primary" type="button" onClick={() => sendTest(account)} disabled={actingId !== null || creating || !testRecipient || !testConfirmed}>Отправить одно</button><button className="button button--secondary" type="button" onClick={() => setTestId(null)}>Отмена</button></div> : null}
           </article>
         ))}
       </section>

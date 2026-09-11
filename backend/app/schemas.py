@@ -123,14 +123,25 @@ class OutreachCampaignCreate(BaseModel):
         return value
 
 
+def normalize_app_password(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or not value.isascii() or any(char.isspace() or ord(char) < 32 for char in value):
+        raise ValueError("Пароль приложения должен содержать только латинские символы без пробелов внутри. Скопируйте его из настроек Mail.ru")
+    return value
+
+
 class SenderAccountCreate(BaseModel):
     provider: str = "mailru_smtp"
     email: str = Field(min_length=3, max_length=320)
     display_name: str = Field(default="", max_length=200)
-    password: str = Field(min_length=1, max_length=512)
+    password: str = Field(min_length=1, max_length=512, repr=False)
     daily_limit: int = Field(default=50, ge=1, le=500)
     smtp_enabled: bool = True
     imap_enabled: bool = False
+
+    _password_format = field_validator("password")(normalize_app_password)
 
     @field_validator("provider")
     @classmethod
@@ -156,11 +167,13 @@ class SenderAccountCreate(BaseModel):
 
 class SenderAccountUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=200)
-    password: str | None = Field(default=None, min_length=1, max_length=512)
+    password: str | None = Field(default=None, min_length=1, max_length=512, repr=False)
     daily_limit: int | None = Field(default=None, ge=1, le=500)
     smtp_enabled: bool | None = None
     imap_enabled: bool | None = None
     is_active: bool | None = None
+
+    _password_format = field_validator("password")(normalize_app_password)
 
 
 class SenderTestEmailRequest(BaseModel):

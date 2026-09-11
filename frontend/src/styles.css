@@ -1534,6 +1534,7 @@ button:disabled { transform: none; }
   .mailbox-actions .button { width: 100%; min-width: 0; padding: 0 7px; }
   .mailbox-actions .button--danger { grid-column: 1 / -1; }
   .inline-mailbox-form, .inline-mailbox-form--test { grid-template-columns: 1fr; }
+  .inline-mailbox-form .button { width: 100%; min-width: 0; padding: 0 12px; }
   .campaign-observability { grid-template-columns: 1fr 1fr; }
   .campaign-counters--full { grid-template-columns: repeat(2, 1fr); }
   .uncertain-resolution { grid-template-columns: 1fr; }

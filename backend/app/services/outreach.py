@@ -519,6 +519,8 @@ def _sender_for_current_position(db: Session, campaign: OutreachCampaign, settin
             if account.verification_status == "temporary_error" and account.blocked_until_round is not None and campaign.current_round > account.blocked_until_round:
                 account.verification_status = "verified"
                 account.verification_error = None
+                account.verification_error_category = None
+                account.verification_retry_at = None
                 account.blocked_until_round = None
                 account.block_reason = None
         daily_limit = _snapshot_sender_limit(campaign, account) if account else 0
@@ -649,6 +651,7 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
     was_stopped = campaign.status == "stopped"
     delivery.claim_token = None
     delivery.smtp_code = error.smtp_code
+    delivery.smtp_response = error.smtp_response
     delivery.error_message = error.safe_message
     if error.uncertain:
         delivery.status = "uncertain"
@@ -668,8 +671,10 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
         delivery.status = "failed"
         account.blocked_until_round = campaign.current_round + 3
         account.block_reason = error.safe_message
-        account.verification_status = "blocked" if error.category == "auth" else "temporary_error"
+        account.verification_status = "blocked" if error.category == "auth" else "temporary_error" if error.category in ("connection", "timeout", "temporary") else "failed"
         account.verification_error = error.safe_message
+        account.verification_error_category = error.category
+        account.verification_retry_at = now + timedelta(minutes=5) if account.verification_status == "temporary_error" else None
         mark_company_send_failed(db, delivery.company_id, delivery.recipient, error.safe_message, campaign_id=campaign.id, occurred_at=now)
         _advance_sender(campaign)
         campaign.next_send_at = now

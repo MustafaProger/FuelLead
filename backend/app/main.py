@@ -270,6 +270,7 @@ def add_sender_account(
 ) -> dict:
     try:
         account = create_sender_account(db, data, settings)
+        account = verify_sender_account(db, account, settings)
     except (SenderAccountError, CredentialEncryptionError) as exc:
         status_code = 503 if isinstance(exc, CredentialEncryptionError) else 409
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
@@ -287,6 +288,8 @@ def patch_sender_account(
         account = update_sender_account(
             db, _sender_account_or_404(db, account_id), data, settings
         )
+        if data.password is not None or data.imap_enabled is not None:
+            account = verify_sender_account(db, account, settings)
     except CredentialEncryptionError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     wake_outreach_worker()
@@ -302,6 +305,7 @@ def verify_mailbox(
     account = verify_sender_account(
         db, _sender_account_or_404(db, account_id), settings
     )
+    wake_outreach_worker()
     return sender_account_to_dict(account)
 
 
