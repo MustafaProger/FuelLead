@@ -1,0 +1,10 @@
+services:
+  db:
+    ports: !override []
+
+  backend:
+    ports: !override []
+
+  frontend:
+    ports: !override
+      - "80:80"
