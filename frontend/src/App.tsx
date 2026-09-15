@@ -1,5 +1,5 @@
 import { Database, Mail, RefreshCw, Search, Send } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { AuthPage } from "./components/AuthPage";
@@ -33,10 +33,11 @@ const defaultFilters: Filters = {
 };
 
 const PAGE_SIZE = 20;
+const UserGuidePage = lazy(() => import("./components/UserGuidePage"));
 
 function pageFromHash(): AppPage {
   const page = window.location.hash.replace("#", "").split("/")[0];
-  return page === "companies" || page === "template" || page === "mailboxes" || page === "suppressions" || page === "conversations" ? page : "dashboard";
+  return page === "companies" || page === "template" || page === "mailboxes" || page === "suppressions" || page === "conversations" || page === "guide" ? page : "dashboard";
 }
 
 interface WorkspaceProps {
@@ -366,6 +367,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
 
         {activePage === "suppressions" ? <SuppressionsPage /> : null}
         {activePage === "conversations" ? <ConversationsPage onChanged={handleOutreachChanged} /> : null}
+        {activePage === "guide" ? <Suspense fallback={<div className="content-page" role="status">Открываем инструкцию…</div>}><UserGuidePage /></Suspense> : null}
       </main>
       <OutreachDialog
         open={outreachOpen}

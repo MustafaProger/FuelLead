@@ -1,9 +1,9 @@
 import { discoveryProviderLabels } from "../discoveryProviders";
 import { useEffect, useRef, useState } from "react";
-import { Ban, Building2, CheckCircle2, Inbox, LayoutDashboard, LogOut, Mail, MessagesSquare } from "lucide-react";
+import { Ban, BookOpen, Building2, CheckCircle2, Inbox, LayoutDashboard, LogOut, Mail, MessagesSquare } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
-export type AppPage = "dashboard" | "companies" | "template" | "mailboxes" | "suppressions" | "conversations";
+export type AppPage = "dashboard" | "companies" | "template" | "mailboxes" | "suppressions" | "conversations" | "guide";
 
 interface AppSidebarProps {
   activePage: AppPage;
@@ -21,6 +21,7 @@ const navigation = [
   { page: "template" as const, label: "Шаблон письма", icon: Mail },
   { page: "mailboxes" as const, label: "Почтовые ящики", icon: Inbox },
   { page: "suppressions" as const, label: "Исключения", icon: Ban },
+  { page: "guide" as const, label: "Инструкция", icon: BookOpen },
 ];
 
 export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, onLogout, unreadReplies = 0 }: AppSidebarProps) {

@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, KeyRound, LoaderCircle, Mail, Pause, Play, Plus, RefreshCw, Send, Trash2 } from "lucide-react";
+import { AlertTriangle, BookOpen, CheckCircle2, KeyRound, LoaderCircle, Mail, Pause, Play, Plus, RefreshCw, Send, Trash2 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import type { SenderAccount, SmtpSenderProvider } from "../types";
@@ -166,6 +166,8 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
       <header className="page-heading">
         <div><span className="page-icon"><Mail size={19} /></span><div><h1>Почтовые ящики</h1><p>Mail.ru, Gmail и Яндекс Почта — с отдельными лимитами и прогревом</p></div></div>
       </header>
+
+      <a className="mailbox-guide-link" href="#guide/mailboxes"><BookOpen size={19} /><span><strong>Как подключить почту и пользоваться ящиками</strong><small>Пароли приложений, SMTP и IMAP, лимиты, пачки и ответы на частые вопросы</small></span></a>
 
       {!encryptionConfigured ? <div className="settings-alert"><AlertTriangle size={18} /><span>Сначала задайте <code>MAIL_CREDENTIALS_ENCRYPTION_KEY</code> в локальном <code>.env</code> и пересоздайте backend. Значение ключа интерфейс не получает.</span></div> : null}
       {error ? <div className="outreach-error"><AlertTriangle size={18} /><span>{error}</span></div> : null}

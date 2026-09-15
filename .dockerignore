@@ -1,0 +1,10 @@
+# The root context is used only by the frontend build, which also reads the guide.
+**
+!frontend/
+!frontend/**
+!docs/
+!docs/USER_GUIDE.md
+frontend/node_modules/
+frontend/dist/
+frontend/.env*
+frontend/*.log
