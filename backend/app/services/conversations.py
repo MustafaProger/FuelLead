@@ -8,10 +8,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import ActivityHistory, Company, EmailReplyAttempt, EmailSuppression, OutreachCampaign, OutreachDelivery, SenderAccount
+from app.models import ActivityHistory, Company, EmailReplyAttempt, EmailSuppression, OutreachDelivery, SenderAccount
 from app.schemas import ConversationReplyRequest
 from app.serializers import as_aware
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
+from app.services.mail_dispatch import mail_dispatch_slot
+from app.services.outreach import defer_outreach_after_reply, wake_outreach_worker
 from app.services.provider import normalize_email
 from app.services.smtp import MailruSMTPClient, SMTPDeliveryError
 
@@ -123,6 +125,14 @@ def attempt_to_dict(attempt):
 
 
 def send_reply(db: Session, company_id: int, request: ConversationReplyRequest, settings, *, sender_factory=MailruSMTPClient):
+    try:
+        with mail_dispatch_slot(db, reply=True):
+            return _send_reply(db, company_id, request, settings, sender_factory=sender_factory)
+    finally:
+        wake_outreach_worker()
+
+
+def _send_reply(db: Session, company_id: int, request: ConversationReplyRequest, settings, *, sender_factory):
     company = _company(db, company_id)
     request_id = str(request.request_id)
     existing = db.get(EmailReplyAttempt, request_id)
@@ -150,9 +160,8 @@ def send_reply(db: Session, company_id: int, request: ConversationReplyRequest, 
     if db.scalar(select(EmailReplyAttempt.id).where(EmailReplyAttempt.sender_account_id == account.id,
                                                    EmailReplyAttempt.status.in_(("sending", "uncertain")))):
         raise HTTPException(409, "В этом ящике есть незавершённая отправка. Проверьте её результат перед новым письмом")
-    if db.scalar(select(OutreachCampaign.id).where(OutreachCampaign.status.in_(("running", "cooldown")))) or db.scalar(
-            select(OutreachDelivery.id).where(OutreachDelivery.status == "sending")):
-        raise HTTPException(409, "Приостановите рассылку перед ответом клиенту")
+    if db.scalar(select(OutreachDelivery.id).where(OutreachDelivery.status == "sending")):
+        raise HTTPException(409, "Предыдущая отправка рассылки ещё не завершена. Проверьте её результат")
     local_date = datetime.now(settings.timezone).date()
     if account.sent_today_date != local_date:
         account.sent_today_date, account.sent_today = local_date, 0
@@ -198,7 +207,11 @@ def send_reply(db: Session, company_id: int, request: ConversationReplyRequest, 
         db.commit()
         return attempt_to_dict(attempt)
     attempt.status, attempt.sent_copy_saved = "accepted", result.sent_copy_saved
+    sent_at = datetime.now(timezone.utc)
     db.refresh(company, with_for_update=True)
+    db.refresh(account, with_for_update=True)
+    account.last_sent_at = sent_at
+    defer_outreach_after_reply(db, account.id, sent_at, settings)
     db.add(ActivityHistory(company_id=company_id, event_type="email_sent", description=f"Ответ отправлен на {recipient}",
         from_status=company.status, to_status=company.status,
         event_data={"recipient": recipient, "sender_account_id": account.id, "sender_email": account.email,
@@ -210,6 +223,14 @@ def send_reply(db: Session, company_id: int, request: ConversationReplyRequest, 
 
 
 def resolve_reply(db, company_id, request_id, outcome):
+    try:
+        with mail_dispatch_slot(db, reply=True):
+            return _resolve_reply(db, company_id, request_id, outcome)
+    finally:
+        wake_outreach_worker()
+
+
+def _resolve_reply(db, company_id, request_id, outcome):
     attempt = db.scalar(select(EmailReplyAttempt).where(EmailReplyAttempt.id == request_id,
         EmailReplyAttempt.company_id == company_id).with_for_update())
     if not attempt:

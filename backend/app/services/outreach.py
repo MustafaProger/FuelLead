@@ -8,7 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from app.mail_providers import SMTP_SENDER_PROVIDERS
 from app.config import Settings
@@ -17,6 +17,7 @@ from app.models import (
     ActivityHistory,
     Company,
     CompanyEmail,
+    EmailReplyAttempt,
     EmailSuppression,
     OutreachCampaign,
     OutreachDelivery,
@@ -26,6 +27,7 @@ from app.queries import build_company_query
 from app.schemas import CompanyFilters
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
 from app.services.email_templates import company_template_values, get_or_create_email_template, render_email_template
+from app.services.mail_dispatch import mail_dispatch_slot
 from app.services.provider import normalize_email
 from app.services.sender_accounts import batch_size_for_successes
 from app.services.smtp import MailruSMTPClient, SMTPAccepted, SMTPDeliveryError
@@ -306,6 +308,17 @@ def outreach_campaign_to_dict(campaign: OutreachCampaign) -> dict:
     processed = sum(counts[status] for status in TERMINAL_DELIVERY_STATUSES)
     remaining = counts["queued"] + counts["sending"]
     active_sender = next((delivery.sender_account_id for delivery in reversed(campaign.deliveries) if delivery.status == "sending"), campaign.current_batch_sender_id)
+    reply_wait_reason = None
+    db = object_session(campaign)
+    if db is not None and campaign.status in ("running", "cooldown"):
+        pending_reply = db.scalar(select(EmailReplyAttempt).where(
+            EmailReplyAttempt.status.in_(("sending", "uncertain"))).order_by(EmailReplyAttempt.created_at).limit(1))
+        if pending_reply:
+            unknown = pending_reply.status == "uncertain" or (datetime.now(timezone.utc) - _aware(pending_reply.created_at)).total_seconds() > 300
+            reply_wait_reason = (
+                "Результат ответа неизвестен. Проверьте «Отправленные» и уточните результат в «Переписке»."
+                if unknown else "Отправляем ответ клиенту. Рассылка продолжится автоматически."
+            )
     return {
         "id": campaign.id,
         "status": campaign.status,
@@ -318,6 +331,7 @@ def outreach_campaign_to_dict(campaign: OutreachCampaign) -> dict:
         "cancelled_count": counts["cancelled"], "remaining_count": remaining,
         "progress_percent": round((processed / campaign.recipient_count) * 100 if campaign.recipient_count else 0, 1),
         "pause_reason": campaign.pause_reason,
+        "reply_wait_reason": reply_wait_reason,
         "current_round": campaign.current_round,
         "active_sender_account_id": active_sender,
         "active_sender_email": campaign.current_batch_sender.email if campaign.current_batch_sender else None,
@@ -448,6 +462,20 @@ def _snapshot_range(
         except (TypeError, ValueError):
             pass
     return fallback
+
+
+def defer_outreach_after_reply(db: Session, account_id: int, sent_at: datetime, settings: Settings) -> None:
+    """Preserve normal spacing, round rest and the operator's campaign state."""
+    for campaign in db.scalars(select(OutreachCampaign).where(
+            OutreachCampaign.status.in_(("running", "cooldown", "paused")))):
+        if account_id not in (campaign.sender_account_ids or []):
+            continue
+        minimum, _ = _snapshot_range(campaign, "message_interval_seconds", (
+            settings.outreach_message_interval_min_seconds, settings.outreach_message_interval_max_seconds))
+        seconds = max(settings.outreach_message_interval_min_seconds, minimum, campaign.current_interval_seconds or 0)
+        resume_after = sent_at + timedelta(seconds=seconds)
+        if campaign.next_send_at is None or _aware(campaign.next_send_at) < resume_after:
+            campaign.next_send_at = resume_after
 
 
 def _pre_send_suppression_reason(db: Session, delivery: OutreachDelivery) -> str | None:
@@ -730,9 +758,23 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
 
 
 def process_outreach_tick(settings: Settings, *, sender_factory: Callable = MailruSMTPClient, session_factory: Callable[[], Session] | None = None, now: datetime | None = None, random_int: Callable[[int, int], int] = random.randint) -> float:
+    factory = session_factory or SessionLocal
+    with factory() as lock_db, mail_dispatch_slot(lock_db, reply=False) as acquired:
+        if not acquired:
+            return float(settings.outreach_worker_poll_seconds)
+        return _process_outreach_tick(settings, sender_factory=sender_factory, session_factory=factory, now=now, random_int=random_int)
+
+
+def _process_outreach_tick(settings: Settings, *, sender_factory: Callable, session_factory: Callable[[], Session], now: datetime | None, random_int: Callable[[int, int], int]) -> float:
     effective_now = _aware(now) or datetime.now(timezone.utc)
     factory = session_factory or SessionLocal
     with factory() as db:
+        # Durable receipts also hold outreach after a lost HTTP response or a
+        # process restart. Only a known outcome can release this hold.
+        if db.scalar(select(EmailReplyAttempt.id).where(EmailReplyAttempt.status.in_(("sending", "uncertain"))).limit(1)):
+            return float(settings.outreach_worker_poll_seconds)
+        if db.scalar(select(OutreachDelivery.id).where(OutreachDelivery.status == "sending").limit(1)):
+            return float(settings.outreach_worker_poll_seconds)
         campaign = db.scalar(select(OutreachCampaign).where(OutreachCampaign.status.in_(("running", "cooldown"))).order_by(OutreachCampaign.id.asc()).with_for_update(skip_locked=True))
         if campaign is None or campaign.worker_claim_token:
             return float(settings.outreach_worker_poll_seconds)

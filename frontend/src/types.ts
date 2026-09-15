@@ -239,6 +239,7 @@ export interface OutreachCampaign {
   remaining_count: number;
   progress_percent: number;
   pause_reason: string | null;
+  reply_wait_reason?: string | null;
   current_round: number;
   active_sender_account_id: number | null;
   active_sender_email: string | null;

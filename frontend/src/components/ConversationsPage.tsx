@@ -211,6 +211,7 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
       {reply.reply_disabled_reason ? <p className="mail-error">{reply.reply_disabled_reason}</p> : null}
       <label className="sr-only" htmlFor="client-reply">Текст ответа</label>
       <textarea ref={textarea} id="client-reply" value={draft.body} maxLength={20000} rows={4} placeholder="Напишите ответ клиенту…" disabled={sending || draft.pending || Boolean(reply.reply_disabled_reason)} onChange={(event) => changeBody(event.target.value)} />
+      <p className="mail-muted" role={sending ? "status" : undefined}>{sending ? "Ожидаем завершения текущей отправки и отправляем ответ…" : "Во время ответа рассылка подождёт и продолжится автоматически. Ручная пауза сохранится."}</p>
       {sendError ? <p className="mail-error" role="alert">{sendError}</p> : null}
       {notice ? <p className="mail-success" role="status">{notice}</p> : null}
       <div className="conversation-composer-actions"><small>{draft.body.length.toLocaleString("ru-RU")} / 20 000</small><button className="button button--primary" type="submit" disabled={sending || !draft.body.trim() || Boolean(reply.reply_disabled_reason) && !draft.pending}>{sending ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}{sending ? "Отправляем…" : draft.pending ? "Проверить результат" : "Отправить ответ"}</button></div>
