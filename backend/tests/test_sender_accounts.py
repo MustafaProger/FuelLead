@@ -186,7 +186,7 @@ def test_imap_failure_does_not_disable_working_smtp(db, category):
         def __exit__(self, *_): pass
     verify_sender_account(db, a, s, smtp_client_factory=SMTP, imap_client_factory=IMAP)
     assert a.verification_status == "verified"
-    assert a.imap_verification_status == ("temporary_error" if category == "timeout" else "failed")
+    assert a.imap_verification_status == ("failed" if category == "auth" else "temporary_error")
     assert a.imap_verification_error == "IMAP failed"
 
 
@@ -201,8 +201,105 @@ def test_slow_verification_does_not_overwrite_replaced_password(db):
     assert CredentialCipher(s.mail_credentials_encryption_key).decrypt(a.encrypted_password) == "new"
 
 
-@pytest.mark.parametrize("active,category,due,is_active,expected", [(False,"connection",True,True,True), (True,"connection",True,True,False), (False,"auth",True,True,False), (False,"provider",True,True,False), (False,"connection",False,True,False), (False,"connection",True,False,False)])
-def test_background_recovery_only_checks_due_temporary_accounts_without_campaign(db, active, category, due, is_active, expected):
+def test_imap_poll_during_smtp_check_does_not_discard_smtp_result(db):
+    from datetime import timedelta
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="secret", imap_enabled=True), s)
+    a.verification_status = "temporary_error"
+    db.commit()
+    newer_imap_check = datetime.now(timezone.utc) + timedelta(seconds=1)
+
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self):
+            a.imap_verification_status = "verified"
+            a.imap_verification_checked_at = newer_imap_check
+            a.updated_at = newer_imap_check
+            db.commit()
+
+    class IMAP:
+        def __init__(self, *_, **__): pass
+        def __enter__(self): raise IMAPCollectorError("stale IMAP failure", category="auth")
+        def __exit__(self, *_): pass
+
+    verify_sender_account(db, a, s, smtp_client_factory=SMTP, imap_client_factory=IMAP)
+    assert a.verification_status == "verified"
+    assert a.imap_verification_status == "verified"
+    assert a.imap_verification_error is None
+    assert a.imap_verification_checked_at.replace(tzinfo=None) == newer_imap_check.replace(tzinfo=None)
+
+
+def test_newer_smtp_failure_wins_over_slow_successful_check(db):
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="secret"), s)
+
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self):
+            a.verification_status = "blocked"
+            a.verification_error_category = "auth"
+            a.verification_error = "newer send failure"
+            a.blocked_until_round = 10
+            db.commit()
+
+    verify_sender_account(db, a, s, smtp_client_factory=SMTP)
+    assert a.verification_status == "blocked"
+    assert a.verification_error == "newer send failure"
+    assert a.blocked_until_round == 10
+
+
+@pytest.mark.parametrize("campaign_status", ["running", "cooldown", "paused", "interrupted"])
+def test_health_check_preserves_campaign_and_accounting(db, campaign_status):
+    from contextlib import nullcontext
+    from datetime import timedelta
+    from app.services.sender_accounts import recover_temporary_sender_accounts
+    s = settings()
+    a = create_sender_account(db, SenderAccountCreate(email="owner@mail.ru", password="secret"), s)
+    a.verification_status = "temporary_error"
+    a.verification_error_category = "timeout"
+    a.verification_retry_at = None  # Legacy temporary errors need recovery too.
+    a.verification_checked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    a.blocked_until_round = 19
+    a.sent_today, a.successful_full_batches = 12, 4
+    rest = datetime.now(timezone.utc) + timedelta(hours=1)
+    c = OutreachCampaign(status=campaign_status, filters={}, daily_limit=50, hourly_limit=0, min_interval_seconds=60, max_per_domain_per_day=0, sender_account_ids=[a.id], current_round=16, next_send_at=rest, round_rest_until=rest)
+    db.add(c)
+    db.commit()
+
+    class SMTP:
+        def __init__(self, *_, **__): pass
+        def verify(self): pass
+
+    recover_temporary_sender_accounts(s, session_factory=lambda: nullcontext(db), smtp_client_factory=SMTP)
+    assert a.verification_status == "verified"
+    assert (a.blocked_until_round, a.sent_today, a.successful_full_batches) == (19, 12, 4)
+    assert (c.status, c.current_round, c.next_send_at, c.round_rest_until) == (campaign_status, 16, rest, rest)
+
+
+def test_health_check_failure_does_not_starve_other_accounts(db):
+    from contextlib import nullcontext
+    from datetime import timedelta
+    from app.services.sender_accounts import recover_temporary_sender_accounts
+    s = settings()
+    accounts = [create_sender_account(db, SenderAccountCreate(email=f"owner{n}@mail.ru", password="secret"), s) for n in range(2)]
+    for a in accounts:
+        a.verification_status = "temporary_error"
+        a.verification_error_category = "timeout"
+        a.verification_retry_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    class SMTP:
+        def __init__(self, account, *_, **__): self.account = account
+        def verify(self):
+            if self.account.id == accounts[0].id: raise RuntimeError("unexpected failure")
+
+    recover_temporary_sender_accounts(s, session_factory=lambda: nullcontext(db), smtp_client_factory=SMTP)
+    assert accounts[0].verification_status == "temporary_error"
+    assert accounts[1].verification_status == "verified"
+
+
+@pytest.mark.parametrize("active,category,due,is_active,expected", [(False,"connection",True,True,True), (True,"connection",True,True,True), (False,"auth",True,True,False), (False,"provider",True,True,False), (False,"connection",False,True,False), (False,"connection",True,False,False)])
+def test_background_recovery_checks_due_accounts_and_preserves_campaign_rest(db, active, category, due, is_active, expected):
     from contextlib import nullcontext
     from datetime import timedelta
     from app.services.sender_accounts import recover_temporary_sender_accounts
@@ -225,10 +322,10 @@ def test_background_recovery_only_checks_due_temporary_accounts_without_campaign
     assert bool(calls) is expected
     assert a.sent_today == 23
     assert (a.verification_status == "verified") is expected
-    assert a.blocked_until_round == (None if expected else 17)
+    assert a.blocked_until_round == (None if expected and not active else 17)
 
 
-@pytest.mark.parametrize("value", ["пароль", "a b", "\n\t ", "ab\x00cd"])
+@pytest.mark.parametrize("value", ["пароль", "a b", "\n\t ", "ab\x00cd", "ab\x7fcd"])
 def test_invalid_password_format_is_rejected_without_value_in_message(value):
     from pydantic import ValidationError
     with pytest.raises(ValidationError) as caught:
@@ -258,3 +355,22 @@ def test_api_password_save_checks_connection_automatically(db, monkeypatch):
     assert calls == [a.id]
     assert result["verification_status"] == "verified"
     assert "encrypted_password" not in result
+
+
+def test_custom_test_message_content_uses_existing_smtp_client():
+    from app.services.sender_accounts import send_test_message
+    from app.services.credentials import CredentialCipher, generate_encryption_key
+    from app.config import Settings
+    from app.models import SenderAccount
+    from app.services.smtp import SMTPAccepted
+    key = generate_encryption_key()
+    settings = Settings(_env_file=None, mail_credentials_encryption_key=key)
+    account = SenderAccount(email="sender@mail.ru", is_active=True, smtp_enabled=True,
+                            encrypted_password=CredentialCipher(key).encrypt("fake"))
+    class FakeSender:
+        def __init__(self, *args, **kwargs): pass
+        def send(self, recipient, subject, body):
+            assert (recipient, subject, body) == ("target@example.ru", "Проверка", "Тест из сервиса")
+            return SMTPAccepted("<test@mail.ru>", "250", "OK")
+    assert send_test_message(account, "target@example.ru", settings, smtp_client_factory=FakeSender,
+                             subject="Проверка", body="Тест из сервиса").message_id == "<test@mail.ru>"

@@ -216,6 +216,7 @@ export function CompanyDetails({
       </div>
 
       <section className="history-section">
+        <a className="button button--secondary company-conversation-link" href={`#conversations/${detail.id}`}><MessageCircle size={17} /> Читать переписку и ответить</a>
         <h3>История действий</h3>
         <ol className="timeline">
           {detail.history.map((event) => (

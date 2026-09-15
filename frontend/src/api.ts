@@ -1,5 +1,8 @@
 import type {
   CompanyDetail,
+  ConversationDetail,
+  ConversationList,
+  ConversationReplyResult,
   CompanyListResponse,
   CompanyStatus,
   ContactType,
@@ -14,6 +17,7 @@ import type {
   OutreachPreflight,
   SearchRun,
   SenderAccount,
+  SmtpSenderProvider,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
@@ -96,6 +100,18 @@ export const api = {
     return request<CompanyListResponse>(`/companies?${params}`);
   },
   company: (id: number) => request<CompanyDetail>(`/companies/${id}`),
+  conversations: (search = "", unread = false, page = 1) => request<ConversationList>(
+    `/conversations?${new URLSearchParams({ search, unread: String(unread), page: String(page) })}`),
+  conversation: (id: number) => request<ConversationDetail>(`/companies/${id}/conversation`),
+  mailSyncState: () => request<{ running: boolean; finished_at: string | null; error: string | null; poll_seconds: number; mailboxes: { email: string; status: string; error: string | null }[] }>("/conversations/sync"),
+  syncMail: () => request<{ started: boolean }>("/conversations/sync", { method: "POST" }),
+  resolveReply: (id: number, requestId: string, outcome: "accepted" | "failed") => request<ConversationReplyResult>(
+    `/companies/${id}/conversation/attempts/${requestId}/resolve`, { method: "POST", body: JSON.stringify({ outcome, confirmed: true }) }),
+  readConversation: (id: number, throughId: number) => request<{ ok: boolean }>(`/companies/${id}/conversation/read`, {
+    method: "POST", body: JSON.stringify({ through_id: throughId }),
+  }),
+  replyConversation: (id: number, replyId: number, body: string, requestId: string) => request<ConversationReplyResult>(
+    `/companies/${id}/conversation/reply`, { method: "POST", body: JSON.stringify({ reply_id: replyId, body, request_id: requestId }) }),
   updateStatus: (id: number, status: CompanyStatus) =>
     request<CompanyDetail>(`/companies/${id}/status`, {
       method: "PATCH",
@@ -180,6 +196,7 @@ export const api = {
     }),
   senderAccounts: () => request<SenderAccount[]>("/sender-accounts"),
   createSenderAccount: (data: {
+    provider: SmtpSenderProvider;
     email: string;
     display_name: string;
     password: string;
@@ -188,7 +205,7 @@ export const api = {
     imap_enabled: boolean;
   }) => request<SenderAccount>("/sender-accounts", {
     method: "POST",
-    body: JSON.stringify({ provider: "mailru_smtp", ...data }),
+    body: JSON.stringify(data),
   }),
   updateSenderAccount: (id: number, data: Partial<{
     display_name: string;

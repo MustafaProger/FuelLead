@@ -62,7 +62,7 @@ def test_full_search_collects_350_companies_beyond_two_pages_and_ten_candidates(
     client = Pages()
     discover_new_companies(db, run, client, 10)
     assert run.companies_created == 350
-    assert client.searches == [("77", page, 100) for page in range(1, 5)] + [("50", 1, 100)]
+    assert client.searches == [("77", 1, 100), ("50", 1, 100)] + [("77", page, 100) for page in range(2, 5)]
     assert run.search_requests == 5
     assert run.company_requests == 350
     assert len(set(client.cards)) == 350
@@ -106,7 +106,7 @@ def test_okvedo_passes_existing_pages_adds_empty_region_cards_and_skips_them_nex
         assert first.companies_created == 4
         assert first.skipped_known == 206
         assert first.skipped_unknown_region == 0
-        assert pages == [1, 2, 3, 1]
+        assert pages == [1, 1, 2, 3]
         assert cards == inns[206:]
         second = full_run(db)
         discover_new_companies(db, second, client, 1, provider="okvedo")
@@ -292,3 +292,143 @@ def test_missing_card_does_not_block_remaining_candidates(db):
     assert run.companies_created == 19
     assert run.errors_count == 1
     assert client.cards == client.inns[1:]
+
+
+def test_full_search_visits_every_query_before_second_page(db):
+    run = full_run(db)
+    run.requested_okved_codes = ['42.11', '77.32']
+    db.commit()
+    client = Pages()
+    searches = []
+
+    def search(code, *, region_code, limit, page):
+        searches.append((code, region_code, page))
+        inn = str(7701000000 + ['42.11', '77.32'].index(code) * 100 + int(region_code) + page)
+        return SearchPage([{'ИНН': inn}], page, 2)
+
+    client.search_by_okved = search
+    discover_new_companies(db, run, client, 1)
+    queries = [('42.11', '77'), ('42.11', '50'), ('77.32', '77'), ('77.32', '50')]
+    assert searches == [(code, region, page) for page in (1, 2) for code, region in queries]
+    assert run.companies_created == 8
+
+
+def test_full_search_prioritizes_unvisited_then_oldest_queries(db):
+    from datetime import datetime, timezone
+    run = full_run(db)
+    run.requested_okved_codes = ['42.11', '77.32']
+    for code, region, day in [('42.11', '77', 14), ('42.11', '50', 13), ('77.32', '77', 4)]:
+        db.add(DiscoveryCursor(provider='checko', okved_code=code, region_code=region,
+                               page_size=100, updated_at=datetime(2026, 9, day, tzinfo=timezone.utc)))
+    db.commit()
+    searches = []
+    client = Pages(0)
+
+    def empty_search(code, *, region_code, limit, page):
+        searches.append((code, region_code))
+        return SearchPage([], page, page)
+
+    client.search_by_okved = empty_search
+    discover_new_companies(db, run, client, 1)
+    assert searches == [('77.32', '50'), ('77.32', '77'), ('42.11', '50'), ('42.11', '77')]
+    assert all(cursor.updated_at.year >= 2026 for cursor in db.scalars(select(DiscoveryCursor)))
+
+
+@pytest.mark.parametrize('reason', ['connection_error', 'timeout', 'service_unavailable'])
+@pytest.mark.parametrize('operation', ['search_by_okved', 'get_company'])
+def test_transient_failure_retries_same_request_without_losing_companies(db, reason, operation):
+    client = Pages(3)
+    original = getattr(client, operation)
+    attempts = []
+
+    def flaky(*args, **kwargs):
+        attempts.append((args, kwargs))
+        if len(attempts) <= 2:
+            raise DiscoveryAPIError('Temporary failure', reason=reason, stop_discovery=True)
+        return original(*args, **kwargs)
+
+    setattr(client, operation, flaky)
+    run = full_run(db)
+    discover_new_companies(db, run, client, 1)
+    assert attempts[0] == attempts[1] == attempts[2]
+    assert run.companies_created == 3
+    assert run.errors_count == 0
+    assert run.search_requests + run.company_requests == 7
+
+
+def test_failed_card_preserves_position_and_other_query_can_add_companies(db):
+    client = Pages(3)
+    original_search = client.search_by_okved
+    original_card = client.get_company
+    other_inn = '5001000001'
+
+    def search(code, *, region_code, limit, page):
+        if region_code == '50':
+            return SearchPage([{'ИНН': other_inn}], page, page)
+        return original_search(code, region_code=region_code, limit=limit, page=page)
+
+    def card(inn):
+        if inn == client.inns[1]:
+            raise DiscoveryAPIError('Timeout', reason='timeout', stop_discovery=True)
+        return original_card(inn)
+
+    client.search_by_okved = search
+    client.get_company = card
+    run = full_run(db)
+    discover_new_companies(db, run, client, 1, propagate_stop_errors=True)
+    cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == '77'))
+    assert (cursor.next_page, cursor.next_record_index) == (1, 1)
+    assert set(db.scalars(select(Company.inn))) == {client.inns[0], other_inn}
+    assert run.errors_count == 1
+    client.get_company = original_card
+    second = full_run(db)
+    discover_new_companies(db, second, client, 1)
+    assert second.companies_created == 2
+    assert db.scalar(select(func.count(Company.id))) == 4
+
+
+def test_unavailable_provider_is_bounded_and_next_run_starts_other_queries(db):
+    client = Pages()
+    calls = []
+
+    def unavailable(code, *, region_code, limit, page):
+        calls.append((code, region_code, page))
+        raise DiscoveryAPIError('Offline', reason='connection_error', stop_discovery=True)
+
+    client.search_by_okved = unavailable
+    run = full_run(db)
+    run.requested_okved_codes = ['42.11', '49.41', '77.32']
+    db.commit()
+    with pytest.raises(DiscoveryAPIError):
+        discover_new_companies(db, run, client, 1, propagate_stop_errors=True)
+    assert len(calls) == 12  # Four attempts on each of three queries, then stop.
+    assert len(set(calls)) == 3
+    second = full_run(db)
+    second.requested_okved_codes = run.requested_okved_codes
+    db.commit()
+    with pytest.raises(DiscoveryAPIError):
+        discover_new_companies(db, second, client, 1, propagate_stop_errors=True)
+    assert calls[12] == ('49.41', '50', 1)
+    assert len(set(calls)) == 6
+
+
+def test_cancel_during_transient_retry_does_not_make_another_request(db, monkeypatch):
+    from app.services.discovery import SearchCancelled
+    run = full_run(db)
+    client = Pages()
+    calls = []
+
+    def unavailable(*args, **kwargs):
+        calls.append(1)
+        raise DiscoveryAPIError('Offline', reason='connection_error', stop_discovery=True)
+
+    def wait(db, run, seconds):
+        if seconds == 2:
+            run.cancel_requested = True
+            db.commit()
+
+    client.search_by_okved = unavailable
+    monkeypatch.setattr('app.services.discovery._wait_for_provider', wait)
+    with pytest.raises(SearchCancelled):
+        discover_new_companies(db, run, client, 1)
+    assert len(calls) == 1

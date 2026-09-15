@@ -180,7 +180,7 @@ def test_okvedo_rate_limit_is_distinct_from_daily_quota(message, reason):
 
 
 @pytest.mark.parametrize("client_type", [OkvedoClient, DaDataClient])
-@pytest.mark.parametrize("status,payload,reason", [(401, {"detail": "secret"}, "access_denied"), (500, {"detail": "secret"}, "http_error"), (200, [], "invalid_response"), (200, {}, "invalid_response")])
+@pytest.mark.parametrize("status,payload,reason", [(401, {"detail": "secret"}, "access_denied"), (500, {"detail": "secret"}, "service_unavailable"), (400, {"detail": "secret"}, "http_error"), (200, [], "invalid_response"), (200, {}, "invalid_response")])
 def test_new_provider_errors_are_secret_safe(client_type, status, payload, reason):
     with client_type("secret", transport=httpx.MockTransport(lambda _: httpx.Response(status, json=payload))) as client:
         with pytest.raises(DiscoveryAPIError) as caught:

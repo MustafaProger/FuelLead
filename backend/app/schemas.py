@@ -1,8 +1,11 @@
+import re
 from datetime import date
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
+from app.mail_providers import MAIL_PROVIDERS
 from app.config import DEFAULT_OKVED_CODES
 from app.email_providers import EMAIL_PROVIDER_VALUES
 from app.models import ALL_STATUSES, CONTACT_TYPES
@@ -127,8 +130,11 @@ def normalize_app_password(value: str | None) -> str | None:
     if value is None:
         return None
     value = value.strip()
-    if not value or not value.isascii() or any(char.isspace() or ord(char) < 32 for char in value):
-        raise ValueError("Пароль приложения должен содержать только латинские символы без пробелов внутри. Скопируйте его из настроек Mail.ru")
+    # Google displays its 16-letter app passwords in four groups.
+    if re.fullmatch(r"[A-Za-z]{4}( [A-Za-z]{4}){3}", value):
+        value = value.replace(" ", "")
+    if not value or not value.isascii() or any(char.isspace() or not char.isprintable() for char in value):
+        raise ValueError("Пароль приложения должен содержать только латинские символы без пробелов внутри. Скопируйте его из настроек почтового сервиса")
     return value
 
 
@@ -145,23 +151,20 @@ class SenderAccountCreate(BaseModel):
 
     @field_validator("provider")
     @classmethod
-    def mailru_only(cls, value: str) -> str:
-        if value != "mailru_smtp":
-            raise ValueError("Через интерфейс можно добавить только Mail.ru SMTP")
+    def supported_provider(cls, value: str) -> str:
+        if value not in MAIL_PROVIDERS:
+            raise ValueError("Выберите Mail.ru, Gmail или Яндекс Почту")
         return value
 
     @field_validator("email")
     @classmethod
-    def valid_email(cls, value: str) -> str:
+    def valid_email(cls, value: str, info: ValidationInfo) -> str:
         normalized = normalize_email(value)
-        if not normalized or normalized.rsplit("@", 1)[1] not in (
-            "mail.ru",
-            "bk.ru",
-            "inbox.ru",
-            "list.ru",
-            "internet.ru",
-        ):
-            raise ValueError("Укажите полный адрес ящика Mail.ru")
+        if not normalized:
+            raise ValueError("Укажите полный корректный адрес почтового ящика")
+        preset = MAIL_PROVIDERS.get(info.data.get("provider", "mailru_smtp"))
+        if preset and normalized.rsplit("@", 1)[1] not in preset.domains:
+            raise ValueError(f"Укажите полный адрес ящика {preset.label}")
         return normalized
 
 
@@ -179,6 +182,8 @@ class SenderAccountUpdate(BaseModel):
 class SenderTestEmailRequest(BaseModel):
     recipient: str = Field(min_length=3, max_length=320)
     confirmed: bool
+    subject: str | None = Field(default=None, min_length=1, max_length=998)
+    body: str | None = Field(default=None, min_length=1, max_length=20_000)
 
     @field_validator("recipient")
     @classmethod
@@ -239,3 +244,20 @@ class UncertainDeliveryResolution(BaseModel):
         if value is not True:
             raise ValueError("Подтвердите ручное решение")
         return value
+
+
+class ConversationReplyRequest(BaseModel):
+    request_id: UUID
+    reply_id: int = Field(ge=1)
+    body: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("body")
+    @classmethod
+    def nonempty_body(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Напишите ответ")
+        return value.strip()
+
+
+class ConversationReadRequest(BaseModel):
+    through_id: int = Field(ge=1)

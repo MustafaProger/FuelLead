@@ -12,6 +12,7 @@ import { Notice } from "./components/Notice";
 import { OutreachDialog } from "./components/OutreachDialog";
 import { SearchRunNotice } from "./components/SearchRunNotice";
 import { SuppressionsPage } from "./components/SuppressionsPage";
+import { ConversationsPage } from "./components/ConversationsPage";
 import type {
   Company,
   CompanyDetail,
@@ -34,8 +35,8 @@ const defaultFilters: Filters = {
 const PAGE_SIZE = 20;
 
 function pageFromHash(): AppPage {
-  const page = window.location.hash.replace("#", "");
-  return page === "companies" || page === "template" || page === "mailboxes" || page === "suppressions" ? page : "dashboard";
+  const page = window.location.hash.replace("#", "").split("/")[0];
+  return page === "companies" || page === "template" || page === "mailboxes" || page === "suppressions" || page === "conversations" ? page : "dashboard";
 }
 
 interface WorkspaceProps {
@@ -65,6 +66,18 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   const [outreachOpen, setOutreachOpen] = useState(false);
   const [outreachFilters, setOutreachFilters] = useState<Filters>(defaultFilters);
   const [mailboxesReady, setMailboxesReady] = useState(false);
+  const [unreadReplies, setUnreadReplies] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => { void api.conversations("", true).then((result) => {
+      if (!cancelled) setUnreadReplies(result.unread_count);
+    }).catch(() => {}); };
+    refresh();
+    const timer = window.setInterval(refresh, 15000);
+    window.addEventListener("fuellead:mail-read", refresh);
+    return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener("fuellead:mail-read", refresh); };
+  }, []);
 
   useEffect(() => {
     const handleHashChange = () => setActivePage(pageFromHash());
@@ -267,6 +280,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         mailboxesConfigured={mailboxesReady}
         userEmail={userEmail}
         onLogout={onLogout}
+        unreadReplies={unreadReplies}
       />
       <main className="workspace-main">
         <SearchRunNotice
@@ -307,7 +321,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
               <span><Database size={14} /> PostgreSQL</span>
               <span className={mailboxesReady ? "integration-ready" : "integration-pending"}>
                 <Mail size={14} />
-                <span>Mail.ru SMTP<small>{mailboxesReady ? "Есть проверенный активный ящик" : "Добавьте и проверьте ящик"}</small></span>
+                <span>Почта SMTP<small>{mailboxesReady ? "Есть проверенный активный ящик" : "Добавьте и проверьте ящик"}</small></span>
               </span>
             </div>
 
@@ -351,6 +365,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         ) : null}
 
         {activePage === "suppressions" ? <SuppressionsPage /> : null}
+        {activePage === "conversations" ? <ConversationsPage onChanged={handleOutreachChanged} /> : null}
       </main>
       <OutreachDialog
         open={outreachOpen}

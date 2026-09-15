@@ -80,7 +80,7 @@ export function OutreachDialog({ open, filters, mailConfigured, onClose, onChang
   return (
     <div className="outreach-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="outreach-dialog" role="dialog" aria-modal="true" aria-labelledby="outreach-dialog-title">
-        <header className="outreach-dialog-header"><span className="outreach-dialog-icon"><Send size={20} /></span><div><h2 id="outreach-dialog-title">Отправка писем</h2><p>Последовательные Mail.ru-пачки с сохранёнными таймерами</p></div><button type="button" className="dialog-close" onClick={onClose} aria-label="Закрыть"><X size={19} /></button></header>
+        <header className="outreach-dialog-header"><span className="outreach-dialog-icon"><Send size={20} /></span><div><h2 id="outreach-dialog-title">Отправка писем</h2><p>Последовательные пачки писем с сохранёнными таймерами</p></div><button type="button" className="dialog-close" onClick={onClose} aria-label="Закрыть"><X size={19} /></button></header>
         {loading ? <div className="outreach-loading"><LoaderCircle className="spin" size={24} /><span>Фиксируем снимок получателей и ящиков…</span></div> : null}
         {error ? <div className="outreach-error"><AlertTriangle size={18} /><span>{error}</span></div> : null}
         {!loading && campaign ? <CampaignProgress campaign={campaign} acting={acting} onAction={runAction} /> : null}

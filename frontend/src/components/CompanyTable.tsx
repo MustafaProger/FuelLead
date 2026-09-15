@@ -347,17 +347,18 @@ function CompanyRow({
           </td>
         ) : null}
         <td data-label="Письмо" className="send-email-cell">
+          {["answered", "interested", "customer", "rejected"].includes(company.status) ? <a className="send-email-button conversation-table-link" href={`#conversations/${company.id}`}><MessageCircle size={15} /> Переписка</a> :
           <button
             className="send-email-button"
             type="button"
             disabled={!hasEmail || !mailConfigured || sendingEmail}
-            title={!hasEmail ? "У компании нет email" : !mailConfigured ? "Нет проверенного ящика Mail.ru" : "Отправить сохранённый шаблон на основной email компании"}
+            title={!hasEmail ? "У компании нет email" : !mailConfigured ? "Нет проверенного почтового ящика" : "Отправить сохранённый шаблон на основной email компании"}
             aria-label={`Отправить письмо на основной email компании ${company.name}`}
             onClick={() => void onSendEmail(company)}
           >
             {sendingEmail ? <LoaderCircle className="spin" size={15} /> : <Send size={15} />}
             {sendingEmail ? "Отправка…" : "Отправить"}
-          </button>
+          </button>}
         </td>
       </tr>
       {expanded && (

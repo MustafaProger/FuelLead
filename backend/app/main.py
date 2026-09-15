@@ -12,6 +12,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.auth import AUTH_COOKIE_NAME, create_session_token, credentials_match, session_email
+from app.mail_providers import SMTP_SENDER_PROVIDERS
 from app.config import DEFAULT_OKVED_CODES, TARGET_REGION_CODES, Settings, get_settings
 from app.database import SessionLocal, create_database, get_db
 from app.export import build_xlsx
@@ -32,6 +33,8 @@ from app.queries import build_company_query
 from app.schemas import (
     AuthLoginRequest,
     CompanyFilters,
+    ConversationReadRequest,
+    ConversationReplyRequest,
     ContactCreate,
     EmailPreviewRequest,
     EmailSendRequest,
@@ -86,6 +89,8 @@ from app.services.sender_accounts import (
     verify_sender_account,
 )
 from app.services.smtp import MailruSMTPClient, SMTPDeliveryError
+from app.services.conversations import conversation_detail, conversation_list, mark_read, send_reply, resolve_reply
+from app.services.conversation_sync import start_sync, sync_state
 from app.services.suppressions import (
     add_or_restore_suppression,
     list_suppressions,
@@ -323,7 +328,8 @@ def send_mailbox_test_email(
             detail="Тестовое письмо недоступно во время активной кампании",
         )
     try:
-        result = send_test_message(account, request.recipient, settings)
+        content = {key: value for key, value in {"subject": request.subject, "body": request.body}.items() if value is not None}
+        result = send_test_message(account, request.recipient, settings, **content)
     except (SenderAccountError, CredentialEncryptionError, SMTPDeliveryError) as exc:
         detail = exc.safe_message if isinstance(exc, SMTPDeliveryError) else str(exc)
         raise HTTPException(status_code=502, detail=detail) from exc
@@ -517,6 +523,9 @@ def update_company_status(
     if company.status != update.status:
         previous = company.status
         company.status = update.status
+        if update.status == "rejected":
+            from app.services.inbound_replies import reject_company
+            reject_company(db, company, reason="Отказ клиента, отмеченный вручную", now=datetime.now(timezone.utc))
         company.last_updated_at = datetime.now(timezone.utc)
         db.add(
             ActivityHistory(
@@ -713,6 +722,44 @@ def preview_email_template(
     }
 
 
+@app.get("/api/conversations")
+def get_conversations(search: str = Query(default="", max_length=200), unread: bool = False,
+                      page: int = Query(default=1, ge=1), db: Session = Depends(get_db)):
+    return conversation_list(db, search=search, unread=unread, page=page)
+
+
+@app.get("/api/conversations/sync")
+def get_conversation_sync(db: Session = Depends(get_db), settings: Settings = Depends(get_settings)):
+    return sync_state(db, settings)
+
+
+@app.post("/api/conversations/sync")
+def sync_conversations(background_tasks: BackgroundTasks, settings: Settings = Depends(get_settings)):
+    return start_sync(background_tasks, settings)
+
+
+@app.get("/api/companies/{company_id}/conversation")
+def get_conversation(company_id: int, db: Session = Depends(get_db)):
+    return conversation_detail(db, company_id)
+
+
+@app.post("/api/companies/{company_id}/conversation/read")
+def read_conversation(company_id: int, request: ConversationReadRequest, db: Session = Depends(get_db)):
+    return mark_read(db, company_id, request.through_id)
+
+
+@app.post("/api/companies/{company_id}/conversation/reply")
+def reply_to_conversation(company_id: int, request: ConversationReplyRequest, db: Session = Depends(get_db),
+                          settings: Settings = Depends(get_settings)):
+    return send_reply(db, company_id, request, settings)
+
+
+@app.post("/api/companies/{company_id}/conversation/attempts/{request_id}/resolve")
+def resolve_conversation_reply(company_id: int, request_id: str, request: UncertainDeliveryResolution,
+                                db: Session = Depends(get_db)):
+    return resolve_reply(db, company_id, request_id, request.outcome)
+
+
 @app.post("/api/companies/{company_id}/send-email")
 def send_company_email(
     company_id: int,
@@ -723,6 +770,8 @@ def send_company_email(
     company = db.get(Company, company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Компания не найдена")
+    if company.status == "rejected":
+        raise HTTPException(status_code=409, detail="Компания отказалась от дальнейших писем")
     recipients = _company_recipients(company, request.recipient)
     try:
         assert_manual_send_allowed(db, recipients[0], settings)
@@ -735,7 +784,7 @@ def send_company_email(
     sender_account = db.scalar(
         select(SenderAccount)
         .where(
-            SenderAccount.provider == "mailru_smtp",
+            SenderAccount.provider.in_(SMTP_SENDER_PROVIDERS),
             SenderAccount.smtp_enabled.is_(True),
             SenderAccount.is_active.is_(True),
             SenderAccount.verification_status == "verified",
@@ -743,7 +792,7 @@ def send_company_email(
         .order_by(SenderAccount.id.asc())
     )
     if sender_account is None:
-        raise HTTPException(status_code=503, detail="Нет проверенного активного ящика Mail.ru")
+        raise HTTPException(status_code=503, detail="Нет проверенного активного почтового ящика")
     sent_messages: list[tuple[str, str, str]] = []
     try:
         password = CredentialCipher(settings.mail_credentials_encryption_key).decrypt(
@@ -784,8 +833,10 @@ def send_company_email(
         db.commit()
         raise HTTPException(status_code=502, detail=reason) from exc
 
+    db.refresh(company, with_for_update=True)
     previous_status = company.status
-    company.status = "sent"
+    if company.status in ("new", "sent"):
+        company.status = "sent"
     company.last_updated_at = datetime.now(timezone.utc)
     for recipient, message_id, subject in sent_messages:
         db.add(
@@ -794,11 +845,13 @@ def send_company_email(
                 event_type="email_sent",
                 description=f"SMTP-сервер принял письмо на {recipient}",
                 from_status=previous_status,
-                to_status="sent",
+                to_status=company.status,
                 event_data={
                     "recipient": recipient,
                     "message_id": message_id,
                     "subject": subject,
+                    "body": body,
+                    "sender_email": sender_account.email,
                     "sender_account_id": sender_account.id,
                     "sent_copy_saved": result.sent_copy_saved,
                 },

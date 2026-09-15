@@ -96,7 +96,8 @@ class DaDataClient:
                                     stop_discovery=True, reason="rate_limit")
         if response.is_error:
             raise DiscoveryAPIError(f"DaData вернула ошибку HTTP {response.status_code}.",
-                                    stop_discovery=True, reason="http_error")
+                                    stop_discovery=True,
+                                    reason="service_unavailable" if response.is_server_error else "http_error")
         try:
             payload = response.json()
         except ValueError:

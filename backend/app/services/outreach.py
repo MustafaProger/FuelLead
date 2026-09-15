@@ -10,11 +10,13 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.mail_providers import SMTP_SENDER_PROVIDERS
 from app.config import Settings
 from app.database import SessionLocal
 from app.models import (
     ActivityHistory,
     Company,
+    CompanyEmail,
     EmailSuppression,
     OutreachCampaign,
     OutreachDelivery,
@@ -141,7 +143,7 @@ def _previously_contacted_addresses(db: Session) -> set[str]:
 
 
 def _verified_senders(db: Session) -> list[SenderAccount]:
-    return list(db.scalars(select(SenderAccount).where(SenderAccount.provider == "mailru_smtp", SenderAccount.smtp_enabled.is_(True), SenderAccount.is_active.is_(True), SenderAccount.verification_status == "verified", SenderAccount.encrypted_password.is_not(None)).order_by(SenderAccount.id.asc())).all())
+    return list(db.scalars(select(SenderAccount).where(SenderAccount.provider.in_(SMTP_SENDER_PROVIDERS), SenderAccount.smtp_enabled.is_(True), SenderAccount.is_active.is_(True), SenderAccount.verification_status == "verified", SenderAccount.encrypted_password.is_not(None)).order_by(SenderAccount.id.asc())).all())
 
 
 def select_outreach_candidates(db: Session, filters: CompanyFilters, settings: Settings) -> OutreachSelection:
@@ -290,7 +292,7 @@ def create_outreach_campaign(db: Session, filters: CompanyFilters, settings: Set
     preflight = build_outreach_preflight(db, filters, settings)
     if not preflight["snapshot_id"]:
         if not preflight["mailru_configured"]:
-            raise OutreachPolicyError("Нет проверенных активных ящиков Mail.ru")
+            raise OutreachPolicyError("Нет проверенных активных почтовых ящиков")
         raise OutreachPolicyError("Нет подходящих получателей")
     return confirm_outreach_campaign(db, preflight["snapshot_id"], settings)
 
@@ -408,6 +410,10 @@ def assert_manual_send_allowed(db: Session, recipient: str, settings: Settings, 
         raise OutreachPolicyError("Одиночная отправка недоступна, пока массовая рассылка активна")
     if normalize_email(recipient) in active_suppressed_addresses(db):
         raise OutreachPolicyError("Адрес находится в глобальных исключениях")
+    if db.scalar(select(Company.id).join(CompanyEmail).where(
+        Company.status == "rejected", func.lower(CompanyEmail.email) == normalize_email(recipient),
+    )):
+        raise OutreachPolicyError("Компания отказалась от дальнейших писем")
 
 
 def _reset_sender_day(account: SenderAccount, now: datetime, settings: Settings) -> None:
@@ -445,7 +451,7 @@ def _snapshot_range(
 
 
 def _pre_send_suppression_reason(db: Session, delivery: OutreachDelivery) -> str | None:
-    company = db.get(Company, delivery.company_id) if delivery.company_id else None
+    company = db.get(Company, delivery.company_id, populate_existing=True) if delivery.company_id else None
     if company is None:
         return "Компания удалена"
     if not company.is_active:
@@ -500,6 +506,7 @@ def _schedule_round_rest(campaign: OutreachCampaign, now: datetime, settings: Se
     )
     minutes = random_int(minimum, maximum)
     campaign.status = "cooldown"
+    campaign.pause_reason = None
     campaign.sender_position = 0
     campaign.batch_position = 0
     campaign.current_batch_target = 0
@@ -510,17 +517,37 @@ def _schedule_round_rest(campaign: OutreachCampaign, now: datetime, settings: Se
     return float(minutes * 60)
 
 
+def _wait_for_senders(db: Session, campaign: OutreachCampaign, now: datetime, settings: Settings, random_int: Callable[[int, int], int]) -> float:
+    accounts = [db.get(SenderAccount, sender_id) for sender_id in campaign.sender_account_ids or []]
+    recoverable = [account for account in accounts if account and account.is_active and account.smtp_enabled and account.encrypted_password and account.verification_status in ("verified", "temporary_error")]
+    if not recoverable:
+        campaign.status = "paused"
+        campaign.pause_reason = "Нет доступных ящиков рассылки. Исправьте ошибку в настройках почты, успешно проверьте ящик и нажмите «Продолжить»"
+        campaign.next_send_at = None
+        campaign.round_rest_until = None
+        campaign.sender_position = 0
+        campaign.batch_position = 0
+        campaign.current_batch_target = 0
+        campaign.current_batch_sender_id = None
+        campaign.current_interval_seconds = None
+        return float(settings.outreach_worker_poll_seconds)
+    delay = _schedule_round_rest(campaign, now, settings, random_int)
+    if all(account.verification_status == "temporary_error" for account in recoverable):
+        campaign.pause_reason = "Временная ошибка почтовых ящиков. Соединение будет проверено автоматически; получатели сохранены в очереди"
+    elif all(account.sent_today >= _snapshot_sender_limit(campaign, account) for account in recoverable):
+        campaign.pause_reason = "Достигнут суточный лимит доступных ящиков. Отправка продолжится после обновления лимита"
+    return delay
+
+
 def _sender_for_current_position(db: Session, campaign: OutreachCampaign, settings: Settings, now: datetime) -> SenderAccount | None:
     sender_ids = campaign.sender_account_ids or []
     while campaign.sender_position < len(sender_ids):
         account = db.get(SenderAccount, sender_ids[campaign.sender_position])
         if account:
             _reset_sender_day(account, now, settings)
-            if account.verification_status == "temporary_error" and account.blocked_until_round is not None and campaign.current_round > account.blocked_until_round:
-                account.verification_status = "verified"
-                account.verification_error = None
-                account.verification_error_category = None
-                account.verification_retry_at = None
+            # A round counter is a sending cooldown, not proof that SMTP works.
+            # Only the login-only health check can restore verification.
+            if account.verification_status == "verified" and account.blocked_until_round is not None and campaign.current_round > account.blocked_until_round:
                 account.blocked_until_round = None
                 account.block_reason = None
         daily_limit = _snapshot_sender_limit(campaign, account) if account else 0
@@ -566,7 +593,7 @@ def _claim_next_delivery(db: Session, campaign: OutreachCampaign, settings: Sett
             return None
         account = _sender_for_current_position(db, campaign, settings, now)
         if account is None:
-            _schedule_round_rest(campaign, now, settings, random_int)
+            _wait_for_senders(db, campaign, now, settings, random_int)
             db.commit()
             return None
         queued_count = db.scalar(select(func.count(OutreachDelivery.id)).where(OutreachDelivery.campaign_id == campaign.id, OutreachDelivery.status == "queued")) or 0
@@ -619,12 +646,13 @@ def _apply_accepted(db: Session, delivery: OutreachDelivery, campaign: OutreachC
     account.block_reason = None
     campaign.last_sent_at = now
     campaign.batch_position += 1
-    company = db.get(Company, delivery.company_id) if delivery.company_id else None
+    company = db.get(Company, delivery.company_id, populate_existing=True, with_for_update=True) if delivery.company_id else None
     if company is not None:
         previous_status = company.status
-        company.status = "sent"
+        if company.status == "new":
+            company.status = "sent"
         company.last_updated_at = now
-        db.add(ActivityHistory(company=company, event_type="email_sent", description=f"SMTP-сервер принял письмо на {delivery.recipient}", from_status=previous_status, to_status="sent", event_data={"recipient": delivery.recipient, "message_id": result.message_id, "campaign_id": campaign.id, "sender_account_id": account.id, "smtp_code": result.smtp_code, "sent_copy_saved": result.sent_copy_saved}, created_at=now))
+        db.add(ActivityHistory(company=company, event_type="email_sent", description=f"SMTP-сервер принял письмо на {delivery.recipient}", from_status=previous_status, to_status=company.status, event_data={"recipient": delivery.recipient, "message_id": result.message_id, "campaign_id": campaign.id, "sender_account_id": account.id, "smtp_code": result.smtp_code, "sent_copy_saved": result.sent_copy_saved}, created_at=now))
     batch_completed = campaign.batch_position >= campaign.current_batch_target
     if batch_completed and campaign.current_batch_target == account.current_batch_size:
         account.successful_full_batches += 1
@@ -647,7 +675,7 @@ def _apply_accepted(db: Session, delivery: OutreachDelivery, campaign: OutreachC
     return float(seconds)
 
 
-def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: OutreachCampaign, account: SenderAccount, error: SMTPDeliveryError, now: datetime, settings: Settings, random_int: Callable[[int, int], int]) -> float:
+def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: OutreachCampaign, account: SenderAccount, error: SMTPDeliveryError, now: datetime, settings: Settings, random_int: Callable[[int, int], int], *, update_account_health: bool = True) -> float:
     was_stopped = campaign.status == "stopped"
     delivery.claim_token = None
     delivery.smtp_code = error.smtp_code
@@ -659,23 +687,33 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
             campaign.status = "interrupted"
             campaign.pause_reason = "Есть SMTP-попытка с неопределённым результатом. Автоповтор запрещён"
         campaign.next_send_at = None
-        account.blocked_until_round = campaign.current_round + 3
-        account.block_reason = "Неопределённый результат SMTP-попытки"
+        if update_account_health:
+            account.blocked_until_round = campaign.current_round + 3
+            account.block_reason = "Неопределённый результат SMTP-попытки"
     elif error.permanent_recipient_failure:
         delivery.status = "bounced"
         _record_bounce_suppression(db, delivery, error.smtp_code, now)
         mark_company_send_failed(db, delivery.company_id, delivery.recipient, error.safe_message, campaign_id=campaign.id, occurred_at=now)
         _advance_sender(campaign)
         campaign.next_send_at = now
-    else:
+    elif error.category in ("recipient", "content"):
+        # A recipient quota or message-content rejection says nothing about
+        # the sender's credentials. Keep the account available for other leads.
         delivery.status = "failed"
-        account.blocked_until_round = campaign.current_round + 3
-        account.block_reason = error.safe_message
-        account.verification_status = "blocked" if error.category == "auth" else "temporary_error" if error.category in ("connection", "timeout", "temporary") else "failed"
-        account.verification_error = error.safe_message
-        account.verification_error_category = error.category
-        account.verification_retry_at = now + timedelta(minutes=5) if account.verification_status == "temporary_error" else None
         mark_company_send_failed(db, delivery.company_id, delivery.recipient, error.safe_message, campaign_id=campaign.id, occurred_at=now)
+        _advance_sender(campaign)
+        campaign.next_send_at = now
+    else:
+        # The server definitely did not accept this message. A mailbox failure
+        # must not consume a lead; another healthy sender can use this row.
+        delivery.status = "cancelled" if was_stopped else "queued"
+        if update_account_health:
+            account.blocked_until_round = campaign.current_round + 3
+            account.block_reason = error.safe_message
+            account.verification_status = "blocked" if error.category == "auth" else "temporary_error" if error.category in ("connection", "timeout", "temporary") else "failed"
+            account.verification_error = error.safe_message
+            account.verification_error_category = error.category
+            account.verification_retry_at = now + timedelta(minutes=5) if account.verification_status == "temporary_error" else None
         _advance_sender(campaign)
         campaign.next_send_at = now
     _sync_campaign_counts(campaign)
@@ -684,10 +722,10 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
         campaign.next_send_at = None
         campaign.round_rest_until = None
         return float(settings.outreach_worker_poll_seconds)
-    if error.uncertain or _complete_if_done(campaign, now):
+    if error.uncertain or _complete_if_done(campaign, now) or campaign.status == "paused":
         return float(settings.outreach_worker_poll_seconds)
     if campaign.sender_position >= len(campaign.sender_account_ids or []):
-        return _schedule_round_rest(campaign, now, settings, random_int)
+        return _wait_for_senders(db, campaign, now, settings, random_int)
     return 1.0
 
 
@@ -712,27 +750,35 @@ def process_outreach_tick(settings: Settings, *, sender_factory: Callable = Mail
         delivery, account, token = claim
         delivery_id, campaign_id, account_id = delivery.id, campaign.id, account.id
         recipient, subject, body = delivery.recipient, delivery.subject, delivery.body
+    send_started = False
+    used_password = None
+    checked_at = None
     try:
         with factory() as credential_db:
             stored_account = credential_db.get(SenderAccount, account_id)
             if stored_account is None:
                 raise CredentialEncryptionError("Ящик удалён до отправки")
-            password = CredentialCipher(settings.mail_credentials_encryption_key).decrypt(stored_account.encrypted_password)
+            used_password = stored_account.encrypted_password
+            checked_at = stored_account.verification_checked_at
+            password = CredentialCipher(settings.mail_credentials_encryption_key).decrypt(used_password)
             client = sender_factory(
                 stored_account,
                 password,
                 timeout_seconds=settings.mail_smtp_timeout_seconds,
                 imap_timeout_seconds=settings.mail_imap_timeout_seconds,
             )
+            send_started = True
             result = client.send(recipient, subject, body, delivery_id=delivery_id, campaign_id=campaign_id)
             if isinstance(result, str):
                 result = SMTPAccepted(result, "250", "accepted")
     except SMTPDeliveryError as exc:
         error, result = exc, None
-    except (CredentialEncryptionError, ValueError):
+    except CredentialEncryptionError:
         error, result = SMTPDeliveryError("Не удалось безопасно использовать пароль ящика", category="credentials"), None
     except Exception:
-        error, result = SMTPDeliveryError("Неизвестная ошибка SMTP-транспорта", category="provider"), None
+        # An unclassified failure after entering send may follow DATA acceptance.
+        # Without a known SMTP rejection, a retry could deliver a duplicate.
+        error, result = SMTPDeliveryError("Неизвестная ошибка SMTP-транспорта", category="uncertain" if send_started else "provider", uncertain=send_started), None
     finished_at = effective_now if now is not None else datetime.now(timezone.utc)
     with factory() as db:
         delivery = db.scalar(select(OutreachDelivery).where(OutreachDelivery.id == delivery_id, OutreachDelivery.claim_token == token).with_for_update())
@@ -746,7 +792,8 @@ def process_outreach_tick(settings: Settings, *, sender_factory: Callable = Mail
             delay = _apply_accepted(db, delivery, campaign, account, result, finished_at, settings, random_int)
             outcome = "accepted"
         else:
-            delay = _apply_smtp_error(db, delivery, campaign, account, error, finished_at, settings, random_int)
+            unchanged_health = account.encrypted_password == used_password and _aware(account.verification_checked_at) == _aware(checked_at)
+            delay = _apply_smtp_error(db, delivery, campaign, account, error, finished_at, settings, random_int, update_account_health=unchanged_health)
             outcome = delivery.status
         db.commit()
         logger.info("smtp_attempt_finished campaign_id=%s delivery_id=%s sender_account_id=%s outcome=%s", campaign_id, delivery_id, account_id, outcome)

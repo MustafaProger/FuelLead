@@ -169,6 +169,11 @@ class CheckoClient:
                 stop_discovery=True,
                 reason="rate_limit",
             )
+        if response.is_server_error:
+            return CheckoAPIError(
+                f"Checko временно недоступен (HTTP {response.status_code}).",
+                stop_discovery=True, reason="service_unavailable",
+            )
         if response.is_error:
             return CheckoAPIError(provider_message or f"Checko вернул ошибку HTTP {response.status_code}.")
         if meta.get("status") == "error":

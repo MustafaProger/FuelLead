@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from collections import deque
 import time
 from collections.abc import Callable
 from typing import TypeVar
@@ -42,6 +43,7 @@ CATEGORY_RULES = [
     ("construction", ("41.20", "43.11", "43.12")),
 ]
 MAX_SEARCH_PAGES_PER_QUERY_RUN = 2
+TRANSIENT_PROVIDER_ERRORS = {"timeout", "connection_error", "service_unavailable"}
 PROVIDER_LABELS = {"checko": "Checko", "okvedo": "Okvedo", "dadata": "DaData", "api_fns": "API-ФНС"}
 T = TypeVar("T")
 
@@ -79,10 +81,14 @@ def _provider_call(db: Session, run: SearchRun, operation: str, call: Callable[[
         try:
             return call()
         except DiscoveryAPIError as exc:
-            if not full or exc.reason != "rate_limit" or attempt == 3:
+            if not full or exc.reason not in TRANSIENT_PROVIDER_ERRORS | {"rate_limit"} or attempt == 3:
                 raise
-            delay = max(60 * (attempt + 1), exc.retry_after_seconds or 0)
-            run.progress_message = f"Провайдер ограничил частоту. Продолжим автоматически через {delay:g} сек."
+            delay = max(
+                60 * (attempt + 1) if exc.reason == "rate_limit" else 2 ** (attempt + 1),
+                exc.retry_after_seconds or 0,
+            )
+            problem = "Провайдер ограничил частоту" if exc.reason == "rate_limit" else "Временный сбой источника"
+            run.progress_message = f"{problem}. Повторим запрос через {delay:g} сек."
             db.commit()
             _wait_for_provider(db, run, delay)
     raise AssertionError("Unreachable")
@@ -381,183 +387,217 @@ def discover_new_companies(
     search_requests = 0
     company_requests = 0
 
-    for code in run.requested_okved_codes:
-        for region_code in TARGET_REGION_CODES:
-            cursor = _get_discovery_cursor(
-                db,
-                provider=provider,
-                okved_code=code,
-                region_code=region_code,
-                page_size=cursor_page_size,
-            )
-            candidate_attempts = 0
-            pages_scanned = 0
-            visited_pages: set[int] = set()
-            page_fingerprints: set[tuple[str, ...]] = set()
+    queries = [(code, region) for code in dict.fromkeys(run.requested_okved_codes)
+               for region in TARGET_REGION_CODES]
+    if full:
+        last_visits = {
+            (cursor.okved_code, cursor.region_code): cursor.updated_at
+            for cursor in db.scalars(select(DiscoveryCursor).where(DiscoveryCursor.provider == provider))
+        }
+        queries.sort(key=lambda query: (
+            last_visits[query].replace(tzinfo=timezone.utc).timestamp()
+            if query in last_visits else float("-inf")
+        ))
+    pending_queries = deque((code, region, set(), set()) for code, region in queries)
+    transient_query_failures = 0
 
-            while (
-                full or (candidate_attempts < limit_per_code
-                and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN)
-            ):
-                _check_cancelled(db, run)
-                requested_page = cursor.next_page
-                if requested_page in visited_pages:
-                    raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
-                                            stop_discovery=True, reason="pagination_stalled")
-                run.progress_message = f"{PROVIDER_LABELS[provider]} · ОКВЭД {code} · регион {region_code} · страница {requested_page}"
+    while pending_queries:
+        code, region_code, visited_pages, page_fingerprints = pending_queries.popleft()
+        cursor = _get_discovery_cursor(
+            db,
+            provider=provider,
+            okved_code=code,
+            region_code=region_code,
+            page_size=cursor_page_size,
+        )
+        candidate_attempts = 0
+        pages_scanned = 0
+        # Touch even empty or failed queries so they cannot monopolize later runs.
+        cursor.updated_at = utcnow()
+        db.commit()
+
+        while (
+            full or (candidate_attempts < limit_per_code
+            and pages_scanned < MAX_SEARCH_PAGES_PER_QUERY_RUN)
+        ):
+            _check_cancelled(db, run)
+            requested_page = cursor.next_page
+            if requested_page in visited_pages:
+                raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
+                                        stop_discovery=True, reason="pagination_stalled")
+            run.progress_message = f"{PROVIDER_LABELS[provider]} · ОКВЭД {code} · регион {region_code} · страница {requested_page}"
+            db.commit()
+            if max_search_requests is not None and search_requests >= max_search_requests:
+                run.errors_count += 1
+                run.error_message = (
+                    "Достигнут безопасный лимит API-ФНС. "
+                    f"Лимит search на один запуск: {max_search_requests}. "
+                    "Курсор сохранён для продолжения."
+                )
                 db.commit()
-                if max_search_requests is not None and search_requests >= max_search_requests:
+                return True
+            search_requests += 1
+            try:
+                search_page = _provider_call(db, run, "search_requests", lambda: client.search_by_okved(
+                    code, region_code=region_code, limit=page_size, page=requested_page,
+                ))
+            except DiscoveryAPIError as exc:
+                if full and exc.reason in TRANSIENT_PROVIDER_ERRORS and transient_query_failures < 2:
+                    transient_query_failures += 1
+                    run.errors_count += 1
+                    run.error_message = str(exc)
+                    db.commit()
+                    break
+                if exc.stop_discovery and propagate_stop_errors:
+                    db.commit()
+                    raise
+                run.errors_count += 1
+                run.error_message = str(exc)
+                db.commit()
+                if exc.stop_discovery:
+                    return True
+                break
+
+            pages_scanned += 1
+            fingerprint = tuple(str(record.get("ИНН") or "") for record in search_page.records)
+            if full and fingerprint and fingerprint in page_fingerprints:
+                raise DiscoveryAPIError("Провайдер повторяет содержимое страницы. Позиция сохранена.",
+                                        stop_discovery=True, reason="pagination_stalled")
+            page_fingerprints.add(fingerprint)
+            if search_page.current_page in visited_pages:
+                raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
+                                        stop_discovery=True, reason="pagination_stalled")
+            visited_pages.add(search_page.current_page)
+            if search_page.current_page != requested_page:
+                cursor.next_page = search_page.current_page
+                cursor.next_record_index = 0
+
+            start_index = min(cursor.next_record_index, len(search_page.records))
+            wrapped_cycle = (
+                _advance_cursor_after_record(cursor, search_page, start_index)
+                if start_index == len(search_page.records) and search_page.records
+                else False
+            )
+            retry_current_record = False
+
+            for record_index in range(start_index, len(search_page.records)):
+                record = search_page.records[record_index]
+                record_region = str(record.get("РегионКод") or "").strip()
+                inn = str(record.get("ИНН") or "").strip()
+
+                if record_region and record_region not in TARGET_REGION_CODES:
+                    run.skipped_region += 1
+                    wrapped_cycle = _advance_cursor_after_record(
+                        cursor, search_page, record_index + 1
+                    )
+                    continue
+                if not inn or inn in known_inns or inn in seen_inns:
+                    if inn in known_inns:
+                        run.skipped_known += 1
+                    wrapped_cycle = _advance_cursor_after_record(
+                        cursor, search_page, record_index + 1
+                    )
+                    continue
+
+                if max_company_requests is not None and company_requests >= max_company_requests:
                     run.errors_count += 1
                     run.error_message = (
                         "Достигнут безопасный лимит API-ФНС. "
-                        f"Лимит search на один запуск: {max_search_requests}. "
+                        f"Лимит egr на один запуск: {max_company_requests}. "
                         "Курсор сохранён для продолжения."
                     )
                     db.commit()
                     return True
-                search_requests += 1
+                _check_cancelled(db, run)
+                seen_inns.add(inn)
+                run.candidates_found += 1
+                candidate_attempts += 1
+                company_requests += 1
                 try:
-                    search_page = _provider_call(db, run, "search_requests", lambda: client.search_by_okved(
-                        code, region_code=region_code, limit=page_size, page=requested_page,
-                    ))
+                    payload = _provider_call(db, run, "company_requests", lambda: client.get_company(inn))
+                    if not payload.is_active:
+                        run.skipped_inactive += 1
+                    elif is_target_region(payload):
+                        with db.begin_nested():
+                            _, created = upsert_company(
+                                db,
+                                payload,
+                                source=source,
+                                provider=provider,
+                            )
+                        _advance_cursor_after_record(cursor, search_page, record_index + 1)
+                        if created:
+                            known_inns.add(inn)
+                        _update_run_counter(db, run, created=created)
+                        wrapped_cycle = cursor.next_page == 1 and cursor.next_record_index == 0
+                        if not full and candidate_attempts >= limit_per_code:
+                            break
+                        continue
+                    elif payload.region_code or payload.region_name:
+                        run.skipped_region += 1
+                    else:
+                        run.skipped_unknown_region += 1
                 except DiscoveryAPIError as exc:
+                    if exc.reason == "not_found":
+                        # A permanently absent card must not pin this query
+                        # to the same INN on every subsequent click.
+                        run.errors_count += 1
+                        run.error_message = str(exc)
+                        wrapped_cycle = _advance_cursor_after_record(cursor, search_page, record_index + 1)
+                        db.commit()
+                        if not full and candidate_attempts >= limit_per_code:
+                            break
+                        continue
+                    seen_inns.discard(inn)
+                    if full and exc.reason in TRANSIENT_PROVIDER_ERRORS and transient_query_failures < 2:
+                        transient_query_failures += 1
+                        run.errors_count += 1
+                        run.error_message = str(exc)
+                        db.commit()
+                        retry_current_record = True
+                        break
                     if exc.stop_discovery and propagate_stop_errors:
                         db.commit()
                         raise
                     run.errors_count += 1
                     run.error_message = str(exc)
                     db.commit()
+                    retry_current_record = True
                     if exc.stop_discovery:
                         return True
                     break
+                except SQLAlchemyError as exc:
+                    run.errors_count += 1
+                    run.error_message = str(exc)
+                    db.commit()
+                    retry_current_record = True
+                    break
+                except ValueError as exc:
+                    run.errors_count += 1
+                    run.error_message = str(exc)
 
-                pages_scanned += 1
-                fingerprint = tuple(str(record.get("ИНН") or "") for record in search_page.records)
-                if full and fingerprint and fingerprint in page_fingerprints:
-                    raise DiscoveryAPIError("Провайдер повторяет содержимое страницы. Позиция сохранена.",
-                                            stop_discovery=True, reason="pagination_stalled")
-                page_fingerprints.add(fingerprint)
-                if search_page.current_page in visited_pages:
-                    raise DiscoveryAPIError("Провайдер повторяет страницу выдачи. Позиция сохранена.",
-                                            stop_discovery=True, reason="pagination_stalled")
-                visited_pages.add(search_page.current_page)
-                if search_page.current_page != requested_page:
-                    cursor.next_page = search_page.current_page
-                    cursor.next_record_index = 0
-
-                start_index = min(cursor.next_record_index, len(search_page.records))
-                wrapped_cycle = (
-                    _advance_cursor_after_record(cursor, search_page, start_index)
-                    if start_index == len(search_page.records) and search_page.records
-                    else False
+                wrapped_cycle = _advance_cursor_after_record(
+                    cursor, search_page, record_index + 1
                 )
-                retry_current_record = False
-
-                for record_index in range(start_index, len(search_page.records)):
-                    record = search_page.records[record_index]
-                    record_region = str(record.get("РегионКод") or "").strip()
-                    inn = str(record.get("ИНН") or "").strip()
-
-                    if record_region and record_region not in TARGET_REGION_CODES:
-                        run.skipped_region += 1
-                        wrapped_cycle = _advance_cursor_after_record(
-                            cursor, search_page, record_index + 1
-                        )
-                        continue
-                    if not inn or inn in known_inns or inn in seen_inns:
-                        if inn in known_inns:
-                            run.skipped_known += 1
-                        wrapped_cycle = _advance_cursor_after_record(
-                            cursor, search_page, record_index + 1
-                        )
-                        continue
-
-                    if max_company_requests is not None and company_requests >= max_company_requests:
-                        run.errors_count += 1
-                        run.error_message = (
-                            "Достигнут безопасный лимит API-ФНС. "
-                            f"Лимит egr на один запуск: {max_company_requests}. "
-                            "Курсор сохранён для продолжения."
-                        )
-                        db.commit()
-                        return True
-                    _check_cancelled(db, run)
-                    seen_inns.add(inn)
-                    run.candidates_found += 1
-                    candidate_attempts += 1
-                    company_requests += 1
-                    try:
-                        payload = _provider_call(db, run, "company_requests", lambda: client.get_company(inn))
-                        if not payload.is_active:
-                            run.skipped_inactive += 1
-                        elif is_target_region(payload):
-                            with db.begin_nested():
-                                _, created = upsert_company(
-                                    db,
-                                    payload,
-                                    source=source,
-                                    provider=provider,
-                                )
-                            _advance_cursor_after_record(cursor, search_page, record_index + 1)
-                            if created:
-                                known_inns.add(inn)
-                            _update_run_counter(db, run, created=created)
-                            wrapped_cycle = cursor.next_page == 1 and cursor.next_record_index == 0
-                            if not full and candidate_attempts >= limit_per_code:
-                                break
-                            continue
-                        elif payload.region_code or payload.region_name:
-                            run.skipped_region += 1
-                        else:
-                            run.skipped_unknown_region += 1
-                    except DiscoveryAPIError as exc:
-                        if exc.reason == "not_found":
-                            # A permanently absent card must not pin this query
-                            # to the same INN on every subsequent click.
-                            run.errors_count += 1
-                            run.error_message = str(exc)
-                            wrapped_cycle = _advance_cursor_after_record(cursor, search_page, record_index + 1)
-                            db.commit()
-                            if not full and candidate_attempts >= limit_per_code:
-                                break
-                            continue
-                        if exc.stop_discovery and propagate_stop_errors:
-                            db.commit()
-                            raise
-                        run.errors_count += 1
-                        run.error_message = str(exc)
-                        db.commit()
-                        retry_current_record = True
-                        if exc.stop_discovery:
-                            return True
-                        break
-                    except SQLAlchemyError as exc:
-                        run.errors_count += 1
-                        run.error_message = str(exc)
-                        db.commit()
-                        retry_current_record = True
-                        break
-                    except ValueError as exc:
-                        run.errors_count += 1
-                        run.error_message = str(exc)
-
-                    wrapped_cycle = _advance_cursor_after_record(
-                        cursor, search_page, record_index + 1
-                    )
-                    db.commit()
-                    if not full and candidate_attempts >= limit_per_code:
-                        break
-
-                if retry_current_record:
-                    break
-                if not search_page.records:
-                    cursor.next_page = 1
-                    cursor.next_record_index = 0
-                    db.commit()
-                    break
                 db.commit()
-                if (not full and candidate_attempts >= limit_per_code) or wrapped_cycle:
+                if not full and candidate_attempts >= limit_per_code:
                     break
+
+            if retry_current_record:
+                break
+            transient_query_failures = 0
+            if not search_page.records:
+                cursor.next_page = 1
+                cursor.next_record_index = 0
+                db.commit()
+                break
+            db.commit()
+            if (not full and candidate_attempts >= limit_per_code) or wrapped_cycle:
+                break
+
+            if full:
+                pending_queries.append((code, region_code, visited_pages, page_fingerprints))
+                break
 
     return False
 
@@ -763,7 +803,10 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
                 run.status = "cancelled"
             run.progress_message = (
                 "Поиск остановлен. Найденные компании и позиция сохранены."
-                if run.status == "cancelled" else "Проход завершён. Следующий запуск продолжит с сохранённых позиций."
+                if run.status == "cancelled" else
+                "Поиск выполнен частично: есть ошибки источников. Позиции сохранены для продолжения."
+                if run.errors_count else
+                "Доступная выдача пройдена. Следующий запуск начнёт с давно не проверявшихся направлений."
             )
             run.active_provider = None
             run.completed_at = utcnow()

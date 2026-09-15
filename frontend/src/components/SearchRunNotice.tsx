@@ -34,6 +34,10 @@ const resultLabels: Record<string, string> = {
   rate_limit: "ограничение частоты после повторных попыток",
   timeout: "не ответил вовремя",
   connection_error: "ошибка соединения",
+  service_unavailable: "сбой сервера источника после повторных попыток",
+  invalid_key: "ключ отклонён",
+  keys_unavailable: "настроенные ключи недоступны: проверьте доступ и лимиты",
+  access_denied: "источник отклонил доступ",
   pagination_stalled: "провайдер повторяет страницу",
 };
 
@@ -135,7 +139,7 @@ export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, 
           run.status === "completed" || run.status === "cancelled" ? (
             <Notice
               tone={run.errors_count ? "warning" : "success"}
-              title={run.status === "cancelled" ? "Поиск остановлен, результат сохранён" : run.errors_count ? "Поиск завершён с предупреждениями" : "Поиск завершён"}
+              title={run.status === "cancelled" ? "Поиск остановлен, результат сохранён" : run.errors_count ? "Поиск выполнен частично, результат сохранён" : "Поиск завершён"}
               description={completedDescription(run)}
               onClose={onCloseRun}
             />

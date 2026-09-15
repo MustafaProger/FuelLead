@@ -259,9 +259,11 @@ export interface OutreachCampaign {
 
 export type SenderVerificationStatus = "unverified" | "verified" | "failed" | "blocked" | "temporary_error";
 
+export type SmtpSenderProvider = "mailru_smtp" | "gmail_smtp" | "yandex_smtp";
+
 export interface SenderAccount {
   id: number;
-  provider: "mailru_smtp" | "gmail_api";
+  provider: SmtpSenderProvider | "gmail_api";
   email: string;
   display_name: string;
   smtp_host: string;
@@ -303,4 +305,58 @@ export interface EmailSuppression {
   lifted_at: string | null;
   comment: string | null;
   active: boolean;
+}
+
+export interface ConversationSummary {
+  company_id: number;
+  company_name: string;
+  status: CompanyStatus;
+  sender: string;
+  subject: string;
+  preview: string;
+  received_at: string;
+  unread_count: number;
+}
+
+export interface ConversationList {
+  items: ConversationSummary[];
+  total: number;
+  page: number;
+  unread_count: number;
+}
+
+export interface ConversationMessage {
+  id: string;
+  reply_id?: number | null;
+  direction: "incoming" | "outgoing";
+  status: "received" | "accepted" | "sending" | "failed" | "uncertain";
+  sender: string;
+  recipient: string;
+  subject: string;
+  body: string;
+  preview?: string;
+  legacy?: boolean;
+  attachments: string[];
+  created_at: string;
+  unread: boolean;
+  reply_recipient?: string | null;
+  reply_sender?: string | null;
+  reply_disabled_reason?: string | null;
+  sent_copy_saved?: boolean | null;
+  error?: string | null;
+}
+
+export interface ConversationDetail {
+  company_id: number;
+  company_name: string;
+  company_status: CompanyStatus;
+  messages: ConversationMessage[];
+  latest_reply_id: number | null;
+}
+
+export interface ConversationReplyResult {
+  request_id: string;
+  status: "accepted" | "sending" | "failed" | "uncertain";
+  error: string | null;
+  sent_copy_saved: boolean | null;
 }

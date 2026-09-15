@@ -329,7 +329,7 @@ def test_stop_is_irreversible_and_cancels_queued(db):
     assert {item.status for item in campaign.deliveries} == {"cancelled"}
 
 
-def test_temporary_sender_error_stops_batch_blocks_three_rounds_and_next_sender_continues(db):
+def test_temporary_sender_error_preserves_recipient_and_verified_sender_waits_three_rounds(db):
     RecordingSMTP.sent = []
     settings = settings_with_key()
     first = add_sender(db, settings, "one@mail.ru")
@@ -359,8 +359,17 @@ def test_temporary_sender_error_stops_batch_blocks_three_rounds_and_next_sender_
     db.expire_all()
     assert db.get(SenderAccount, first.id).blocked_until_round == 4
     assert db.get(SenderAccount, first.id).verification_status == "temporary_error"
+    assert current.deliveries[0].status == "queued"
+    assert current.failed_count == 0
     tick_at_schedule(db, settings, FirstFails, now)
-    assert RecordingSMTP.sent[-1][0] == "two@mail.ru"
+    assert RecordingSMTP.sent[-1] == ("two@mail.ru", "temporary1@example.ru")
+    # The independent login-only health worker proves recovery; it must retain
+    # the sending cooldown until the three skipped rounds have passed.
+    first.verification_status = "verified"
+    first.verification_error = None
+    first.verification_error_category = None
+    first.verification_retry_at = None
+    db.commit()
 
     for _ in range(40):
         tick_at_schedule(db, settings, FirstFails, now)
@@ -377,6 +386,181 @@ def test_temporary_sender_error_stops_batch_blocks_three_rounds_and_next_sender_
     assert db.get(SenderAccount, first.id).verification_status == "verified"
     assert db.get(SenderAccount, first.id).blocked_until_round is None
     assert db.get(SenderAccount, first.id).block_reason is None
+
+
+@pytest.mark.parametrize("category", ["auth", "credentials", "connection", "timeout", "temporary", "tls", "provider"])
+def test_sender_failure_keeps_only_recipient_queued_for_another_account(db, category):
+    RecordingSMTP.sent = []
+    settings = settings_with_key()
+    broken = add_sender(db, settings, "broken@mail.ru")
+    healthy = add_sender(db, settings, "healthy@mail.ru")
+    company = add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+
+    class BrokenFirst(RecordingSMTP):
+        def send(self, *args, **kwargs):
+            if self.account.id == broken.id:
+                raise SMTPDeliveryError("Ошибка ящика", category=category)
+            return super().send(*args, **kwargs)
+
+    tick_at_schedule(db, settings, BrokenFirst, now)
+    assert campaign.deliveries[0].status == "queued"
+    assert campaign.failed_count == 0
+    assert company.status == "new"
+    assert not db.query(EmailSuppression).count()
+    tick_at_schedule(db, settings, BrokenFirst, now)
+    assert campaign.deliveries[0].status == "accepted"
+    assert campaign.deliveries[0].sender_account_id == healthy.id
+    assert campaign.status == "completed"
+    assert broken.sent_today == 0
+    assert healthy.sent_today == 1
+
+
+def test_all_auth_blocked_pauses_and_password_repair_can_resume_same_recipient(db):
+    RecordingSMTP.sent = []
+    settings = settings_with_key()
+    account = add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+
+    class AuthFailure(RecordingSMTP):
+        def send(self, *_args, **_kwargs):
+            raise SMTPDeliveryError("Неверный пароль", category="auth")
+
+    tick_at_schedule(db, settings, AuthFailure, now)
+    assert campaign.status == "paused"
+    assert "Нет доступных ящиков" in campaign.pause_reason
+    assert campaign.next_send_at is None
+    assert campaign.deliveries[0].status == "queued"
+    assert campaign.deliveries[0].claim_token is None
+    account.verification_status = "verified"
+    account.verification_error = None
+    account.verification_error_category = None
+    account.blocked_until_round = None
+    db.commit()
+    resume_outreach_campaign(db, campaign)
+    tick_at_schedule(db, settings, RecordingSMTP, now)
+    assert campaign.status == "completed"
+    assert RecordingSMTP.sent == [("one@mail.ru", "lead@example.ru")]
+
+
+def test_round_expiry_never_promotes_an_unverified_temporary_sender(db):
+    settings = settings_with_key()
+    account = add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+    account.verification_status = "temporary_error"
+    account.verification_error = "Временная ошибка"
+    account.verification_error_category = "connection"
+    account.blocked_until_round = 4
+    campaign.current_round = 5
+    db.commit()
+
+    class MustNotSend(RecordingSMTP):
+        def send(self, *_args, **_kwargs):
+            pytest.fail("Only a successful health check may restore verification")
+
+    tick_at_schedule(db, settings, MustNotSend, now)
+    assert account.verification_status == "temporary_error"
+    assert campaign.status == "cooldown"
+    assert "проверено автоматически" in campaign.pause_reason
+    assert campaign.deliveries[0].status == "queued"
+
+
+@pytest.mark.parametrize("category", ["recipient", "content"])
+def test_recipient_or_content_error_keeps_sender_healthy_and_address_unsuppressed(db, category):
+    RecordingSMTP.sent = []
+    settings = settings_with_key()
+    account = add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="full@example.ru")
+    add_company(db, 2, email="good@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+
+    class FirstRejected(RecordingSMTP):
+        def send(self, recipient, *args, **kwargs):
+            if recipient == "full@example.ru":
+                raise SMTPDeliveryError("Отклонено для получателя", category=category)
+            return super().send(recipient, *args, **kwargs)
+
+    tick_at_schedule(db, settings, FirstRejected, now)
+    assert campaign.deliveries[0].status == "failed"
+    assert account.verification_status == "verified"
+    assert account.verification_error is None
+    assert account.blocked_until_round is None
+    assert not db.query(EmailSuppression).count()
+    tick_at_schedule(db, settings, FirstRejected, now)
+    assert RecordingSMTP.sent == [("one@mail.ru", "good@example.ru")]
+    assert campaign.status == "completed"
+
+
+@pytest.mark.parametrize("changed_field", ["password", "verification"])
+def test_late_auth_error_does_not_overwrite_repaired_account(db, changed_field):
+    settings = settings_with_key()
+    account = add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+
+    class RepairDuringSend(RecordingSMTP):
+        def send(self, *_args, **_kwargs):
+            with factory() as other_db:
+                updated = other_db.get(SenderAccount, account.id)
+                if changed_field == "password":
+                    updated.encrypted_password = CredentialCipher(settings.mail_credentials_encryption_key).encrypt("replacement")
+                else:
+                    updated.verification_checked_at = datetime.now(timezone.utc)
+                updated.verification_status = "verified"
+                updated.blocked_until_round = None
+                updated.verification_error = None
+                other_db.commit()
+            raise SMTPDeliveryError("Старый пароль отклонён", category="auth")
+
+    tick_at_schedule(db, settings, RepairDuringSend, datetime.now(timezone.utc))
+    assert account.verification_status == "verified"
+    assert account.verification_error is None
+    assert account.blocked_until_round is None
+    assert campaign.deliveries[0].status == "queued"
+
+
+def test_unclassified_error_inside_send_is_uncertain_and_never_retried(db):
+    settings = settings_with_key()
+    account = add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+
+    class UnknownAfterSend(RecordingSMTP):
+        def send(self, *_args, **_kwargs):
+            raise ValueError("Could occur after DATA acceptance")
+
+    tick_at_schedule(db, settings, UnknownAfterSend, datetime.now(timezone.utc))
+    assert campaign.status == "interrupted"
+    assert campaign.deliveries[0].status == "uncertain"
+    assert account.verification_status == "verified"
+
+
+@pytest.mark.parametrize("action", ["pause", "stop"])
+def test_user_action_during_definite_sender_failure_is_preserved(db, action):
+    settings = settings_with_key()
+    add_sender(db, settings, "one@mail.ru")
+    add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+
+    class PauseOrStopDuringSend(RecordingSMTP):
+        def send(self, *_args, **_kwargs):
+            with factory() as other_db:
+                active = other_db.get(OutreachCampaign, campaign.id)
+                (pause_outreach_campaign if action == "pause" else stop_outreach_campaign)(other_db, active)
+            raise SMTPDeliveryError("Временная ошибка", category="connection")
+
+    tick_at_schedule(db, settings, PauseOrStopDuringSend, datetime.now(timezone.utc))
+    assert campaign.status == ("paused" if action == "pause" else "stopped")
+    assert campaign.deliveries[0].status == ("queued" if action == "pause" else "cancelled")
+    assert campaign.worker_claim_token is None
 
 
 def test_permanent_recipient_bounce_is_suppressed_and_campaign_continues(db):

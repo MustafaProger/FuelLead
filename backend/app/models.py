@@ -60,7 +60,7 @@ OUTREACH_DELIVERY_STATUSES = (
     "suppressed",
     "cancelled",
 )
-SENDER_PROVIDERS = ("gmail_api", "mailru_smtp")
+SENDER_PROVIDERS = ("gmail_api", "mailru_smtp", "gmail_smtp", "yandex_smtp")
 SENDER_VERIFICATION_STATUSES = (
     "unverified",
     "verified",
@@ -262,7 +262,7 @@ class SenderAccount(Base):
     __tablename__ = "sender_accounts"
     __table_args__ = (
         CheckConstraint(
-            "provider IN ('gmail_api','mailru_smtp')",
+            "provider IN ('gmail_api','mailru_smtp','gmail_smtp','yandex_smtp')",
             name="ck_sender_accounts_provider",
         ),
         CheckConstraint(
@@ -304,6 +304,7 @@ class SenderAccount(Base):
     block_reason: Mapped[str | None] = mapped_column(Text)
     last_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     imap_last_uid: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    imap_uidvalidity: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False, index=True
     )
@@ -331,6 +332,17 @@ class EmailSuppression(Base):
     )
     lifted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     comment: Mapped[str | None] = mapped_column(Text)
+
+
+class ImapReplyFolder(Base):
+    __tablename__ = "imap_reply_folders"
+    __table_args__ = (UniqueConstraint("sender_account_id", "mailbox", name="uq_imap_reply_folder"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sender_account_id: Mapped[int] = mapped_column(ForeignKey("sender_accounts.id", ondelete="CASCADE"), index=True)
+    mailbox: Mapped[str] = mapped_column(String(500), nullable=False)
+    uidvalidity: Mapped[int | None] = mapped_column(BigInteger)
+    last_uid: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
 
 
 class ImapProcessedMessage(Base):
@@ -462,3 +474,22 @@ class OutreachDelivery(Base):
     sender_account: Mapped["SenderAccount | None"] = relationship(
         foreign_keys=[sender_account_id], lazy="selectin"
     )
+
+
+class EmailReplyAttempt(Base):
+    """Durable manual-send receipt: a lost HTTP response must never resend mail."""
+    __tablename__ = "email_reply_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    company_id: Mapped[int] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), index=True)
+    reply_id: Mapped[int] = mapped_column(Integer)
+    sender_account_id: Mapped[int | None] = mapped_column(ForeignKey("sender_accounts.id", ondelete="SET NULL"), index=True)
+    sender_email: Mapped[str] = mapped_column(String(320))
+    recipient: Mapped[str] = mapped_column(String(320))
+    subject: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    message_id: Mapped[str] = mapped_column(String(255), unique=True)
+    status: Mapped[str] = mapped_column(String(20), default="sending", index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    sent_copy_saved: Mapped[bool | None] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

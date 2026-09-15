@@ -1,23 +1,22 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.mail_providers import MAIL_PROVIDERS, SMTP_SENDER_PROVIDERS
 from app.config import Settings
-from app.models import OutreachCampaign, OutreachDelivery, SenderAccount
+from app.models import EmailReplyAttempt, OutreachCampaign, OutreachDelivery, SenderAccount
 from app.schemas import SenderAccountCreate, SenderAccountUpdate
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
-from app.services.imap_bounces import IMAPCollectorError, MailruIMAPClient
+from app.services.imap_bounces import IMAPCollectorError, MailruIMAPClient, imap_failure_status
 from app.services.smtp import MailruSMTPClient, SMTPAccepted, SMTPDeliveryError
 
 
-MAILRU_SMTP_HOST = "smtp.mail.ru"
-MAILRU_SMTP_PORT = 465
-MAILRU_IMAP_HOST = "imap.mail.ru"
-MAILRU_IMAP_PORT = 993
 ACTIVE_CAMPAIGN_STATUSES = ("running", "paused", "cooldown", "interrupted")
+logger = logging.getLogger("fuellead.mail_health")
 
 
 class SenderAccountError(RuntimeError):
@@ -70,15 +69,16 @@ def create_sender_account(
     settings: Settings,
 ) -> SenderAccount:
     cipher = CredentialCipher(settings.mail_credentials_encryption_key)
+    preset = MAIL_PROVIDERS[data.provider]
     account = SenderAccount(
-        provider="mailru_smtp",
+        provider=data.provider,
         email=data.email,
         display_name=data.display_name.strip(),
         encrypted_password=cipher.encrypt(data.password),
-        smtp_host=MAILRU_SMTP_HOST,
-        smtp_port=MAILRU_SMTP_PORT,
-        imap_host=MAILRU_IMAP_HOST,
-        imap_port=MAILRU_IMAP_PORT,
+        smtp_host=preset.smtp_host,
+        smtp_port=preset.smtp_port,
+        imap_host=preset.imap_host,
+        imap_port=preset.imap_port,
         smtp_enabled=data.smtp_enabled,
         imap_enabled=data.imap_enabled,
         is_active=True,
@@ -140,6 +140,11 @@ def _password(account: SenderAccount, settings: Settings) -> str:
     )
 
 
+def _revision(account: SenderAccount, fields: tuple[str, ...]) -> tuple:
+    values = (getattr(account, field) for field in fields)
+    return tuple(value.replace(tzinfo=None) if isinstance(value, datetime) else value for value in values)
+
+
 def verify_sender_account(
     db: Session,
     account: SenderAccount,
@@ -147,8 +152,14 @@ def verify_sender_account(
     *,
     smtp_client_factory: Callable = MailruSMTPClient,
     imap_client_factory: Callable = MailruIMAPClient,
+    preserve_round_block: bool = False,
 ) -> SenderAccount:
-    original_updated_at = account.updated_at
+    connection_fields = ("encrypted_password", "email", "smtp_host", "smtp_port", "imap_host", "imap_port", "smtp_enabled", "imap_enabled", "is_active")
+    smtp_fields = ("verification_status", "verification_error", "verification_error_category", "verification_checked_at", "verification_retry_at", "blocked_until_round", "block_reason", "last_sent_at")
+    imap_fields = ("imap_verification_status", "imap_verification_error", "imap_verification_checked_at")
+    original_connection = _revision(account, connection_fields)
+    original_smtp = _revision(account, smtp_fields)
+    original_imap = _revision(account, imap_fields)
     status, error, category = "verified", None, None
     imap_status, imap_error = "disabled", None
     try:
@@ -173,25 +184,29 @@ def verify_sender_account(
                 pass
             imap_status = "verified"
         except IMAPCollectorError as exc:
-            imap_status, imap_error = ("temporary_error" if exc.category in ("connection", "timeout", "temporary") else "failed"), str(exc)
+            imap_status, imap_error = imap_failure_status(exc.category), str(exc)
     elif account.imap_enabled:
         imap_status, imap_error = "failed", error
-    # A password replacement or send finishing during a slow check wins.
+    # Independent IMAP polling must not discard a slow SMTP check. A changed
+    # password or newer SMTP outcome still wins; only hold the lock to persist.
     db.refresh(account, with_for_update=True)
-    if account.updated_at.replace(tzinfo=None) != original_updated_at.replace(tzinfo=None):
+    if _revision(account, connection_fields) != original_connection:
+        db.commit()
         return account
     timestamp = datetime.now(timezone.utc)
-    account.verification_status = status
-    account.verification_error = error
-    account.verification_error_category = category
-    account.verification_retry_at = timestamp + timedelta(minutes=5) if status == "temporary_error" else None
-    account.imap_verification_status = imap_status
-    account.imap_verification_error = imap_error
-    account.imap_verification_checked_at = timestamp if account.imap_enabled else None
-    if status == "verified":
-        account.blocked_until_round = None
-        account.block_reason = None
-    account.verification_checked_at = timestamp
+    if _revision(account, smtp_fields) == original_smtp:
+        account.verification_status = status
+        account.verification_error = error
+        account.verification_error_category = category
+        account.verification_retry_at = timestamp + timedelta(minutes=5) if status == "temporary_error" else None
+        if status == "verified" and not preserve_round_block:
+            account.blocked_until_round = None
+            account.block_reason = None
+        account.verification_checked_at = timestamp
+    if _revision(account, imap_fields) == original_imap:
+        account.imap_verification_status = imap_status
+        account.imap_verification_error = imap_error
+        account.imap_verification_checked_at = timestamp if account.imap_enabled else None
     account.updated_at = timestamp
     db.commit()
     db.refresh(account)
@@ -199,21 +214,31 @@ def verify_sender_account(
 
 
 def recover_temporary_sender_accounts(settings: Settings, *, session_factory=None, smtp_client_factory=MailruSMTPClient, imap_client_factory=MailruIMAPClient) -> None:
-    """Login-only recovery outside active campaign cooldowns; never send or requeue."""
+    """Login-only recovery, including paused campaigns; retain their round rest."""
     from app.database import SessionLocal
-    with (session_factory or SessionLocal)() as db:
-        now = datetime.now(timezone.utc)
-        accounts = list(db.scalars(select(SenderAccount).where(
-            SenderAccount.provider == "mailru_smtp",
+    factory = session_factory or SessionLocal
+    now = datetime.now(timezone.utc)
+    with factory() as db:
+        account_ids = list(db.scalars(select(SenderAccount.id).where(
+            SenderAccount.provider.in_(SMTP_SENDER_PROVIDERS),
             SenderAccount.is_active.is_(True), SenderAccount.smtp_enabled.is_(True),
             SenderAccount.verification_status == "temporary_error",
             SenderAccount.verification_error_category.in_(("connection", "timeout", "temporary")),
-            SenderAccount.verification_retry_at <= now,
+            or_(SenderAccount.verification_retry_at <= now,
+                (SenderAccount.verification_retry_at.is_(None) & or_(SenderAccount.verification_checked_at.is_(None), SenderAccount.verification_checked_at <= now - timedelta(minutes=5)))),
         )).all())
-        for account in accounts:
-            if sender_used_by_active_campaign(db, account.id):
-                continue
-            verify_sender_account(db, account, settings, smtp_client_factory=smtp_client_factory, imap_client_factory=imap_client_factory)
+    for account_id in account_ids:
+        try:
+            with factory() as db:
+                account = db.get(SenderAccount, account_id)
+                if not account or not account.is_active or not account.smtp_enabled or account.verification_status != "temporary_error":
+                    continue
+                verify_sender_account(db, account, settings,
+                    smtp_client_factory=smtp_client_factory, imap_client_factory=imap_client_factory,
+                    preserve_round_block=sender_used_by_active_campaign(db, account.id))
+        except Exception as exc:
+            # One bad mailbox/database session must not starve all later checks.
+            logger.warning("mail_health_check_failed account_id=%s error_type=%s", account_id, type(exc).__name__)
 
 
 def send_test_message(
@@ -222,6 +247,8 @@ def send_test_message(
     settings: Settings,
     *,
     smtp_client_factory: Callable = MailruSMTPClient,
+    subject: str | None = None,
+    body: str | None = None,
 ) -> SMTPAccepted:
     if not account.is_active or not account.smtp_enabled:
         raise SenderAccountError("Ящик приостановлен или SMTP отключён")
@@ -234,12 +261,15 @@ def send_test_message(
     )
     return client.send(
         recipient,
-        "FuelLead — проверка Mail.ru SMTP",
-        "Это одиночное тестовое письмо FuelLead. Рассылка компаниям не запускалась.",
+        subject or "FuelLead — проверка почты SMTP",
+        body or "Это одиночное тестовое письмо FuelLead. Рассылка компаниям не запускалась.",
     )
 
 
 def sender_used_by_active_campaign(db: Session, account_id: int) -> bool:
+    if db.scalar(select(EmailReplyAttempt.id).where(EmailReplyAttempt.sender_account_id == account_id,
+                                                  EmailReplyAttempt.status.in_(("sending", "uncertain")))):
+        return True
     campaigns = list(
         db.scalars(
             select(OutreachCampaign).where(

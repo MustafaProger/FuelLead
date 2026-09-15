@@ -121,7 +121,8 @@ class OkvedoClient:
                                     stop_discovery=True, reason="access_denied")
         if response.is_error:
             raise DiscoveryAPIError(f"Okvedo вернул ошибку HTTP {response.status_code}.",
-                                    stop_discovery=True, reason="http_error")
+                                    stop_discovery=True,
+                                    reason="service_unavailable" if response.is_server_error else "http_error")
         if "data" not in payload or payload.get("errors"):
             raise DiscoveryAPIError("Okvedo вернул ответ без корректных данных.",
                                     stop_discovery=True, reason="invalid_response")

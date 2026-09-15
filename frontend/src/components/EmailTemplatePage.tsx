@@ -128,7 +128,7 @@ export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageP
         <div><h1>Шаблон письма</h1><p>Один шаблон для персональных писем каждой компании</p></div>
         <div className={`integration-chip ${mailConfigured ? "integration-chip--ready" : "integration-chip--warning"}`}>
           {mailConfigured ? <CheckCircle2 size={17} /> : <Mail size={17} />}
-          <span>{mailConfigured ? "Mail.ru SMTP готов" : "Mail.ru SMTP не настроен"}<small>Ящик выбирает планировщик</small></span>
+          <span>{mailConfigured ? "Почта SMTP готов" : "Почта SMTP не настроен"}<small>Ящик выбирает планировщик</small></span>
         </div>
       </header>
 
@@ -202,7 +202,7 @@ export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageP
                   <Send size={17} /> {sending ? "Отправляем…" : "Отправить письмо"}
                 </button>
               </div>
-              {!mailConfigured ? <p className="send-disabled-copy">Добавьте и проверьте Mail.ru ящик, чтобы активировать отправку. Редактор и предпросмотр уже работают.</p> : null}
+              {!mailConfigured ? <p className="send-disabled-copy">Добавьте и проверьте почтовый ящик, чтобы активировать отправку. Редактор и предпросмотр уже работают.</p> : null}
             </>
           ) : (
             <div className="template-empty"><Mail size={24} /><h3>Нет компаний с email</h3><p>После поиска компании с найденным адресом появятся здесь.</p><a className="button button--secondary" href="#companies">Перейти к компаниям</a></div>

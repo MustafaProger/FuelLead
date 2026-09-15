@@ -1,9 +1,9 @@
 import { discoveryProviderLabels } from "../discoveryProviders";
 import { useEffect, useRef, useState } from "react";
-import { Ban, Building2, CheckCircle2, Inbox, LayoutDashboard, LogOut, Mail } from "lucide-react";
+import { Ban, Building2, CheckCircle2, Inbox, LayoutDashboard, LogOut, Mail, MessagesSquare } from "lucide-react";
 import type { DiscoveryProvider } from "../types";
 
-export type AppPage = "dashboard" | "companies" | "template" | "mailboxes" | "suppressions";
+export type AppPage = "dashboard" | "companies" | "template" | "mailboxes" | "suppressions" | "conversations";
 
 interface AppSidebarProps {
   activePage: AppPage;
@@ -11,17 +11,19 @@ interface AppSidebarProps {
   mailboxesConfigured: boolean;
   userEmail: string;
   onLogout: () => void;
+  unreadReplies?: number;
 }
 
 const navigation = [
   { page: "dashboard" as const, label: "Обзор", icon: LayoutDashboard },
   { page: "companies" as const, label: "Компании", icon: Building2 },
+  { page: "conversations" as const, label: "Переписка", icon: MessagesSquare },
   { page: "template" as const, label: "Шаблон письма", icon: Mail },
   { page: "mailboxes" as const, label: "Почтовые ящики", icon: Inbox },
   { page: "suppressions" as const, label: "Исключения", icon: Ban },
 ];
 
-export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, onLogout }: AppSidebarProps) {
+export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, onLogout, unreadReplies = 0 }: AppSidebarProps) {
   const providerLabel = discoveryProviderLabels[mode];
   const [menuOpen, setMenuOpen] = useState(false);
   const sidebarRef = useRef<HTMLElement>(null);
@@ -99,6 +101,7 @@ export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, o
             >
               <Icon size={20} strokeWidth={1.9} />
               <span>{label}</span>
+              {page === "conversations" && unreadReplies > 0 ? <span className="mail-unread-badge" aria-label={`${unreadReplies} непрочитанных ответов`}>{unreadReplies}</span> : null}
             </a>
           ))}
         </nav>
@@ -110,7 +113,7 @@ export function AppSidebar({ activePage, mode, mailboxesConfigured, userEmail, o
           </div>
           <div className={`sidebar-status ${mailboxesConfigured ? "" : "sidebar-status--muted"}`}>
             <Mail size={17} />
-            <span>{mailboxesConfigured ? "Mail.ru готов" : "Mail.ru не настроен"}</span>
+            <span>{mailboxesConfigured ? "Почта готова" : "Почта не настроена"}</span>
           </div>
         </div>
 

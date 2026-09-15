@@ -37,6 +37,63 @@ def create_database() -> None:
     )
     _upgrade_discovery_cursor_schema(models.DiscoveryCursor)
     _upgrade_search_run_schema()
+    _upgrade_imap_uidvalidity_schema()
+    _upgrade_sqlite_sender_providers()
+
+
+def _upgrade_sqlite_sender_providers() -> None:
+    """Expand the provider check, retaining all columns, indexes and child FKs."""
+    if engine.dialect.name != "sqlite":
+        return
+    from sqlalchemy.schema import CreateTable
+    from app.models import SenderAccount
+
+    with engine.connect() as connection:
+        checks = inspect(connection).get_check_constraints("sender_accounts")
+        provider_check = next((c for c in checks if c.get("name") == "ck_sender_accounts_provider"), None)
+        if provider_check and all(p in provider_check["sqltext"] for p in ("gmail_smtp", "yandex_smtp")):
+            return
+        foreign_keys = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.commit()
+        try:
+            # Explicit BEGIN keeps DDL and the data copy atomic in sqlite3.
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            indexes = connection.exec_driver_sql(
+                "SELECT sql FROM sqlite_master WHERE tbl_name='sender_accounts' "
+                "AND type IN ('index','trigger') AND sql IS NOT NULL"
+            ).scalars().all()
+            ddl = str(CreateTable(SenderAccount.__table__).compile(connection))
+            connection.exec_driver_sql(ddl.replace("CREATE TABLE sender_accounts", "CREATE TABLE sender_accounts_upgrade", 1))
+            quote = connection.dialect.identifier_preparer.quote
+            columns = ", ".join(quote(c["name"]) for c in inspect(connection).get_columns("sender_accounts"))
+            connection.exec_driver_sql(f"INSERT INTO sender_accounts_upgrade ({columns}) SELECT {columns} FROM sender_accounts")
+            connection.exec_driver_sql("DROP TABLE sender_accounts")
+            connection.exec_driver_sql("ALTER TABLE sender_accounts_upgrade RENAME TO sender_accounts")
+            for statement in indexes:
+                connection.exec_driver_sql(statement)
+            if connection.exec_driver_sql("PRAGMA foreign_key_check(sender_accounts)").all():
+                raise RuntimeError("Sender provider migration failed foreign-key validation")
+            connection.commit()
+        finally:
+            if connection.in_transaction():
+                connection.rollback()
+            connection.exec_driver_sql(f"PRAGMA foreign_keys={int(foreign_keys)}")
+            connection.commit()
+
+
+def _upgrade_imap_uidvalidity_schema() -> None:
+    """Keep existing local SQLite mailboxes usable after the additive upgrade."""
+    if engine.dialect.name == "postgresql":
+        return  # The versioned migration is serialized with backend/worker startup.
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        if "sender_accounts" not in inspector.get_table_names():
+            return
+        columns = {column["name"] for column in inspector.get_columns("sender_accounts")}
+        if "imap_uidvalidity" not in columns:
+            connection.exec_driver_sql("ALTER TABLE sender_accounts ADD COLUMN imap_uidvalidity BIGINT")
 
 
 def _upgrade_search_run_schema() -> None:
@@ -99,6 +156,12 @@ def _run_postgresql_migrations() -> None:
         health_version = "20260910_mail_health"
         if not connection.execute(text("SELECT 1 FROM schema_migrations WHERE version = :version"), {"version": health_version}).scalar():
             connection.exec_driver_sql(migration_path.with_name(f"{health_version}.sql").read_text(encoding="utf-8"))
+        uidvalidity_version = "20260911_imap_uidvalidity"
+        if not connection.execute(text("SELECT 1 FROM schema_migrations WHERE version = :version"), {"version": uidvalidity_version}).scalar():
+            connection.exec_driver_sql(migration_path.with_name(f"{uidvalidity_version}.sql").read_text(encoding="utf-8"))
+        providers_version = "20260914_mail_providers"
+        if not connection.execute(text("SELECT 1 FROM schema_migrations WHERE version = :version"), {"version": providers_version}).scalar():
+            connection.exec_driver_sql(migration_path.with_name(f"{providers_version}.sql").read_text(encoding="utf-8"))
 
 
 def _upgrade_company_status_schema(company_model, statuses, removed_statuses) -> None:

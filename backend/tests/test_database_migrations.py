@@ -126,3 +126,64 @@ def test_postgresql_mail_scheduler_migration_preserves_legacy_rows():
     assert "DROP CONSTRAINT IF EXISTS ck_outreach_campaigns_status" in sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_one_active_outreach_campaign" in sql
     assert "DROP TABLE" not in sql.upper()
+
+
+def test_imap_namespace_upgrade_is_additive_and_idempotent(tmp_path, monkeypatch):
+    legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy-mail.db'}")
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE sender_accounts (id INTEGER PRIMARY KEY, email TEXT NOT NULL, imap_last_uid BIGINT NOT NULL)")
+        connection.exec_driver_sql("INSERT INTO sender_accounts VALUES (1, 'sender@mail.ru', 123)")
+        connection.exec_driver_sql("CREATE TABLE imap_processed_messages (id INTEGER PRIMARY KEY, sender_account_id INTEGER NOT NULL REFERENCES sender_accounts(id), uid BIGINT NOT NULL)")
+        connection.exec_driver_sql("INSERT INTO imap_processed_messages VALUES (1, 1, 123)")
+    monkeypatch.setattr(database, "engine", legacy_engine)
+
+    database._upgrade_imap_uidvalidity_schema()
+    database._upgrade_imap_uidvalidity_schema()
+
+    with legacy_engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT id, email, imap_last_uid, imap_uidvalidity FROM sender_accounts").one() == (1, "sender@mail.ru", 123, None)
+        assert connection.exec_driver_sql("SELECT sender_account_id, uid FROM imap_processed_messages").one() == (1, 123)
+
+
+def test_postgresql_imap_namespace_migration_preserves_existing_cursors():
+    sql = (Path(__file__).parents[1] / "app" / "migrations" / "20260911_imap_uidvalidity.sql").read_text(encoding="utf-8")
+    assert "ADD COLUMN IF NOT EXISTS imap_uidvalidity BIGINT" in sql
+    assert "20260911_imap_uidvalidity" in sql
+    assert "DELETE " not in sql.upper()
+    assert "UPDATE " not in sql.upper()
+    assert "DROP " not in sql.upper()
+
+
+def test_sqlite_provider_upgrade_preserves_mailbox_and_delivery_links(tmp_path, monkeypatch):
+    from app.models import SenderAccount
+    from sqlalchemy.schema import CreateTable
+    from sqlalchemy.orm import Session
+    legacy_engine = create_engine(f"sqlite:///{tmp_path / 'providers.db'}")
+    ddl = str(CreateTable(SenderAccount.__table__).compile(legacy_engine)).replace(
+        "'gmail_api','mailru_smtp','gmail_smtp','yandex_smtp'", "'gmail_api','mailru_smtp'"
+    )
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql(ddl)
+        connection.exec_driver_sql('CREATE UNIQUE INDEX ix_sender_accounts_email ON sender_accounts(email)')
+        connection.exec_driver_sql('CREATE TABLE delivery_links (id INTEGER PRIMARY KEY, sender_account_id INTEGER REFERENCES sender_accounts(id))')
+    with Session(legacy_engine) as session:
+        session.add(SenderAccount(email='owner@mail.ru', encrypted_password='fake-cipher', sent_today=23, imap_last_uid=400, imap_uidvalidity=19))
+        session.commit()
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql('INSERT INTO delivery_links VALUES (1, 1)')
+        before = connection.exec_driver_sql('SELECT * FROM sender_accounts').all()
+    monkeypatch.setattr(database, 'engine', legacy_engine)
+    database._upgrade_sqlite_sender_providers()
+    database._upgrade_sqlite_sender_providers()
+    with legacy_engine.connect() as connection:
+        assert connection.exec_driver_sql('SELECT * FROM sender_accounts').all() == before
+        assert connection.exec_driver_sql('SELECT * FROM delivery_links').all() == [(1, 1)]
+        assert connection.exec_driver_sql('PRAGMA foreign_key_check').all() == []
+        assert inspect(connection).get_foreign_keys('delivery_links')[0]['referred_table'] == 'sender_accounts'
+        assert inspect(connection).get_indexes('sender_accounts')[0]['unique']
+    with Session(legacy_engine) as session:
+        session.add_all([SenderAccount(provider='gmail_smtp', email='new@gmail.com'), SenderAccount(provider='yandex_smtp', email='new@ya.ru')])
+        session.commit()
+    with pytest.raises(IntegrityError), Session(legacy_engine) as session:
+        session.add(SenderAccount(provider='unknown', email='no@example.org'))
+        session.commit()
