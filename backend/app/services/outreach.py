@@ -8,7 +8,7 @@ from typing import Callable
 from uuid import uuid4
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, object_session
+from sqlalchemy.orm import Session, lazyload, object_session
 
 from app.mail_providers import SMTP_SENDER_PROVIDERS
 from app.config import Settings
@@ -149,12 +149,20 @@ def _verified_senders(db: Session) -> list[SenderAccount]:
 
 
 def select_outreach_candidates(db: Session, filters: CompanyFilters, settings: Settings) -> OutreachSelection:
-    companies = list(db.scalars(build_company_query(filters, settings.timezone).order_by(Company.first_discovered_at.asc(), Company.id.asc())).all())
+    # Recipient selection needs company fields and emails, not every company's
+    # full activity history, phone contacts and additional OKVED records.
+    query = build_company_query(filters, settings.timezone).options(
+        lazyload(Company.history),
+        lazyload(Company.contacts),
+        lazyload(Company.additional_okveds),
+    ).order_by(Company.first_discovered_at.asc(), Company.id.asc())
+    companies = list(db.scalars(query).all())
     template = get_or_create_email_template(db)
     contacted = _previously_contacted_addresses(db)
     suppressed = active_suppressed_addresses(db)
     selected_addresses: set[str] = set()
     candidates: list[OutreachCandidate] = []
+    eligible_count = 0
     skipped = Counter({"not_new": 0, "inactive": 0, "without_email": 0, "already_contacted": 0, "duplicate_address": 0, "suppressed": 0})
     for company in companies:
         is_not_new = company.status != "new"
@@ -178,12 +186,15 @@ def select_outreach_candidates(db: Session, filters: CompanyFilters, settings: S
         if recipient in selected_addresses:
             skipped["duplicate_address"] += 1
             continue
+        selected_addresses.add(recipient)
+        eligible_count += 1
+        if len(candidates) >= settings.outreach_batch_limit:
+            continue
         values = company_template_values(company, recipient, settings)
         subject = render_email_template(template.subject_template, values).strip()
         body = append_opt_out_footer(render_email_template(template.body_template, values), settings)
-        selected_addresses.add(recipient)
         candidates.append(OutreachCandidate(company.id, company.name, company.inn, recipient, recipient.rsplit("@", 1)[1], subject, body))
-    return OutreachSelection(len(companies), len(candidates), tuple(candidates[: settings.outreach_batch_limit]), dict(skipped))
+    return OutreachSelection(len(companies), eligible_count, tuple(candidates), dict(skipped))
 
 
 def outreach_policy_dict(settings: Settings) -> dict:

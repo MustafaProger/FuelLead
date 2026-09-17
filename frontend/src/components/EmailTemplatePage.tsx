@@ -1,29 +1,17 @@
-import { CheckCircle2, Info, Mail, RotateCcw, Save, Send } from "lucide-react";
+import { CheckCircle2, Info, Save } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { Company, EmailPreview, EmailTemplate } from "../types";
+import type { EmailTemplate } from "../types";
 import { Notice } from "./Notice";
-
-interface EmailTemplatePageProps {
-  mailConfigured: boolean;
-  onSent: () => void;
-}
 
 type TemplateField = "subject" | "body";
 
-export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageProps) {
+export function EmailTemplatePage() {
   const [template, setTemplate] = useState<EmailTemplate | null>(null);
   const [subjectTemplate, setSubjectTemplate] = useState("");
   const [bodyTemplate, setBodyTemplate] = useState("");
-  const [companies, setCompanies] = useState<Company[]>([]);
-  const [companyId, setCompanyId] = useState<number | null>(null);
-  const [recipient, setRecipient] = useState("");
-  const [preview, setPreview] = useState<EmailPreview | null>(null);
-  const [finalSubject, setFinalSubject] = useState("");
-  const [finalBody, setFinalBody] = useState("");
   const [activeField, setActiveField] = useState<TemplateField>("body");
   const [saving, setSaving] = useState(false);
-  const [sending, setSending] = useState(false);
   const [saved, setSaved] = useState(true);
   const [notice, setNotice] = useState<{ tone: "error" | "success" | "warning"; title: string; description?: string } | null>(null);
   const subjectRef = useRef<HTMLInputElement>(null);
@@ -31,55 +19,19 @@ export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageP
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([
-      api.emailTemplate(),
-      api.companies({ status: "", hasEmail: "true", emailProvider: "", category: "", discoveredOn: "", search: "" }, 1, 100),
-    ]).then(([templateResponse, companiesResponse]) => {
+    api.emailTemplate().then((templateResponse) => {
       if (cancelled) return;
       setTemplate(templateResponse);
       setSubjectTemplate(templateResponse.subject_template);
       setBodyTemplate(templateResponse.body_template);
-      setCompanies(companiesResponse.items);
-      const first = companiesResponse.items[0];
-      if (first) {
-        setCompanyId(first.id);
-        setRecipient(first.emails[0]?.email || "");
-      }
     }).catch((requestError) => {
       if (!cancelled) setNotice({ tone: "error", title: "Не удалось открыть шаблон", description: requestError instanceof Error ? requestError.message : undefined });
     });
     return () => { cancelled = true; };
   }, []);
 
-  useEffect(() => {
-    if (!companyId || !subjectTemplate || !bodyTemplate) return;
-    const timer = window.setTimeout(() => {
-      api.previewEmail(companyId, subjectTemplate, bodyTemplate, recipient)
-        .then((response) => {
-          setPreview(response);
-          setFinalSubject(response.subject);
-          setFinalBody(response.body);
-          setNotice((current) => current?.tone === "error" ? null : current);
-        })
-        .catch((requestError) => setNotice({
-          tone: "error",
-          title: "Не удалось собрать письмо",
-          description: requestError instanceof Error ? requestError.message : undefined,
-        }));
-    }, 220);
-    return () => window.clearTimeout(timer);
-  }, [companyId, recipient, subjectTemplate, bodyTemplate]);
-
-  const selectedCompany = companies.find((company) => company.id === companyId) || null;
-
   const updateSubject = (value: string) => { setSubjectTemplate(value); setSaved(false); };
   const updateBody = (value: string) => { setBodyTemplate(value); setSaved(false); };
-
-  const handleCompanyChange = (nextId: number) => {
-    const company = companies.find((item) => item.id === nextId);
-    setCompanyId(nextId);
-    setRecipient(company?.emails[0]?.email || "");
-  };
 
   const insertVariable = (token: string) => {
     const ref = activeField === "subject" ? subjectRef.current : bodyRef.current;
@@ -108,28 +60,10 @@ export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageP
     }
   };
 
-  const sendEmail = async () => {
-    if (!companyId || !preview) return;
-    setSending(true);
-    try {
-      const response = await api.sendEmail(companyId, preview.recipient, finalSubject, finalBody);
-      setNotice({ tone: "success", title: "Письмо отправлено", description: `${response.recipient} · отправлено одно персональное письмо.` });
-      onSent();
-    } catch (requestError) {
-      setNotice({ tone: "error", title: "Не удалось отправить письмо", description: requestError instanceof Error ? requestError.message : undefined });
-    } finally {
-      setSending(false);
-    }
-  };
-
   return (
     <div className="content-page template-page">
       <header className="page-header">
         <div><h1>Шаблон письма</h1><p>Один шаблон для персональных писем каждой компании</p></div>
-        <div className={`integration-chip ${mailConfigured ? "integration-chip--ready" : "integration-chip--warning"}`}>
-          {mailConfigured ? <CheckCircle2 size={17} /> : <Mail size={17} />}
-          <span>{mailConfigured ? "Почта SMTP готов" : "Почта SMTP не настроен"}<small>Ящик выбирает планировщик</small></span>
-        </div>
       </header>
 
       {notice ? <Notice {...notice} onClose={() => setNotice(null)} /> : null}
@@ -169,45 +103,6 @@ export function EmailTemplatePage({ mailConfigured, onSent }: EmailTemplatePageP
           </div>
         </section>
 
-        <section className="template-panel company-email-panel">
-          <div className="template-panel-heading"><h2>Письмо компании</h2><p>Это письмо можно изменить отдельно перед отправкой.</p></div>
-          {companies.length ? (
-            <>
-              <label className="form-field">
-                <span>Компания</span>
-                <select value={companyId || ""} onChange={(event) => handleCompanyChange(Number(event.target.value))}>
-                  {companies.map((company) => <option key={company.id} value={company.id}>{company.name}</option>)}
-                </select>
-              </label>
-              <label className="form-field">
-                <span>Получатель</span>
-                <select value={recipient} onChange={(event) => setRecipient(event.target.value)}>
-                  {(selectedCompany?.emails || []).map((email) => <option key={email.id} value={email.email}>{email.email}</option>)}
-                </select>
-              </label>
-              <div className="one-off-hint"><Info size={16} /><span>Правки ниже относятся только к этому письму и не меняют основной шаблон.</span></div>
-              <label className="form-field">
-                <span>Тема письма</span>
-                <input value={finalSubject} onChange={(event) => setFinalSubject(event.target.value)} />
-              </label>
-              <label className="form-field form-field--grow">
-                <span>Текст письма</span>
-                <textarea className="final-body-input" value={finalBody} onChange={(event) => setFinalBody(event.target.value)} />
-              </label>
-              <div className="send-actions">
-                <button className="button button--secondary" type="button" onClick={() => { setFinalSubject(preview?.subject || ""); setFinalBody(preview?.body || ""); }}>
-                  <RotateCcw size={17} /> Вернуть шаблон
-                </button>
-                <button className="button button--primary" type="button" disabled={!mailConfigured || !preview || sending || !finalSubject.trim() || !finalBody.trim()} onClick={sendEmail}>
-                  <Send size={17} /> {sending ? "Отправляем…" : "Отправить письмо"}
-                </button>
-              </div>
-              {!mailConfigured ? <p className="send-disabled-copy">Добавьте и проверьте почтовый ящик, чтобы активировать отправку. Редактор и предпросмотр уже работают.</p> : null}
-            </>
-          ) : (
-            <div className="template-empty"><Mail size={24} /><h3>Нет компаний с email</h3><p>После поиска компании с найденным адресом появятся здесь.</p><a className="button button--secondary" href="#companies">Перейти к компаниям</a></div>
-          )}
-        </section>
       </div>
     </div>
   );

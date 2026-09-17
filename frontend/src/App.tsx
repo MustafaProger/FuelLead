@@ -115,7 +115,10 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
   useEffect(() => {
     let cancelled = false;
     void api.latestSearchRun().then((run) => {
-      if (!cancelled) setSearchRun((current) => current ?? run);
+      // Restore live progress, not an old completion notice on every visit.
+      if (!cancelled && run && ["pending", "running"].includes(run.status)) {
+        setSearchRun((current) => current ?? run);
+      }
     }).catch(() => { /* The primary API calls report connection errors. */ });
     return () => { cancelled = true; };
   }, []);
@@ -352,10 +355,7 @@ function Workspace({ userEmail, onLogout }: WorkspaceProps) {
         ) : null}
 
         {activePage === "template" ? (
-          <EmailTemplatePage
-            mailConfigured={mailboxesReady}
-            onSent={() => setRefreshToken((value) => value + 1)}
-          />
+          <EmailTemplatePage />
         ) : null}
 
         {activePage === "mailboxes" ? (

@@ -2,10 +2,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
-from app.models import ActivityHistory, Company, CompanyEmail, EmailSuppression, OutreachCampaign, SenderAccount
+from app.models import ActivityHistory, Company, CompanyContact, CompanyEmail, CompanyOkved, EmailSuppression, OutreachCampaign, SenderAccount
 from app.schemas import CompanyFilters
 from app.services.credentials import CredentialCipher, generate_encryption_key
 from app.services.outreach import (
@@ -134,6 +135,49 @@ def test_resend_enabled_event_allows_a_historical_recipient_again(db):
 
     assert preflight["selected_count"] == 1
     assert preflight["skipped"]["already_contacted"] == 0
+
+
+def test_preflight_caps_rendering_without_losing_counts_or_loading_company_details(db, monkeypatch):
+    from app.services import outreach
+
+    settings = settings_with_key(outreach_campaign_size=1)
+    add_sender(db, settings, "one@mail.ru")
+    for index, recipient in enumerate(("first@example.ru", "second@example.ru", "second@example.ru"), 1):
+        company = add_company(db, index, email=recipient)
+        company.contacts.append(CompanyContact(contact_type="phone", value=f"+7999000000{index}"))
+        company.additional_okveds.append(CompanyOkved(code="49.41"))
+        company.history.extend(ActivityHistory(
+            event_type="discovered", description="История поиска компании"
+        ) for _ in range(20))
+    db.commit()
+    db.expunge_all()
+
+    loaded_details = []
+    def record_loaded(_session, instance):
+        if isinstance(instance, (ActivityHistory, CompanyContact, CompanyOkved)):
+            loaded_details.append(instance)
+
+    rendered = []
+    original_render = outreach.render_email_template
+    def record_render(template, values):
+        rendered.append(values["email"])
+        return original_render(template, values)
+
+    monkeypatch.setattr(outreach, "render_email_template", record_render)
+    event.listen(db, "loaded_as_persistent", record_loaded)
+    try:
+        preflight = build_outreach_preflight(db, CompanyFilters(), settings)
+    finally:
+        event.remove(db, "loaded_as_persistent", record_loaded)
+
+    assert preflight["matched_count"] == 3
+    assert preflight["eligible_count"] == 2
+    assert preflight["selected_count"] == 1
+    assert preflight["deferred_by_campaign_limit"] == 1
+    assert preflight["skipped"]["duplicate_address"] == 1
+    assert preflight["sample"]["recipient"] == "first@example.ru"
+    assert rendered == ["first@example.ru", "first@example.ru"]
+    assert loaded_details == []
 
 
 def test_expired_snapshot_cannot_be_confirmed(db):
@@ -470,7 +514,7 @@ def test_round_expiry_never_promotes_an_unverified_temporary_sender(db):
     assert campaign.deliveries[0].status == "queued"
 
 
-@pytest.mark.parametrize("category", ["recipient", "content"])
+@pytest.mark.parametrize("category", ["recipient", "content", "external_recipient_verification"])
 def test_recipient_or_content_error_keeps_sender_healthy_and_address_unsuppressed(db, category):
     RecordingSMTP.sent = []
     settings = settings_with_key()
@@ -483,6 +527,9 @@ def test_recipient_or_content_error_keeps_sender_healthy_and_address_unsuppresse
     class FirstRejected(RecordingSMTP):
         def send(self, recipient, *args, **kwargs):
             if recipient == "full@example.ru":
+                if category == "external_recipient_verification":
+                    from app.services.smtp import _rejection
+                    raise _rejection(550, b"non-local recipient verification failed", stage="RCPT", password="secret", recipient=recipient)
                 raise SMTPDeliveryError("Отклонено для получателя", category=category)
             return super().send(recipient, *args, **kwargs)
 
@@ -592,6 +639,58 @@ def test_permanent_recipient_bounce_is_suppressed_and_campaign_continues(db):
     assert current.deliveries[0].status == "bounced"
     assert db.query(EmailSuppression).filter_by(email="bad@example.ru").one().smtp_code == "5.2.1"
     assert RecordingSMTP.sent[-1] == ("two@mail.ru", "good@example.ru")
+
+
+@pytest.mark.parametrize("smtp_code,reason,expected_status", [
+    (550, "account is disabled", "bounced"),
+    (550, "unknown provider reason", "failed"),
+    (550, "mailbox full", "failed"),
+    (450, "temporarily offline", "failed"),
+    (450, "user not found", "failed"),
+])
+def test_mailru_unavailable_recipient_is_attempted_once_without_disabling_senders(db, smtp_code, reason, expected_status):
+    from app.services.smtp import _rejection
+
+    RecordingSMTP.sent = []
+    settings = settings_with_key()
+    accounts = [add_sender(db, settings, f"sender{index}@mail.ru") for index in range(4)]
+    add_company(db, 1, email="specstrois@mail.ru")
+    add_company(db, 2, email="good@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+    attempts = []
+
+    class DisabledRecipient(RecordingSMTP):
+        def send(self, recipient, *args, **kwargs):
+            attempts.append((self.account.email, recipient))
+            if recipient == "specstrois@mail.ru":
+                raise _rejection(
+                    smtp_code,
+                    f"Message was not accepted -- invalid mailbox. Local mailbox specstrois@mail.ru is unavailable: {reason}".encode(),
+                    stage="DATA", password="app-password", recipient=recipient,
+                )
+            return super().send(recipient, *args, **kwargs)
+
+    tick_at_schedule(db, settings, DisabledRecipient, now)
+    tick_at_schedule(db, settings, DisabledRecipient, now)
+
+    assert attempts == [("sender0@mail.ru", "specstrois@mail.ru"), ("sender1@mail.ru", "good@example.ru")]
+    assert campaign.deliveries[0].status == expected_status
+    assert campaign.deliveries[1].status == "accepted"
+    assert campaign.status == "completed"
+    suppression = db.query(EmailSuppression).filter_by(email="specstrois@mail.ru").one_or_none()
+    if expected_status == "bounced":
+        assert suppression is not None
+        assert suppression.smtp_code == "550"
+        assert suppression.lifted_at is None
+    else:
+        assert suppression is None
+    for sender in accounts:
+        assert sender.verification_status == "verified"
+        assert sender.verification_error is None
+        assert sender.verification_error_category is None
+        assert sender.blocked_until_round is None
+        assert sender.block_reason is None
 
 
 def test_uncertain_interrupts_without_retry_and_restart_marks_sending_uncertain(db):

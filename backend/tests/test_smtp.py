@@ -59,6 +59,41 @@ def test_smtp_verify_authenticates_without_sending():
     assert not any(isinstance(item, tuple) and item[0] in ("MAIL", "RCPT", "DATA") for item in commands)
 
 
+@pytest.mark.parametrize("response", [
+    b"non-local recipient verification failed",
+    b"5.7.1 Non-local recipient verification failed.",
+])
+def test_external_recipient_verification_failure_does_not_blame_sender(response):
+    class RejectedRecipient(FakeSMTP):
+        def rcpt(self, recipient):
+            return 550, response
+
+        def data(self, payload):
+            pytest.fail("A rejected recipient must never reach DATA")
+
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=RejectedRecipient).send(
+            "lead@example.ru", "Subject", "Body"
+        )
+    assert caught.value.category == "recipient"
+    assert not caught.value.permanent_recipient_failure
+    assert not caught.value.uncertain
+    assert "адрес получателя" in caught.value.safe_message
+
+
+@pytest.mark.parametrize("stage,response", [
+    ("MAIL", b"non-local recipient verification failed"),
+    ("DATA", b"non-local recipient verification failed"),
+    ("RCPT", b"non-local sender verification failed"),
+    ("RCPT", b"message sending for this account is disabled"),
+])
+def test_recipient_verification_match_does_not_hide_sender_or_other_stage_errors(stage, response):
+    from app.services.smtp import _rejection
+    error = _rejection(550, response, stage=stage, password="secret", recipient="lead@example.ru")
+    assert error.category == "provider"
+    assert not error.permanent_recipient_failure
+
+
 def test_smtp_send_captures_data_acceptance_and_technical_headers():
     FakeSMTP.instances = []
     result = MailruSMTPClient(account(), "secret", smtp_factory=FakeSMTP).send(
@@ -238,6 +273,7 @@ def test_failed_quit_does_not_undo_accepted_message():
 @pytest.mark.parametrize("recipient,reason", [
     ("shaturadcy@mail.ru", "user not found"),
     ("eskstyle4@mail.ru", "user is terminated"),
+    ("specstrois@mail.ru", "account is disabled"),
 ])
 def test_mailru_data_missing_recipient_does_not_fail_sender(recipient, reason, raised):
     reply = f"Message was not accepted -- invalid mailbox. Local mailbox {recipient} is unavailable: {reason}".encode()
@@ -256,14 +292,22 @@ def test_mailru_data_missing_recipient_does_not_fail_sender(recipient, reason, r
     assert caught.value.uncertain is False
     assert caught.value.smtp_response == reply.decode()
     assert str(caught.value).startswith("DATA:")
+    assert f"Адрес получателя {recipient}" in caught.value.safe_message
 
 
 @pytest.mark.parametrize("reply", [
     b"Message was not accepted -- invalid mailbox",
     b"Local mailbox sender@mail.ru is unavailable: user not found",
+    b"Local mailbox sender@mail.ru is unavailable: account is disabled",
     b"Local mailbox other@mail.ru is unavailable: user is terminated",
-    b"Local mailbox lead@mail.ru is unavailable: temporarily offline",
+    b"Local mailbox other@mail.ru is unavailable: account is disabled",
+    b"Local mailbox other@mail.ru is unavailable: unknown provider reason",
+    b"Local mailbox lead@mail.ru is unavailable:",
+    b"Local mailbox lead@mail.ru is unavailable:   \r\n ",
     b"Local mailbox prefixlead@mail.ru is unavailable: user not found",
+    b"Local mailbox prefixlead@mail.ru is unavailable: account is disabled",
+    b"Local mailbox lead@mail.ru.invalid is unavailable: account is disabled",
+    b"Message sending for this account is disabled",
 ])
 def test_mailru_data_refusal_requires_specific_missing_target_evidence(reply):
     class RefusingSMTP(FakeSMTP):
@@ -275,6 +319,117 @@ def test_mailru_data_refusal_requires_specific_missing_target_evidence(reply):
 
     assert caught.value.category == "provider"
     assert caught.value.permanent_recipient_failure is False
+
+
+@pytest.mark.parametrize("stage,code,category,permanent", [
+    ("RCPT", 550, "recipient", True),
+    ("DATA", 550, "recipient", True),
+    ("MAIL FROM", 550, "provider", False),
+    ("AUTH", 550, "provider", False),
+    ("RCPT", 450, "recipient", False),
+    ("DATA", 450, "recipient", False),
+])
+def test_mailru_disabled_recipient_requires_permanent_recipient_stage(stage, code, category, permanent):
+    from app.services.smtp import _rejection
+
+    error = _rejection(
+        code,
+        b"Local mailbox <LEAD@mail.ru> is unavailable: account is disabled",
+        stage=stage,
+        password="secret",
+        recipient="lead@mail.ru",
+    )
+    assert error.category == category
+    assert error.permanent_recipient_failure is permanent
+    assert not error.uncertain
+
+
+@pytest.mark.parametrize("transport", ["rcpt", "data", "data_exception"])
+@pytest.mark.parametrize("code", [450, 451, 452, 550, 551, 552, 553, 554])
+@pytest.mark.parametrize("reason", ["temporarily offline", "mailbox full", "unknown provider reason"])
+def test_mailru_unknown_recipient_reason_is_scoped_without_permanent_suppression(transport, code, reason):
+    reply = f"Message was not accepted -- invalid mailbox. Local mailbox lead@mail.ru is unavailable: {reason}".encode()
+
+    class RefusingSMTP(FakeSMTP):
+        def rcpt(self, recipient):
+            if transport == "rcpt":
+                return code, reply
+            return super().rcpt(recipient)
+
+        def data(self, payload):
+            if transport == "rcpt":
+                pytest.fail("A rejected recipient must never reach DATA")
+            if transport == "data_exception":
+                raise smtplib.SMTPDataError(code, reply)
+            return code, reply
+
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@mail.ru", "Subject", "Body")
+
+    assert caught.value.category == "recipient"
+    assert caught.value.permanent_recipient_failure is False
+    assert caught.value.uncertain is False
+    assert caught.value.smtp_response == reply.decode()
+
+
+@pytest.mark.parametrize("stage", ["RCPT", "DATA"])
+@pytest.mark.parametrize("code,category", [
+    (421, "temporary"), (455, "temporary"),
+    (500, "provider"), (503, "provider"), (555, "provider"),
+    (530, "auth"), (534, "auth"), (535, "auth"), (538, "auth"),
+])
+@pytest.mark.parametrize("reason", ["account is disabled", "unknown provider reason"])
+def test_mailru_recipient_hint_does_not_override_connection_auth_or_protocol_refusal(stage, code, category, reason):
+    from app.services.smtp import _rejection
+
+    error = _rejection(
+        code, f"Local mailbox lead@mail.ru is unavailable: {reason}".encode(),
+        stage=stage, password="secret", recipient="lead@mail.ru",
+    )
+    assert error.category == category
+    assert not error.permanent_recipient_failure
+
+
+@pytest.mark.parametrize("stage", ["RCPT", "DATA"])
+@pytest.mark.parametrize("enhanced,category,permanent", [
+    ("5.1.1", "recipient", True),
+    ("5.2.1", "recipient", True),
+    ("5.1.7", "provider", False),
+    ("5.1.8", "provider", False),
+    ("5.3.0", "provider", False),
+    ("5.4.4", "provider", False),
+    ("5.7.8", "provider", False),
+    ("4.3.0", "temporary", False),
+    ("4.4.1", "temporary", False),
+    ("4.7.1", "temporary", False),
+    ("5.2.2", "recipient", False),
+    ("4.2.2", "recipient", False),
+    ("5.2.3", "content", False),
+    ("5.3.4", "content", False),
+])
+@pytest.mark.parametrize("reason", ["account is disabled", "unknown provider reason"])
+def test_mailru_recipient_hint_respects_enhanced_status(stage, enhanced, category, permanent, reason):
+    from app.services.smtp import _rejection
+
+    error = _rejection(
+        int(enhanced[0]) * 100 + 50,
+        f"{enhanced} Local mailbox lead@mail.ru is unavailable: {reason}".encode(),
+        stage=stage, password="secret", recipient="lead@mail.ru",
+    )
+    assert error.category == category
+    assert error.permanent_recipient_failure is permanent
+    assert not error.uncertain
+
+
+def test_mailru_recipient_hint_requires_known_target():
+    from app.services.smtp import _rejection
+
+    error = _rejection(
+        550, b"Local mailbox lead@mail.ru is unavailable: account is disabled",
+        stage="DATA", password="secret",
+    )
+    assert error.category == "provider"
+    assert not error.permanent_recipient_failure
 
 
 @pytest.mark.parametrize("stage", ["rcpt", "data"])
@@ -337,7 +492,7 @@ def test_temporary_reply_with_missing_mailbox_text_does_not_suppress_recipient()
     with pytest.raises(SMTPDeliveryError) as caught:
         MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@mail.ru", "Subject", "Body")
 
-    assert caught.value.category == "temporary"
+    assert caught.value.category == "recipient"
     assert caught.value.permanent_recipient_failure is False
 
 

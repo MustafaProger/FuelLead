@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from uuid import uuid4
 
@@ -47,6 +47,7 @@ def test_full_body_headers_and_rescan_preserve_read_and_status(db):
     assert len(result["messages"][0]["body"]) > 2000
     assert result["messages"][0]["subject"] == "Условия поставки"
     assert result["messages"][0]["created_at"].startswith("2026-09-15T10:00")
+    assert result["messages"][0]["is_automatic"] is False
     assert conversation_list(db)["unread_count"] == 1
     mark_read(db, company.id, event.id)
     company.status = "customer"; db.commit()
@@ -54,6 +55,50 @@ def test_full_body_headers_and_rescan_preserve_read_and_status(db):
     assert conversation_list(db)["unread_count"] == 0 and company.status == "customer"
     assert len(conversation_detail(db, company.id)["messages"]) == 1
     assert conversation_list(db, unread=True)["items"] == []
+
+
+def test_automatic_reply_is_visible_and_labelled_in_conversation(db):
+    _, account, company, _, raw = setup_thread(db)
+    company.status = 'sent'
+    db.add(ActivityHistory(company_id=company.id, event_type='email_sent', description='sent', event_data={
+        'message_id': '<original@mail.ru>', 'sender_account_id': account.id, 'recipient': 'client@example.ru'}))
+    raw.replace_header('Message-ID', '<vacation@example.ru>')
+    raw.replace_header('Subject', 'Автоматический ответ: Условия поставки')
+    raw['Auto-Submitted'] = 'auto-replied'
+    raw['In-Reply-To'] = '<original@mail.ru>'
+    raw.set_content('С 14 по 21 сентября я в отпуске. Не пишите на этот адрес в период отпуска.')
+    db.commit()
+    apply_client_reply(db, account.id, raw.as_bytes()); db.commit()
+    listing = conversation_list(db)
+    assert listing['items'][0]['is_automatic'] is True
+    assert listing['unread_count'] == 2 and company.status == 'sent'
+    detail = conversation_detail(db, company.id)
+    automatic = next(item for item in detail['messages'] if item.get('is_automatic'))
+    assert automatic['direction'] == 'incoming' and automatic['status'] == 'received'
+    assert automatic['body'].startswith('С 14 по 21 сентября я в отпуске.')
+    assert automatic['unread'] is True
+    assert all(item['is_automatic'] is False for item in detail['messages'] if item['direction'] == 'outgoing')
+    mark_read(db, company.id, int(automatic['id']))
+    assert conversation_list(db)['unread_count'] == 0
+    assert db.query(EmailSuppression).count() == 0
+
+
+@pytest.mark.parametrize('reply_delay', [-3, 0, 3])
+def test_reply_follows_referenced_outgoing_despite_clock_skew(db, reply_delay):
+    _, account, company, reply, _ = setup_thread(db)
+    accepted_at = datetime(2026, 9, 17, 1, 2, 33, tzinfo=timezone.utc)
+    reply_date = (accepted_at + timedelta(seconds=reply_delay)).astimezone(timezone(timedelta(hours=3))).isoformat()
+    reply.event_data = {**reply.event_data, 'sent_at': reply_date, 'references': ['<offer@mail.ru>']}
+    original = ActivityHistory(company_id=company.id, event_type='email_sent', description='sent', created_at=accepted_at,
+        event_data={'message_id': '<offer@mail.ru>', 'sender_account_id': account.id, 'recipient': 'client@example.ru'})
+    earlier = ActivityHistory(company_id=company.id, event_type='email_sent', description='earlier',
+        created_at=accepted_at - timedelta(minutes=1), event_data={'message_id': '<earlier@mail.ru>'})
+    later = ActivityHistory(company_id=company.id, event_type='email_sent', description='later',
+        created_at=accepted_at + timedelta(minutes=1), event_data={'message_id': '<later@mail.ru>'})
+    db.add_all([later, original, earlier]); db.commit()
+    messages = conversation_detail(db, company.id)['messages']
+    assert [item['id'] for item in messages] == [str(earlier.id), str(original.id), str(reply.id), str(later.id)]
+    assert messages[2]['created_at'] == reply_date
 
 
 def test_read_snapshot_does_not_swallow_a_new_reply(db):

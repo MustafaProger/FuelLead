@@ -1,6 +1,7 @@
-import { ArrowLeft, CheckCheck, ChevronLeft, ChevronRight, Inbox, LoaderCircle, Mail, Paperclip, RefreshCw, Reply, Search, Send } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { ArrowLeft, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, Inbox, LoaderCircle, Mail, Maximize2, Minimize2, Paperclip, RefreshCw, Reply, Search, Send } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../api";
+import { createRequestId } from "../requestId";
 import type { ConversationDetail, ConversationMessage, ConversationSummary } from "../types";
 
 function selectedFromHash() {
@@ -89,7 +90,7 @@ export function ConversationsPage({ onChanged }: { onChanged: () => void }) {
 }
 
 interface Draft { body: string; replyId: number | null; requestId: string; pending: boolean }
-function newDraft(): Draft { return { body: "", replyId: null, requestId: crypto.randomUUID(), pending: false }; }
+function newDraft(): Draft { return { body: "", replyId: null, requestId: createRequestId(), pending: false }; }
 function readDraft(key: string): Draft {
   try { const value = JSON.parse(sessionStorage.getItem(key) || "null"); if (value && typeof value.body === "string" && typeof value.requestId === "string") return value; } catch { /* Storage may be unavailable. */ }
   return newDraft();
@@ -103,6 +104,7 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
   const [sendError, setSendError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [composerExpanded, setComposerExpanded] = useState(false);
   const sendLock = useRef(false);
   const alive = useRef(true);
   const revision = useRef(0);
@@ -142,6 +144,26 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
     }
   }, [detail, companyId, onRead]);
   const reply = detail?.messages.find((m) => m.reply_id === (draft.replyId || detail.latest_reply_id));
+  const composerVisible = Boolean(reply && (!reply.reply_disabled_reason || draft.pending));
+  const resizeComposer = useCallback(() => {
+    const input = textarea.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight + input.offsetHeight - input.clientHeight}px`;
+  }, []);
+  useLayoutEffect(resizeComposer, [draft.body, composerExpanded, composerVisible, resizeComposer]);
+  useEffect(() => {
+    const input = textarea.current;
+    if (!input) return;
+    let width = input.getBoundingClientRect().width;
+    const observer = new ResizeObserver(() => {
+      const nextWidth = input.getBoundingClientRect().width;
+      if (nextWidth !== width) { width = nextWidth; resizeComposer(); }
+    });
+    observer.observe(input);
+    window.addEventListener("resize", resizeComposer);
+    return () => { observer.disconnect(); window.removeEventListener("resize", resizeComposer); };
+  }, [composerVisible, resizeComposer]);
   const changeBody = (body: string) => setDraft((current) => ({ ...current, body, replyId: current.replyId || detail?.latest_reply_id || null }));
   const chooseReply = (message: ConversationMessage) => {
     if (draft.pending || sending) return;
@@ -162,10 +184,10 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
         initialScroll.current = true;
         const cleared = newDraft();
         try { sessionStorage.removeItem(storageKey); } catch { /* Nothing to clear. */ }
-        if (alive.current) { setDraft(cleared); setNotice(result.sent_copy_saved === false ? "Письмо принято почтовым сервером. Копию в «Отправленные» сохранить не удалось; повторно отправлять письмо не нужно." : "Письмо принято почтовым сервером. Ответ клиента появится здесь."); }
+        if (alive.current) { setDraft(cleared); setComposerExpanded(false); setNotice(result.sent_copy_saved === false ? "Письмо принято почтовым сервером. Копию в «Отправленные» сохранить не удалось; повторно отправлять письмо не нужно." : "Письмо принято почтовым сервером. Ответ клиента появится здесь."); }
         onChanged();
       } else if (alive.current) {
-        if (result.status === "failed") setDraft({ ...attempt, pending: false, requestId: crypto.randomUUID() });
+        if (result.status === "failed") setDraft({ ...attempt, pending: false, requestId: createRequestId() });
         setSendError(result.error || (result.status === "sending" ? "Письмо ещё отправляется. Нажмите «Проверить результат» через несколько секунд." : "Не удалось подтвердить отправку. Проверьте «Отправленные»; письмо не будет отправлено повторно."));
       }
       if (alive.current) await load();
@@ -182,7 +204,7 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
     if (!window.confirm(outcome === "accepted" ? "Вы проверили почту и подтверждаете, что письмо отправлено?" : "Вы проверили почту и подтверждаете, что письмо НЕ отправлено? После этого можно будет повторить отправку.")) return;
     try {
       await api.resolveReply(companyId, message.id, outcome);
-      if (message.id === draft.requestId) setDraft(outcome === "accepted" ? newDraft() : { ...draft, pending: false, requestId: crypto.randomUUID() });
+      if (message.id === draft.requestId) setDraft(outcome === "accepted" ? newDraft() : { ...draft, pending: false, requestId: createRequestId() });
       setSendError(null); await load();
     } catch (error) { setSendError(errorText(error)); }
   };
@@ -193,7 +215,7 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
       {!detail && !error ? <p className="mail-empty"><LoaderCircle className="spin" size={24} /> Загружаем письма…</p> : null}
       {detail && !detail.messages.length ? <p className="mail-empty">Переписки пока нет. После отправки предложения и ответа клиента здесь появятся письма.</p> : null}
       {detail?.messages.map((message) => <article key={message.id} className={`conversation-message conversation-message--${message.direction}`}>
-        <header><span>{message.direction === "incoming" ? <Mail size={15} /> : <Send size={15} />}{statusLabels[message.status]}</span><time dateTime={message.created_at}>{dateTime(message.created_at)}</time></header>
+        <header><span>{message.direction === "incoming" ? <Mail size={15} /> : <Send size={15} />}{message.direction === "incoming" && message.is_automatic ? "Автоответ" : statusLabels[message.status]}</span><time dateTime={message.created_at}>{dateTime(message.created_at)}</time></header>
         <h3>{message.subject}</h3><div className="conversation-addresses"><span>От: {message.sender || "Исходный ящик"}</span><span>Кому: {message.recipient}</span></div>
         <MessageBody message={message} />
         {message.legacy ? <p className="mail-muted">Сохранён фрагмент старого письма.</p> : null}
@@ -204,17 +226,30 @@ function ConversationThread({ companyId, onRead, onChanged }: { companyId: numbe
         {message.direction === "incoming" ? <button type="button" className="conversation-reply-link" disabled={sending || draft.pending} onClick={() => chooseReply(message)}><Reply size={15} /> Ответить на это письмо</button> : null}
       </article>)}
     </div>
-    {reply ? <form className="conversation-composer" onSubmit={send}>
-      <div className="conversation-composer-heading"><strong><Reply size={17} /> Ответ клиенту</strong><span>Черновик сохраняется в этой вкладке</span></div>
-      <p className="conversation-compose-route">С <strong>{reply.reply_sender || "исходного ящика"}</strong> → <strong>{reply.reply_recipient || reply.sender}</strong></p>
-      <p className="mail-muted conversation-compose-subject">На письмо: {reply.subject}</p>
-      {reply.reply_disabled_reason ? <p className="mail-error">{reply.reply_disabled_reason}</p> : null}
-      <label className="sr-only" htmlFor="client-reply">Текст ответа</label>
-      <textarea ref={textarea} id="client-reply" value={draft.body} maxLength={20000} rows={4} placeholder="Напишите ответ клиенту…" disabled={sending || draft.pending || Boolean(reply.reply_disabled_reason)} onChange={(event) => changeBody(event.target.value)} />
-      <p className="mail-muted" role={sending ? "status" : undefined}>{sending ? "Ожидаем завершения текущей отправки и отправляем ответ…" : "Во время ответа рассылка подождёт и продолжится автоматически. Ручная пауза сохранится."}</p>
+    {reply ? <form className={`conversation-composer${composerExpanded ? " conversation-composer--expanded" : ""}`} onSubmit={send}>
+      <details className="conversation-reply-context">
+        <summary><Reply size={15} /><span><strong>Ответ: {reply.reply_recipient || reply.sender}</strong><span>{reply.subject}</span></span><ChevronDown size={15} /></summary>
+        <div>
+          <p className="conversation-compose-route">С <strong>{reply.reply_sender || "исходного ящика"}</strong> → <strong>{reply.reply_recipient || reply.sender}</strong></p>
+          <p className="mail-muted">На письмо: {reply.subject}</p>
+          <p className="mail-muted">Черновик сохраняется в этой вкладке. Во время ответа рассылка подождёт и продолжится автоматически. Ручная пауза сохранится.</p>
+        </div>
+      </details>
+      {reply.reply_disabled_reason ? <p className="mail-error" role="status">{reply.reply_disabled_reason}</p> : null}
+      {composerVisible ? <>
+        <div className="conversation-composer-input">
+          <div className="conversation-composer-field">
+            <label className="sr-only" htmlFor="client-reply">Текст ответа</label>
+            <textarea ref={textarea} id="client-reply" value={draft.body} maxLength={20000} rows={1} placeholder="Сообщение…" disabled={sending || draft.pending} onChange={(event) => changeBody(event.target.value)} />
+            <button type="button" className="conversation-composer-toggle" aria-label={composerExpanded ? "Свернуть поле ответа" : "Развернуть поле ответа"} title={composerExpanded ? "Свернуть поле ответа" : "Развернуть поле ответа"} aria-expanded={composerExpanded} aria-controls="client-reply" onClick={() => { setComposerExpanded((value) => !value); textarea.current?.focus(); }}>{composerExpanded ? <Minimize2 size={17} /> : <Maximize2 size={17} />}</button>
+          </div>
+          <button className={`conversation-composer-send${draft.pending && !sending ? " conversation-composer-send--pending" : ""}`} type="submit" aria-label={sending ? "Отправляем ответ" : draft.pending ? "Проверить результат" : "Отправить ответ"} title={sending ? "Отправляем ответ" : draft.pending ? "Проверить результат" : "Отправить ответ"} disabled={sending || !draft.body.trim() || Boolean(reply.reply_disabled_reason) && !draft.pending}>{sending ? <LoaderCircle className="spin" size={19} /> : draft.pending ? <RefreshCw size={19} /> : <Send size={19} />}{draft.pending && !sending ? <span>Проверить результат</span> : null}</button>
+        </div>
+        {draft.body.length ? <div className="conversation-composer-footer"><span>{draft.pending ? "Ожидает подтверждения отправки" : "Черновик сохраняется в этой вкладке"}</span><small>{draft.body.length.toLocaleString("ru-RU")} / 20 000</small></div> : null}
+      </> : null}
+      {sending ? <p className="mail-muted" role="status">Ожидаем завершения текущей отправки и отправляем ответ…</p> : null}
       {sendError ? <p className="mail-error" role="alert">{sendError}</p> : null}
       {notice ? <p className="mail-success" role="status">{notice}</p> : null}
-      <div className="conversation-composer-actions"><small>{draft.body.length.toLocaleString("ru-RU")} / 20 000</small><button className="button button--primary" type="submit" disabled={sending || !draft.body.trim() || Boolean(reply.reply_disabled_reason) && !draft.pending}>{sending ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}{sending ? "Отправляем…" : draft.pending ? "Проверить результат" : "Отправить ответ"}</button></div>
     </form> : null}
   </section>;
 }

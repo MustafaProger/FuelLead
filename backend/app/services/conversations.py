@@ -48,6 +48,7 @@ def conversation_list(db: Session, *, search="", unread=False, page=1, page_size
                        "sender": (h.event_data or {}).get("sender", ""),
                        "subject": (h.event_data or {}).get("subject") or "Без темы",
                        "preview": (h.event_data or {}).get("text", "")[:220],
+                       "is_automatic": bool((h.event_data or {}).get("is_automatic")),
                        "received_at": as_aware(h.created_at).isoformat(), "unread_count": n}
                       for c, h, n in rows], "total": total, "page": page,
             "unread_count": db.scalar(select(func.count()).select_from(ActivityHistory).where(_unread())) or 0}
@@ -92,6 +93,7 @@ def conversation_detail(db, company_id):
             "subject": data.get("subject") or (delivery.subject if delivery else "Без темы"),
             "body": data.get("body") or (delivery.body if delivery else data.get("text")) or "Текст этого старого письма не сохранён",
             "preview": data.get("text", ""), "legacy": inbound and not data.get("content_version"),
+            "is_automatic": inbound and bool(data.get("is_automatic")),
             "attachments": data.get("attachments", []), "created_at": data.get("sent_at") or as_aware(event.created_at).isoformat(),
             "unread": inbound and not data.get("read_at"), "reply_recipient": recipient,
             "reply_sender": account.email if account else None, "reply_disabled_reason": reason,
@@ -100,7 +102,23 @@ def conversation_detail(db, company_id):
                                                            EmailReplyAttempt.status != "accepted")):
         messages.append({**attempt_to_dict(attempt), "id": attempt.id, "direction": "outgoing", "sender": attempt.sender_email,
                          "created_at": as_aware(attempt.created_at).isoformat(), "unread": False, "attachments": []})
-    messages.sort(key=lambda m: (as_aware(datetime.fromisoformat(m["created_at"])).timestamp(), m["id"]))
+    order = {m["id"]: (as_aware(datetime.fromisoformat(m["created_at"])).timestamp(), 0, m["id"])
+             for m in messages}
+    outgoing_times = {((e.event_data or {}).get("sender_account_id"), (e.event_data or {}).get("message_id")):
+                      order[str(e.id)][0] for e in events if e.event_type == "email_sent"}
+    for event in events:
+        if event.event_type != "email_reply":
+            continue
+        data = event.event_data or {}
+        parent_times = [outgoing_times[(data.get("sender_account_id"), reference)]
+                        for reference in (data.get("references") or [])
+                        if (data.get("sender_account_id"), reference) in outgoing_times]
+        key = str(event.id)
+        if parent_times and max(parent_times) >= order[key][0]:
+            # A fast auto-reply can be dated before SMTP completion is recorded.
+            # Keep its real Date visible, but show it after the referenced offer.
+            order[key] = (max(parent_times), 1, key)
+    messages.sort(key=lambda m: order[m["id"]])
     return {"company_id": company.id, "company_name": company.name, "company_status": company.status,
             "messages": messages, "latest_reply_id": latest_reply_id}
 

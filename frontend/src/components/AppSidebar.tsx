@@ -18,8 +18,8 @@ const navigation = [
   { page: "dashboard" as const, label: "Обзор", icon: LayoutDashboard },
   { page: "companies" as const, label: "Компании", icon: Building2 },
   { page: "conversations" as const, label: "Переписка", icon: MessagesSquare },
-  { page: "template" as const, label: "Шаблон письма", icon: Mail },
   { page: "mailboxes" as const, label: "Почтовые ящики", icon: Inbox },
+  { page: "template" as const, label: "Шаблон письма", icon: Mail },
   { page: "suppressions" as const, label: "Исключения", icon: Ban },
   { page: "guide" as const, label: "Инструкция", icon: BookOpen },
 ];

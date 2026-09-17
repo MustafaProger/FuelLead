@@ -337,6 +337,7 @@ export interface ConversationMessage {
   body: string;
   preview?: string;
   legacy?: boolean;
+  is_automatic?: boolean;
   attachments: string[];
   created_at: string;
   unread: boolean;

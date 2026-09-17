@@ -39,10 +39,23 @@ export function OutreachDialog({ open, filters, mailConfigured, onClose, onChang
     if (!open) return;
     let cancelled = false;
     setLoading(true); setError(null); setConfirmed(false);
-    Promise.all([api.activeOutreachCampaign(), api.outreachPreflight(filters)])
-      .then(([active, check]) => { if (!cancelled) { setCampaign(active); setPreflight(check); } })
-      .catch((requestError) => { if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Не удалось проверить рассылку"); })
-      .finally(() => { if (!cancelled) setLoading(false); });
+    setCampaign(null); setPreflight(null);
+    void (async () => {
+      try {
+        const active = await api.activeOutreachCampaign();
+        if (cancelled) return;
+        if (active) {
+          setCampaign(active);
+        } else {
+          const check = await api.outreachPreflight(filters);
+          if (!cancelled) setPreflight(check);
+        }
+      } catch (requestError) {
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : "Не удалось проверить рассылку");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
     return () => { cancelled = true; };
   }, [open, filters]);
 
@@ -81,7 +94,7 @@ export function OutreachDialog({ open, filters, mailConfigured, onClose, onChang
     <div className="outreach-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="outreach-dialog" role="dialog" aria-modal="true" aria-labelledby="outreach-dialog-title">
         <header className="outreach-dialog-header"><span className="outreach-dialog-icon"><Send size={20} /></span><div><h2 id="outreach-dialog-title">Отправка писем</h2><p>Последовательные пачки писем с сохранёнными таймерами</p></div><button type="button" className="dialog-close" onClick={onClose} aria-label="Закрыть"><X size={19} /></button></header>
-        {loading ? <div className="outreach-loading"><LoaderCircle className="spin" size={24} /><span>Фиксируем снимок получателей и ящиков…</span></div> : null}
+        {loading ? <div className="outreach-loading"><LoaderCircle className="spin" size={24} /><span>Загружаем состояние рассылки…</span></div> : null}
         {error ? <div className="outreach-error"><AlertTriangle size={18} /><span>{error}</span></div> : null}
         {!loading && campaign ? <CampaignProgress campaign={campaign} acting={acting} onAction={runAction} /> : null}
         {!loading && !campaign && preflight ? (

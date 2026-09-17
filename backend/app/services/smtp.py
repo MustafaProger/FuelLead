@@ -169,23 +169,57 @@ def _rejection(code: int, response: bytes, *, stage: str, password: str, recipie
     recipient_stage = stage in ("RCPT", "DATA")
     # Mail.ru sometimes validates its local recipient only after DATA and
     # returns plain 550 instead of an enhanced status. Match the actual sole
-    # recipient: a sender failure or an unrelated address must not suppress it.
-    mailru_missing_recipient = bool(
-        recipient_stage
-        and recipient
-        and re.search(
-            rf"\blocal mailbox\s+<?{re.escape(recipient)}>?\s+is unavailable:\s*user (?:not found|is terminated)\b",
+    # recipient independently of the reason. New provider wording must not
+    # disable every sender, but is not proof of permanent recipient failure.
+    # Explicit enhanced statuses and service/auth/protocol codes take priority.
+    mailru_unavailable_recipient = (
+        re.search(
+            rf"\blocal mailbox\s+<?{re.escape(recipient)}>?\s+is unavailable:\s*(\S.*)",
             safe_smtp_text(response),
+            re.IGNORECASE,
+        )
+        if recipient_stage and recipient and enhanced == str(code)
+        and code in (450, 451, 452, 550, 551, 552, 553, 554)
+        else None
+    )
+    mailru_permanent_reason = bool(
+        mailru_unavailable_recipient
+        and re.match(
+            r"(?:user (?:not found|is terminated)|account is disabled)\b",
+            mailru_unavailable_recipient.group(1),
             re.IGNORECASE,
         )
     )
     permanent_recipient = (
         recipient_stage and 500 <= code < 600
-        and (enhanced in PERMANENT_RECIPIENT_CODES or mailru_missing_recipient)
+        and (enhanced in PERMANENT_RECIPIENT_CODES or mailru_permanent_reason)
     )
     if permanent_recipient:
         mapped.category = "recipient"
         mapped.permanent_recipient_failure = True
+        if mailru_unavailable_recipient:
+            mapped.safe_message = (
+                f"Адрес получателя {recipient} недоступен (SMTP {code}): "
+                f"{mapped.smtp_response}. Проверьте адрес получателя"
+            )
+    elif mailru_unavailable_recipient:
+        mapped.category = "recipient"
+        mapped.safe_message = (
+            f"Адрес получателя {recipient} сейчас недоступен (SMTP {code}): "
+            f"{mapped.smtp_response}. Письмо пропущено; адрес не добавлен в постоянные исключения"
+        )
+    elif stage == "RCPT" and code == 550 and re.fullmatch(
+        r"(?:5\.\d{1,3}\.\d{1,3}\s+)?non-local recipient verification failed[.!]?",
+        safe_smtp_text(response),
+        re.IGNORECASE,
+    ):
+        # External-recipient verification is not a sender authentication failure.
+        # It does not by itself prove that the address is permanently nonexistent.
+        mapped.category = "recipient"
+        mapped.safe_message = (
+            "Почтовый сервер не смог проверить адрес получателя (SMTP 550). "
+            "Проверьте адрес и DNS домена получателя. Отправляющий ящик доступен"
+        )
     elif (
         enhanced in ("4.2.3", "5.2.3", "4.3.4", "5.3.4")
         or enhanced.startswith(("4.6.", "5.6."))

@@ -11,3 +11,7 @@ frontend/dist/
 backups/
 .DS_Store
 *.mov
+*.egg-info/
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts

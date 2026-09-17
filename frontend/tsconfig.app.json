@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.app.tsbuildinfo",
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "allowJs": false,
@@ -18,4 +19,3 @@
   },
   "include": ["src"]
 }
-

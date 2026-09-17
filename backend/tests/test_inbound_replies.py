@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import Settings
-from app.models import ActivityHistory, Company, CompanyEmail, EmailSuppression, ImapProcessedMessage, SenderAccount
+from app.models import ActivityHistory, Company, CompanyEmail, EmailSuppression, ImapProcessedMessage, OutreachCampaign, OutreachDelivery, SenderAccount
 from app.services.imap_bounces import apply_dsn_bounce, process_imap_tick
 from app.services.inbound_replies import apply_client_reply, parse_client_reply
 from app.services.outreach import OutreachPolicyError, assert_manual_send_allowed
@@ -52,9 +52,23 @@ def test_charset_and_html():
     assert parse_client_reply(message('<p>Не&nbsp;пишите мне больше</p>', html=True)).refusal
 
 
-def test_autoreplies_and_marketing_are_not_client_refusals():
-    for header in [b'Auto-Submitted: auto-replied', b'List-Unsubscribe: <https://example.ru/unsub>', b'List-Id: advertising']:
+def test_generated_reports_and_marketing_are_not_client_replies():
+    for header in [b'Auto-Submitted: auto-generated', b'Auto-Submitted: custom',
+                   b'List-Unsubscribe: <https://example.ru/unsub>', b'List-Id: advertising']:
         assert parse_client_reply(header + b'\r\n' + message('Не интересно')) is None
+
+
+@pytest.mark.parametrize('header', ['auto-replied', ' Auto-Replied ; owner-email=client@example.ru'])
+def test_automatic_reply_is_readable_without_refusal_detection(header):
+    raw = ('Auto-Submitted: ' + header + '\r\n').encode() + message('Не пишите в период отпуска')
+    reply = parse_client_reply(raw)
+    assert reply and reply.is_automatic and reply.refusal is None
+    assert reply.text == 'Не пишите в период отпуска'
+
+
+def test_automatic_list_message_is_still_excluded():
+    raw = b'Auto-Submitted: auto-replied\r\nList-Id: advertising\r\n' + message('Автоматическое уведомление')
+    assert parse_client_reply(raw) is None
 
 
 def setup_client(db):
@@ -64,6 +78,75 @@ def setup_client(db):
     db.add_all([account, company])
     db.commit()
     return account, company
+
+
+@pytest.mark.parametrize('status', ['new', 'sent', 'answered', 'interested', 'customer', 'rejected'])
+def test_automatic_reply_preserves_company_status_and_suppressions(db, status):
+    account, company = setup_client(db)
+    company.status = status
+    db.add(ActivityHistory(company_id=company.id, event_type='email_sent', description='sent', event_data={
+        'message_id': '<original@mail.ru>', 'sender_account_id': account.id, 'recipient': 'client@example.ru'}))
+    db.commit()
+    db.refresh(company)
+    updated_at = company.last_updated_at
+    raw = b'Auto-Submitted: auto-replied\r\n' + message(
+        'Не пишите в период отпуска', sender='assistant@another.ru', reference='<original@mail.ru>')
+    assert apply_client_reply(db, account.id, raw)[0] == 'automatic_reply'
+    db.commit()
+    assert company.status == status and company.last_updated_at == updated_at
+    assert db.query(EmailSuppression).count() == 0
+    event = db.query(ActivityHistory).filter_by(event_type='email_reply').one()
+    assert event.event_data['is_automatic'] is True and event.event_data['refusal'] is None
+    assert event.from_status == event.to_status == status
+
+
+def test_automatic_sender_fallback_requires_outgoing_on_receiving_account(db):
+    account, company = setup_client(db)
+    raw = b'Auto-Submitted: auto-replied\r\n' + message('Я в отпуске')
+    assert apply_client_reply(db, account.id, raw)[0] == 'unmatched_reply'
+    outgoing = ActivityHistory(company_id=company.id, event_type='email_sent', description='sent', event_data={
+        'message_id': '<original@mail.ru>', 'sender_account_id': 999, 'recipient': 'client@example.ru'})
+    db.add(outgoing); db.commit()
+    assert apply_client_reply(db, account.id, raw)[0] == 'unmatched_reply'
+    outgoing.event_data = {**outgoing.event_data, 'sender_account_id': account.id}
+    db.commit()
+    assert apply_client_reply(db, account.id, raw)[0] == 'automatic_reply'
+
+
+def test_automatic_sender_fallback_matches_only_accepted_delivery(db):
+    account, company = setup_client(db)
+    campaign = OutreachCampaign(daily_limit=50, hourly_limit=0, min_interval_seconds=60, max_per_domain_per_day=0)
+    delivery = OutreachDelivery(company_id=company.id, sender_account_id=account.id,
+        company_name=company.name, company_inn=company.inn, recipient='client@example.ru', recipient_domain='example.ru',
+        subject='Предложение', body='Условия', status='failed')
+    campaign.deliveries.append(delivery)
+    db.add(campaign); db.commit()
+    raw = b'Auto-Submitted: auto-replied\r\n' + message('Я в отпуске')
+    assert apply_client_reply(db, account.id, raw)[0] == 'unmatched_reply'
+    delivery.status = 'accepted'; db.commit()
+    assert apply_client_reply(db, account.id, raw) == ('automatic_reply', delivery.id)
+
+
+def test_reprocess_discarded_automatic_reply_preserves_cursor_and_read_state(db):
+    account, company = setup_client(db)
+    account.imap_last_uid = 500
+    db.add(ImapProcessedMessage(sender_account_id=account.id, uid=315, outcome='unrecognized'))
+    db.add(ActivityHistory(company_id=company.id, event_type='email_sent', description='sent', event_data={
+        'message_id': '<original@mail.ru>', 'sender_account_id': account.id, 'recipient': 'client@example.ru'}))
+    db.commit()
+    raw = b'Auto-Submitted: auto-replied\r\n' + message('Я в отпуске', reference='<original@mail.ru>')
+    apply_dsn_bounce(db, account, 315, raw, expected_uidvalidity=44, reprocess=True)
+    assert company.status == 'sent' and account.imap_last_uid == 500
+    assert db.query(ImapProcessedMessage).one().outcome == 'automatic_reply'
+    event = db.query(ActivityHistory).filter_by(event_type='email_reply').one()
+    event.event_data = {**event.event_data, 'read_at': '2026-09-17T10:00:00+00:00'}
+    db.commit()
+    apply_dsn_bounce(db, account, 315, raw, expected_uidvalidity=44, reprocess=True)
+    apply_client_reply(db, account.id, raw, mailbox='Archive', uid=5)
+    db.commit()
+    assert db.query(ActivityHistory).filter_by(event_type='email_reply').count() == 1
+    assert event.event_data['read_at'] == '2026-09-17T10:00:00+00:00'
+    assert account.imap_last_uid == 500 and db.query(EmailSuppression).count() == 0
 
 
 def test_refusal_is_atomic_idempotent_and_suppresses_every_company_address(db):

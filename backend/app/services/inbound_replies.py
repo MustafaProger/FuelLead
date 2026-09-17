@@ -1,4 +1,4 @@
-"""Human replies, with quoted correspondence excluded from refusal detection."""
+"""Client correspondence, with automatic replies excluded from status changes."""
 import hashlib
 import re
 from dataclasses import dataclass
@@ -76,14 +76,17 @@ class ClientReply:
     sent_at: str | None = None
     reply_to: str | None = None
     attachments: tuple[str, ...] = ()
+    is_automatic: bool = False
 
 
 def parse_client_reply(raw: bytes) -> ClientReply | None:
     message = BytesParser(policy=policy.default).parsebytes(raw)
     if message.get_content_type() in ("multipart/report", "message/delivery-status"):
         return None
-    if str(message.get("Auto-Submitted", "no")).lower() != "no" or message.get("List-Id") or message.get("List-Unsubscribe"):
+    auto_submitted = str(message.get("Auto-Submitted", "no")).split(";", 1)[0].strip().lower()
+    if auto_submitted not in ("no", "auto-replied") or message.get("List-Id") or message.get("List-Unsubscribe"):
         return None
+    is_automatic = auto_submitted == "auto-replied"
     addresses = getaddresses(message.get_all("From", []))
     if len(addresses) != 1 or not (sender := normalize_email(addresses[0][1])):
         return None
@@ -124,7 +127,7 @@ def parse_client_reply(raw: bytes) -> ClientReply | None:
         if not text:
             return None
     normalized = " ".join(detection_text.lower().replace("ё", "е").split())
-    match = REFUSAL_RE.search(normalized)
+    match = None if is_automatic else REFUSAL_RE.search(normalized)
     # A quoted opt-out instruction or negation is not the client's request.
     if match and re.search(r"(?:фраз\w*|слов\w*|ответьте|если|почему)\s.{0,45}$", normalized[:match.start()]):
         match = None
@@ -144,7 +147,7 @@ def parse_client_reply(raw: bytes) -> ClientReply | None:
     return ClientReply(sender, message_id, references, text, match.group() if match else None,
                        hashlib.sha256((sender + "\n" + message_id).encode() if message_id else raw).hexdigest(),
                        str(message.get("Subject", ""))[:998], full_body.strip()[:200000], sent_at,
-                       reply_to, attachments)
+                       reply_to, attachments, is_automatic)
 
 
 def match_reply(db: Session, reply: ClientReply, account_id: int) -> tuple[list[Company], OutreachDelivery | None]:
@@ -165,7 +168,22 @@ def match_reply(db: Session, reply: ClientReply, account_id: int) -> tuple[list[
                 company_ids.add(history.company_id)
         if company_ids:
             break
-    if not company_ids:
+    if not company_ids and reply.is_automatic:
+        # An automatic message without references must correspond to an actual
+        # outgoing message on this mailbox, not merely an imported contact.
+        deliveries = list(db.scalars(select(OutreachDelivery).where(
+            OutreachDelivery.sender_account_id == account_id,
+            func.lower(OutreachDelivery.recipient) == reply.sender,
+            OutreachDelivery.status == "accepted",
+        ).order_by(OutreachDelivery.id.desc())))
+        company_ids.update(d.company_id for d in deliveries if d.company_id)
+        delivery = deliveries[0] if deliveries else None
+        company_ids.update(db.scalars(select(ActivityHistory.company_id).where(
+            ActivityHistory.event_type == "email_sent",
+            ActivityHistory.event_data["sender_account_id"].as_integer() == account_id,
+            func.lower(ActivityHistory.event_data["recipient"].as_string()) == reply.sender,
+        )))
+    elif not company_ids:
         company_ids.update(db.scalars(select(CompanyEmail.company_id).where(
             func.lower(CompanyEmail.email) == reply.sender)))
         if company_ids:
@@ -220,7 +238,8 @@ def apply_client_reply(db: Session, account_id: int, raw: bytes, *, now: datetim
         message_data = {"subject": reply.subject, "body": reply.body, "text": reply.text,
                         "references": list(reply.references), "sent_at": reply.sent_at,
                         "reply_to": reply.reply_to, "attachments": list(reply.attachments),
-                        "sender_account_id": account_id, "content_version": 1}
+                        "sender_account_id": account_id, "content_version": 1,
+                        "is_automatic": reply.is_automatic}
         if existing:
             # Historical rescans enrich the same event without changing status/read state.
             prior_data = existing.event_data or {}
@@ -231,15 +250,16 @@ def apply_client_reply(db: Session, account_id: int, raw: bytes, *, now: datetim
         if reply.refusal:
             reject_company(db, company, reason="Отказ клиента: " + reply.refusal, now=timestamp,
                            extra_addresses=[reply.sender, *([delivery.recipient] if delivery else [])], delivery=delivery)
-        elif company.status in ("new", "sent"):
+        elif not reply.is_automatic and company.status in ("new", "sent"):
             company.status = "answered"
             company.last_updated_at = timestamp
         db.add(ActivityHistory(company_id=company.id, event_type="email_reply",
-            description=("Получен отказ клиента" if reply.refusal else "Получен ответ клиента") + f" от {reply.sender}",
+            description=("Получен автоматический ответ" if reply.is_automatic else
+                         "Получен отказ клиента" if reply.refusal else "Получен ответ клиента") + f" от {reply.sender}",
             from_status=previous, to_status=company.status, created_at=timestamp,
             event_data={"reply_key": reply.key, "message_id": reply.message_id,
                         "sender_account_id": account_id, "sender": reply.sender,
                         "mailbox": mailbox, "uid": uid, **message_data,
                         "refusal": reply.refusal, "delivery_id": delivery.id if delivery else None}))
         db.flush()
-    return ("rejected" if reply.refusal else "answered"), delivery.id if delivery else None
+    return ("automatic_reply" if reply.is_automatic else "rejected" if reply.refusal else "answered"), delivery.id if delivery else None
