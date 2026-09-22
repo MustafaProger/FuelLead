@@ -3,7 +3,7 @@ from datetime import date
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from app.mail_providers import MAIL_PROVIDERS
 from app.config import DEFAULT_OKVED_CODES
@@ -86,9 +86,12 @@ class SearchRunCreate(BaseModel):
 
 class EmailTemplateUpdate(BaseModel):
     subject_template: str = Field(min_length=1, max_length=998)
-    body_template: str = Field(min_length=1, max_length=20_000)
+    body_template: str = Field(default="", max_length=20_000)
+    body_format: Literal["text", "html"] = "text"
+    html_template: str = Field(default="", max_length=200_000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=5)
 
-    @field_validator("subject_template", "body_template")
+    @field_validator("subject_template")
     @classmethod
     def strip_template(cls, value: str) -> str:
         value = value.strip()
@@ -96,11 +99,22 @@ class EmailTemplateUpdate(BaseModel):
             raise ValueError("Template field cannot be empty")
         return value
 
+    @model_validator(mode="after")
+    def validate_content(self):
+        if "\r" in self.subject_template or "\n" in self.subject_template:
+            raise ValueError("Тема должна занимать одну строку")
+        if not (self.html_template if self.body_format == "html" else self.body_template).strip():
+            raise ValueError("Заполните содержимое выбранного формата письма")
+        return self
+
 
 class EmailPreviewRequest(BaseModel):
-    company_id: int = Field(ge=1)
+    company_id: int | None = Field(default=None, ge=1)
     subject_template: str | None = Field(default=None, max_length=998)
     body_template: str | None = Field(default=None, max_length=20_000)
+    body_format: Literal["text", "html"] | None = None
+    html_template: str | None = Field(default=None, max_length=200_000)
+    attachment_ids: list[str] | None = Field(default=None, max_length=5)
     recipient: str | None = Field(default=None, max_length=320)
 
 

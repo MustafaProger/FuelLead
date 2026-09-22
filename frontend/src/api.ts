@@ -10,6 +10,8 @@ import type {
   EmailPreview,
   EmailSendResult,
   EmailTemplate,
+  EmailTemplateDraft,
+  EmailAttachment,
   EmailSuppression,
   Filters,
   Health,
@@ -140,11 +142,16 @@ export const api = {
   latestSearchRun: () => request<SearchRun | null>("/search-runs/latest"),
   stopSearch: (id: number) => request<SearchRun>(`/search-runs/${id}/stop`, { method: "POST" }),
   emailTemplate: () => request<EmailTemplate>("/email-template"),
-  saveEmailTemplate: (subjectTemplate: string, bodyTemplate: string) =>
-    request<EmailTemplate>("/email-template", {
-      method: "PUT",
-      body: JSON.stringify({ subject_template: subjectTemplate, body_template: bodyTemplate }),
+  saveEmailTemplate: (draft: EmailTemplateDraft) =>
+    request<EmailTemplate>("/email-template", { method: "PUT", body: JSON.stringify(draft) }),
+  artelOffer: () => request<Omit<EmailTemplateDraft, "attachment_ids">>("/email-template/artel-offer"),
+  previewTemplateDraft: (draft: EmailTemplateDraft, companyId?: number) =>
+    request<EmailPreview>("/email-template/preview", { method: "POST", body: JSON.stringify({ ...draft, company_id: companyId }) }),
+  uploadEmailAttachment: (file: File) =>
+    request<EmailAttachment>(`/email-template/attachments?filename=${encodeURIComponent(file.name)}`, {
+      method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: file,
     }),
+  attachmentUrl: (id: string) => `${API_BASE}/email-template/attachments/${encodeURIComponent(id)}`,
   previewEmail: (
     companyId: number,
     subjectTemplate: string,

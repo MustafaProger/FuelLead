@@ -39,6 +39,31 @@ def create_database() -> None:
     _upgrade_search_run_schema()
     _upgrade_imap_uidvalidity_schema()
     _upgrade_sqlite_sender_providers()
+    _upgrade_email_content_schema()
+
+
+def _upgrade_email_content_schema() -> None:
+    """Add content fields without changing saved text, campaigns or deliveries."""
+    additions = {
+        "email_templates": {
+            "body_format": "VARCHAR(10) NOT NULL DEFAULT 'text'",
+            "html_template": "TEXT NOT NULL DEFAULT ''",
+            "attachment_ids": "JSON NOT NULL DEFAULT '[]'",
+        },
+        "outreach_campaigns": {"attachment_ids": "JSON NOT NULL DEFAULT '[]'"},
+        "outreach_deliveries": {"html_body": "TEXT"},
+    }
+    with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.exec_driver_sql("SELECT pg_advisory_xact_lock(701337, 20260921)")
+        tables = set(inspect(connection).get_table_names())
+        for table, fields in additions.items():
+            if table not in tables:
+                continue
+            columns = {c["name"] for c in inspect(connection).get_columns(table)}
+            for name, definition in fields.items():
+                if name not in columns:
+                    connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _upgrade_sqlite_sender_providers() -> None:

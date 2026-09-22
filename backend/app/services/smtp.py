@@ -8,10 +8,13 @@ import ssl
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
+
 from email import policy
 from email.utils import format_datetime, formataddr, make_msgid
 from datetime import datetime, timezone
 
+from app.services.email_attachments import MailAttachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS
+from app.services.email_branding import inline_letterhead
 from app.mail_providers import MAIL_PROVIDERS
 from app.models import SenderAccount
 from app.services.imap_bounces import IMAPCollectorError, MailruIMAPClient
@@ -341,6 +344,8 @@ class MailruSMTPClient:
         subject: str,
         text_body: str,
         *,
+        html_body: str | None = None,
+        attachments: list[MailAttachment] | tuple[MailAttachment, ...] = (),
         delivery_id: int | None = None,
         campaign_id: int | None = None,
         in_reply_to: str | None = None,
@@ -389,6 +394,23 @@ class MailruSMTPClient:
         # Always emit CRLF and a 7-bit-safe body; bytes passed to SMTP.data
         # are not normalized and BODY=8BITMIME is not negotiated here.
         message.set_content(text_body, cte="quoted-printable")
+
+        if html_body is not None:
+            if not html_body.strip():
+                raise SMTPDeliveryError("HTML-письмо не может быть пустым", category="content")
+            html_body, brand_image = inline_letterhead(html_body)
+            message.add_alternative(html_body, subtype="html", cte="quoted-printable")
+            if brand_image:
+                message.get_payload()[-1].add_related(
+                    brand_image.content, maintype="image", subtype="jpeg",
+                    cid=f"<{brand_image.content_id}>", disposition="inline",
+                    filename="artel-letterhead.jpeg",
+                )
+        if len(attachments) > MAX_ATTACHMENTS or sum(len(file.content) for file in attachments) > MAX_ATTACHMENT_BYTES:
+            raise SMTPDeliveryError("Превышен лимит вложений: до 5 файлов, суммарно 10 МБ", category="content")
+        for file in attachments:
+            main_type, sub_type = file.content_type.split("/", 1)
+            message.add_attachment(file.content, maintype=main_type, subtype=sub_type, filename=file.filename)
 
         raw_message = message.as_bytes()
         smtp = self._connect()

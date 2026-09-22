@@ -153,21 +153,41 @@ export interface TemplateVariable {
   label: string;
 }
 
+export interface EmailAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+}
+
+export interface EmailTemplateDraft {
+  subject_template: string;
+  body_template: string;
+  body_format: "text" | "html";
+  html_template: string;
+  attachment_ids: string[];
+}
+
 export interface EmailTemplate {
   id: number;
   name: string;
   subject_template: string;
   body_template: string;
+  body_format: "text" | "html";
+  html_template: string;
+  attachments: EmailAttachment[];
   updated_at: string;
   variables: TemplateVariable[];
 }
 
 export interface EmailPreview {
-  company_id: number;
+  company_id: number | null;
   company_name: string;
   recipient: string;
   subject: string;
   body: string;
+  html_body: string | null;
+  attachments: EmailAttachment[];
 }
 
 export interface EmailSendResult {
@@ -219,6 +239,8 @@ export interface OutreachPreflight {
     recipient: string;
     subject: string;
     body: string;
+    html_body: string | null;
+    attachments: EmailAttachment[];
   } | null;
 }
 

@@ -1791,3 +1791,45 @@ button:disabled { transform: none; }
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
   select, textarea, [contenteditable="true"] { font-size: 16px !important; }
 }
+
+/* Letter formats, immutable attachments and isolated email preview. */
+.template-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.template-fields:disabled { opacity: .72; }
+.template-preset { margin-bottom: 22px; white-space: normal; }
+.template-format-switch { display: flex; gap: 4px; padding: 4px; margin-bottom: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--accent-soft); }
+.template-format-switch button { display: flex; flex: 1; justify-content: center; align-items: center; gap: 7px; min-height: 42px; padding: 9px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: inherit; font-size: 13px; cursor: pointer; }
+.template-format-switch button[aria-pressed="true"] { color: var(--accent); background: #fff; box-shadow: var(--shadow-sm); font-weight: 650; }
+.template-format-switch button:focus-visible, .template-file-list button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.form-field .template-html-input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 300px; tab-size: 2; }
+.template-help { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 0 0 14px; }
+.template-fields .variables-section { margin-top: 24px; }
+.template-attachments { margin-top: 26px; padding-top: 20px; border-top: 1px solid var(--border); }
+.template-attachments h3 { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 15px; }
+.template-attachments > p { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.template-file-list { list-style: none; padding: 0; margin: 12px 0 0; }
+.template-file-list li { display: flex; align-items: center; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.template-file-list a { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--accent); font-size: 13px; }
+.template-file-list small { display: block; margin-top: 4px; color: var(--muted); }
+.template-file-list button { display: grid; place-items: center; width: 40px; height: 40px; flex-shrink: 0; border: 1px solid var(--border); border-radius: 9px; background: #fff; color: var(--muted); cursor: pointer; }
+.template-preview-panel { align-self: start; }
+.template-preview-subject { padding: 16px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.template-preview-subject small { display: block; margin-bottom: 6px; color: var(--muted); }
+.template-preview-subject strong { font-size: 14px; }
+.template-preview-content { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.template-preview-content.is-pending { opacity: .55; }
+.template-preview-status { margin: -10px 0 12px; font-size: 12px; color: var(--muted); }
+.email-html-preview { display: block; width: 100%; height: 780px; border: 0; background: #fff; }
+.email-text-preview { margin: 0; padding: 20px; white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.7 Arial, sans-serif; color: var(--graphite); }
+.template-preview-files { display: flex; align-items: center; gap: 7px; margin: 0; padding: 14px; overflow-wrap: anywhere; font-size: 12px; border-top: 1px solid var(--border); }
+.template-save-row { flex-wrap: wrap; }
+@media (min-width: 1280px) {
+  .template-workspace--preview { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+}
+@media (max-width: 600px) {
+  .template-panel { padding: 16px; }
+  .template-format-switch button { font-size: 12px; }
+  .template-fields .form-field input, .template-fields .form-field textarea { font-size: 16px; }
+  .variable-list button { grid-template-columns: minmax(0, 1fr); gap: 3px; padding: 9px 11px; }
+  .email-html-preview { height: 900px; }
+  .template-preset { width: 100%; font-size: 12px; }
+}

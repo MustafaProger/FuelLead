@@ -7,6 +7,7 @@ dependencies = [
   "cryptography>=43,<46",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
+  "nh3>=0.3.7,<0.4",
   "openpyxl>=3.1,<4",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.7,<3",
@@ -26,6 +27,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["templates/*.html", "templates/*.txt", "templates/*.jpeg", "migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -164,6 +164,7 @@ def test_preflight_caps_rendering_without_losing_counts_or_loading_company_detai
         return original_render(template, values)
 
     monkeypatch.setattr(outreach, "render_email_template", record_render)
+    monkeypatch.setattr("app.services.email_templates.render_email_template", record_render)
     event.listen(db, "loaded_as_persistent", record_loaded)
     try:
         preflight = build_outreach_preflight(db, CompanyFilters(), settings)

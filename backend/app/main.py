@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager, suppress
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
+from urllib.parse import quote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -24,6 +25,7 @@ from app.models import (
     CompanyContact,
     ExcludedCompany,
     EmailSuppression,
+    EmailAttachment,
     OutreachCampaign,
     OutreachDelivery,
     SenderAccount,
@@ -58,6 +60,11 @@ from app.services.email_templates import (
     email_template_to_dict,
     get_or_create_email_template,
     render_email_template,
+    render_email_content,
+    artel_offer_preset,
+)
+from app.services.email_attachments import (
+    MAX_ATTACHMENT_BYTES, create_attachment, get_attachments, attachment_metadata, smtp_attachments,
 )
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
 from app.services.outreach import (
@@ -670,7 +677,7 @@ def get_email_template(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    return email_template_to_dict(get_or_create_email_template(db), settings)
+    return email_template_to_dict(get_or_create_email_template(db), settings, db)
 
 
 @app.put("/api/email-template")
@@ -680,17 +687,24 @@ def update_email_template(
     settings: Settings = Depends(get_settings),
 ) -> dict:
     try:
-        render_email_template(update.subject_template, {item: "" for item in ("company_name", "date", "inn", "primary_okved", "email")})
-        render_email_template(update.body_template, {item: "" for item in ("company_name", "date", "inn", "primary_okved", "email")})
+        values = {item: "Пример" for item in ("company_name", "date", "inn", "primary_okved", "email")}
+        render_email_template(update.subject_template, values)
+        render_email_template(update.body_template, values)
+        render_email_template(update.html_template, values)
+        render_email_content(update.body_format, update.body_template, update.html_template, values, settings)
+        get_attachments(db, update.attachment_ids)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     template = get_or_create_email_template(db)
     template.subject_template = update.subject_template
     template.body_template = update.body_template
+    template.body_format = update.body_format
+    template.html_template = update.html_template
+    template.attachment_ids = list(update.attachment_ids)
     template.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(template)
-    return email_template_to_dict(template, settings)
+    return email_template_to_dict(template, settings, db)
 
 
 @app.post("/api/email-template/preview")
@@ -699,27 +713,55 @@ def preview_email_template(
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    company = db.get(Company, request.company_id)
-    if not company:
+    company = db.get(Company, request.company_id) if request.company_id else Company(
+        name='ООО «Пример»', inn="7700000000", primary_okved_code="49.41", primary_okved_name="Грузовые перевозки")
+    if company is None:
         raise HTTPException(status_code=404, detail="Компания не найдена")
-    recipient = _company_recipient(company, request.recipient)
+    recipient = _company_recipient(company, request.recipient) if request.company_id else "client@example.ru"
     template = get_or_create_email_template(db)
     values = company_template_values(company, recipient, settings)
     try:
-        subject = render_email_template(request.subject_template or template.subject_template, values)
-        body = append_opt_out_footer(
-            render_email_template(request.body_template or template.body_template, values),
-            settings,
-        )
+        subject = render_email_template(request.subject_template if request.subject_template is not None else template.subject_template, values)
+        body, html_body = render_email_content(
+            request.body_format if request.body_format is not None else template.body_format,
+            request.body_template if request.body_template is not None else template.body_template,
+            request.html_template if request.html_template is not None else template.html_template, values, settings)
+        files = get_attachments(db, request.attachment_ids if request.attachment_ids is not None else template.attachment_ids)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return {
-        "company_id": company.id,
-        "company_name": company.name,
-        "recipient": recipient,
-        "subject": subject,
-        "body": body,
-    }
+    return {"company_id": company.id, "company_name": company.name, "recipient": recipient,
+            "subject": subject, "body": body, "html_body": html_body,
+            "attachments": [attachment_metadata(file) for file in files]}
+
+
+@app.get("/api/email-template/artel-offer")
+def get_artel_offer() -> dict:
+    return artel_offer_preset()
+
+
+@app.post("/api/email-template/attachments", status_code=201)
+async def upload_email_attachment(request: Request, filename: str = Query(min_length=1, max_length=180),
+                                  db: Session = Depends(get_db)) -> dict:
+    content = bytearray()
+    async for chunk in request.stream():
+        if len(content) + len(chunk) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="Файл не должен превышать 10 МБ")
+        content.extend(chunk)
+    try:
+        return attachment_metadata(create_attachment(db, filename, bytes(content)))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/email-template/attachments/{attachment_id}")
+def download_email_attachment(attachment_id: str, db: Session = Depends(get_db)):
+    file = db.get(EmailAttachment, attachment_id)
+    if not file:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return Response(file.content, media_type=file.content_type, headers={
+        "Content-Disposition": "attachment; filename*=UTF-8''" + quote(file.filename, safe=""),
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, no-store",
+    })
 
 
 @app.get("/api/conversations")
@@ -807,10 +849,17 @@ def send_company_email(
         recipient = recipients[0]
         values = company_template_values(company, recipient, settings)
         subject = render_email_template(request.subject or template.subject_template, values).strip()
-        body = append_opt_out_footer(
-            render_email_template(request.body or template.body_template, values), settings
-        )
-        result = sender.send(recipient, subject, body)
+        body, html_body = render_email_content(
+            "text" if request.body is not None else template.body_format,
+            request.body if request.body is not None else template.body_template,
+            template.html_template, values, settings)
+        files = get_attachments(db, template.attachment_ids)
+        content_options = {}
+        if html_body:
+            content_options["html_body"] = html_body
+        if files:
+            content_options["attachments"] = smtp_attachments(db, template.attachment_ids)
+        result = sender.send(recipient, subject, body, **content_options)
         sent_messages.append((recipient, result.message_id, subject))
     except (SMTPDeliveryError, CredentialEncryptionError, ValueError) as exc:
         reason = exc.safe_message if isinstance(exc, SMTPDeliveryError) else str(exc)
@@ -851,6 +900,8 @@ def send_company_email(
                     "message_id": message_id,
                     "subject": subject,
                     "body": body,
+                    "html_body": html_body,
+                    "attachments": [attachment_metadata(file) for file in files],
                     "sender_email": sender_account.email,
                     "sender_account_id": sender_account.id,
                     "sent_copy_saved": result.sent_copy_saved,

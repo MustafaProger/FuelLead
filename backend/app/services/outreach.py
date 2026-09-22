@@ -26,7 +26,8 @@ from app.models import (
 from app.queries import build_company_query
 from app.schemas import CompanyFilters
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
-from app.services.email_templates import company_template_values, get_or_create_email_template, render_email_template
+from app.services.email_templates import company_template_values, get_or_create_email_template, render_email_template, render_email_content, append_opt_out_footer
+from app.services.email_attachments import attachment_metadata, get_attachments, smtp_attachments
 from app.services.mail_dispatch import mail_dispatch_slot
 from app.services.provider import normalize_email
 from app.services.sender_accounts import batch_size_for_successes
@@ -54,6 +55,7 @@ class OutreachCandidate:
     recipient_domain: str
     subject: str
     body: str
+    html_body: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,14 +75,6 @@ def _aware(value: datetime | None) -> datetime | None:
 def _iso(value: datetime | None) -> str | None:
     aware = _aware(value)
     return aware.isoformat() if aware else None
-
-
-def append_opt_out_footer(body: str, settings: Settings) -> str:
-    footer = settings.outreach_opt_out_text.strip()
-    clean_body = body.strip()
-    if not footer or footer in clean_body:
-        return clean_body
-    return f"{clean_body}\n\n—\n{footer}"
 
 
 def mark_company_send_failed(db: Session, company_id: int | None, recipient: str, reason: str, *, campaign_id: int | None = None, occurred_at: datetime | None = None) -> Company | None:
@@ -192,8 +186,8 @@ def select_outreach_candidates(db: Session, filters: CompanyFilters, settings: S
             continue
         values = company_template_values(company, recipient, settings)
         subject = render_email_template(template.subject_template, values).strip()
-        body = append_opt_out_footer(render_email_template(template.body_template, values), settings)
-        candidates.append(OutreachCandidate(company.id, company.name, company.inn, recipient, recipient.rsplit("@", 1)[1], subject, body))
+        body, html_body = render_email_content(template.body_format, template.body_template, template.html_template, values, settings)
+        candidates.append(OutreachCandidate(company.id, company.name, company.inn, recipient, recipient.rsplit("@", 1)[1], subject, body, html_body))
     return OutreachSelection(len(companies), eligible_count, tuple(candidates), dict(skipped))
 
 
@@ -232,14 +226,15 @@ def build_outreach_preflight(db: Session, filters: CompanyFilters, settings: Set
     selection = select_outreach_candidates(db, filters, settings)
     senders = _verified_senders(db)
     template = get_or_create_email_template(db)
+    attachments = get_attachments(db, template.attachment_ids)
     snapshot: OutreachCampaign | None = None
     policy = outreach_policy_dict(settings)
     policy["sender_daily_limits"] = {
         str(sender.id): sender.daily_limit for sender in senders
     }
     if selection.candidates and senders:
-        snapshot = OutreachCampaign(status="draft", filters=filters.model_dump(mode="json"), matched_count=selection.matched_count, recipient_count=len(selection.candidates), daily_limit=sum(sender.daily_limit for sender in senders), hourly_limit=0, min_interval_seconds=settings.outreach_message_interval_min_seconds, max_per_domain_per_day=0, subject_snapshot=template.subject_template, body_snapshot=template.body_template, recipients_snapshot=[{"company_id": item.company_id, "recipient": item.recipient} for item in selection.candidates], sender_account_ids=[sender.id for sender in senders], scheduler_settings=policy, snapshot_expires_at=now + timedelta(seconds=settings.outreach_snapshot_ttl_seconds))
-        snapshot.deliveries.extend(OutreachDelivery(company_id=item.company_id, company_name=item.company_name, company_inn=item.company_inn, recipient=item.recipient, recipient_domain=item.recipient_domain, subject=item.subject, body=item.body) for item in selection.candidates)
+        snapshot = OutreachCampaign(status="draft", filters=filters.model_dump(mode="json"), matched_count=selection.matched_count, recipient_count=len(selection.candidates), daily_limit=sum(sender.daily_limit for sender in senders), hourly_limit=0, min_interval_seconds=settings.outreach_message_interval_min_seconds, max_per_domain_per_day=0, subject_snapshot=template.subject_template, body_snapshot=template.body_template, attachment_ids=list(template.attachment_ids), recipients_snapshot=[{"company_id": item.company_id, "recipient": item.recipient} for item in selection.candidates], sender_account_ids=[sender.id for sender in senders], scheduler_settings=policy, snapshot_expires_at=now + timedelta(seconds=settings.outreach_snapshot_ttl_seconds))
+        snapshot.deliveries.extend(OutreachDelivery(company_id=item.company_id, company_name=item.company_name, company_inn=item.company_inn, recipient=item.recipient, recipient_domain=item.recipient_domain, subject=item.subject, body=item.body, html_body=item.html_body) for item in selection.candidates)
         db.add(snapshot)
         db.commit()
         db.refresh(snapshot)
@@ -256,7 +251,7 @@ def build_outreach_preflight(db: Session, filters: CompanyFilters, settings: Set
         "snapshot_id": snapshot.id if snapshot else None,
         "snapshot_expires_at": _iso(snapshot.snapshot_expires_at) if snapshot else None,
         "policy": policy,
-        "sample": {"company_name": sample.company_name, "recipient": sample.recipient, "subject": sample.subject, "body": sample.body} if sample else None,
+        "sample": {"company_name": sample.company_name, "recipient": sample.recipient, "subject": sample.subject, "body": sample.body, "html_body": sample.html_body, "attachments": [attachment_metadata(file) for file in attachments]} if sample else None,
     }
 
 
@@ -803,6 +798,7 @@ def _process_outreach_tick(settings: Settings, *, sender_factory: Callable, sess
         delivery, account, token = claim
         delivery_id, campaign_id, account_id = delivery.id, campaign.id, account.id
         recipient, subject, body = delivery.recipient, delivery.subject, delivery.body
+        html_body, attachment_ids = delivery.html_body, list(campaign.attachment_ids)
     send_started = False
     used_password = None
     checked_at = None
@@ -820,8 +816,16 @@ def _process_outreach_tick(settings: Settings, *, sender_factory: Callable, sess
                 timeout_seconds=settings.mail_smtp_timeout_seconds,
                 imap_timeout_seconds=settings.mail_imap_timeout_seconds,
             )
+            content_options = {}
+            if html_body:
+                content_options["html_body"] = html_body
+            if attachment_ids:
+                try:
+                    content_options["attachments"] = smtp_attachments(credential_db, attachment_ids)
+                except ValueError as exc:
+                    raise SMTPDeliveryError("Не удалось подготовить вложения письма", category="content") from exc
             send_started = True
-            result = client.send(recipient, subject, body, delivery_id=delivery_id, campaign_id=campaign_id)
+            result = client.send(recipient, subject, body, delivery_id=delivery_id, campaign_id=campaign_id, **content_options)
             if isinstance(result, str):
                 result = SMTPAccepted(result, "250", "accepted")
     except SMTPDeliveryError as exc:

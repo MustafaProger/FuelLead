@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -252,10 +253,25 @@ class EmailTemplate(Base):
     name: Mapped[str] = mapped_column(String(120), default="Основной шаблон", nullable=False)
     subject_template: Mapped[str] = mapped_column(Text, nullable=False)
     body_template: Mapped[str] = mapped_column(Text, nullable=False)
+    body_format: Mapped[str] = mapped_column(String(10), default="text", server_default="text", nullable=False)
+    html_template: Mapped[str] = mapped_column(Text, default="", server_default="", nullable=False)
+    attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
     )
+
+
+class EmailAttachment(Base):
+    """Immutable files; campaign snapshots retain them after template edits."""
+    __tablename__ = "email_attachments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    filename: Mapped[str] = mapped_column(String(180), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(150), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class SenderAccount(Base):
@@ -394,6 +410,7 @@ class OutreachCampaign(Base):
     pause_reason: Mapped[str | None] = mapped_column(Text)
     subject_snapshot: Mapped[str | None] = mapped_column(Text)
     body_snapshot: Mapped[str | None] = mapped_column(Text)
+    attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]", nullable=False)
     recipients_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
     sender_account_ids: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
     scheduler_settings: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
@@ -455,6 +472,7 @@ class OutreachDelivery(Base):
     recipient_domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     subject: Mapped[str] = mapped_column(Text, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    html_body: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="queued", nullable=False, index=True)
     message_id: Mapped[str | None] = mapped_column(String(255), index=True)
     error_message: Mapped[str | None] = mapped_column(Text)
