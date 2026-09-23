@@ -233,6 +233,24 @@ def _rejection(code: int, response: bytes, *, stage: str, password: str, recipie
         or enhanced in ("4.1.1", "4.1.2", "4.1.3", "4.1.4", "4.1.6", "5.1.4")
     ):
         mapped.category = "recipient"
+    elif (
+        stage == "DATA" and code in (550, 554)
+        and enhanced in (str(code), "5.7.1")
+        and re.match(
+            r"^(?:5\.7\.1\s+)?(?:spam message (?:rejected|discarded)|message rejected as spam)\b",
+            safe_smtp_text(response),
+            re.IGNORECASE,
+        )
+    ):
+        # A confirmed content-level spam refusal must stop this campaign,
+        # not retry the same message through every remaining sender account.
+        # Stage and status checks keep auth, temporary and recipient errors
+        # on their existing paths even when their response mentions spam.
+        mapped.category = "policy"
+        mapped.safe_message = (
+            f"Почтовый сервис отклонил письмо как спам (SMTP {enhanced}): "
+            f"{mapped.smtp_response}"
+        )
     mapped.safe_message = f"{stage}: {mapped.safe_message}"
     mapped.args = (mapped.safe_message,)
     return mapped

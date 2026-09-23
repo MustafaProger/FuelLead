@@ -462,6 +462,68 @@ def test_sender_failure_keeps_only_recipient_queued_for_another_account(db, cate
     assert healthy.sent_today == 1
 
 
+@pytest.mark.parametrize("response", [b"spam message rejected", b"5.7.1 spam message discarded"])
+def test_data_spam_rejection_pauses_campaign_without_rotating_or_retrying_senders(db, response):
+    from app.services.smtp import _rejection
+
+    settings = settings_with_key()
+    rejected = add_sender(db, settings, "one@mail.ru")
+    healthy = add_sender(db, settings, "two@mail.ru")
+    company = add_company(db, 1, email="lead@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+    campaign.next_send_at = now
+    campaign.round_rest_until = now + timedelta(minutes=30)
+    db.commit()
+    attempts = []
+
+    class SpamRejected(RecordingSMTP):
+        def send(self, recipient, *_args, **_kwargs):
+            attempts.append((self.account.id, recipient))
+            raise _rejection(550, response, stage="DATA", password="app-password", recipient=recipient)
+
+    tick_at_schedule(db, settings, SpamRejected, now)
+
+    delivery = campaign.deliveries[0]
+    assert campaign.status == "paused"
+    assert "отклонил письмо как спам" in campaign.pause_reason
+    assert "Повторная рассылка остановлена" in campaign.pause_reason
+    assert campaign.next_send_at is None
+    assert campaign.round_rest_until is None
+    assert campaign.sender_position == 0
+    assert campaign.batch_position == 0
+    assert campaign.worker_claim_token is None
+    assert delivery.status == "queued"
+    assert delivery.sender_account_id == rejected.id
+    assert delivery.claim_token is None
+    assert delivery.smtp_response == response.decode()
+    assert delivery.smtp_code == ("5.7.1" if response.startswith(b"5.7.1") else "550")
+    assert "отклонил письмо как спам" in delivery.error_message
+    assert campaign.failed_count == campaign.bounced_count == campaign.accepted_count == 0
+    assert rejected.verification_status == "failed"
+    assert rejected.verification_error_category == "policy"
+    assert rejected.verification_retry_at is None
+    assert rejected.block_reason == delivery.error_message
+    assert rejected.sent_today == 0
+    assert healthy.verification_status == "verified"
+    assert healthy.verification_error is None
+    assert healthy.verification_error_category is None
+    assert healthy.blocked_until_round is None
+    assert healthy.block_reason is None
+    assert healthy.sent_today == 0
+    assert company.status == "new"
+    assert not db.query(EmailSuppression).count()
+    assert not db.query(ActivityHistory).filter(ActivityHistory.event_type == "email_send_failed").count()
+
+    tick_at_schedule(db, settings, SpamRejected, now + timedelta(days=1))
+
+    assert attempts == [(rejected.id, "lead@example.ru")]
+    assert campaign.status == "paused"
+    assert delivery.status == "queued"
+    assert healthy.verification_status == "verified"
+    assert healthy.sent_today == 0
+
+
 def test_all_auth_blocked_pauses_and_password_repair_can_resume_same_recipient(db):
     RecordingSMTP.sent = []
     settings = settings_with_key()
@@ -546,7 +608,8 @@ def test_recipient_or_content_error_keeps_sender_healthy_and_address_unsuppresse
 
 
 @pytest.mark.parametrize("changed_field", ["password", "verification"])
-def test_late_auth_error_does_not_overwrite_repaired_account(db, changed_field):
+@pytest.mark.parametrize("category", ["auth", "policy"])
+def test_late_sender_error_does_not_overwrite_repaired_account(db, changed_field, category):
     settings = settings_with_key()
     account = add_sender(db, settings, "one@mail.ru")
     add_company(db, 1, email="lead@example.ru")
@@ -565,13 +628,16 @@ def test_late_auth_error_does_not_overwrite_repaired_account(db, changed_field):
                 updated.blocked_until_round = None
                 updated.verification_error = None
                 other_db.commit()
-            raise SMTPDeliveryError("Старый пароль отклонён", category="auth")
+            raise SMTPDeliveryError("Предыдущая попытка отклонена", category=category)
 
     tick_at_schedule(db, settings, RepairDuringSend, datetime.now(timezone.utc))
     assert account.verification_status == "verified"
     assert account.verification_error is None
     assert account.blocked_until_round is None
     assert campaign.deliveries[0].status == "queued"
+    if category == "policy":
+        assert campaign.status == "paused"
+        assert "отклонил письмо как спам" in campaign.pause_reason
 
 
 def test_unclassified_error_inside_send_is_uncertain_and_never_retried(db):
@@ -591,7 +657,8 @@ def test_unclassified_error_inside_send_is_uncertain_and_never_retried(db):
 
 
 @pytest.mark.parametrize("action", ["pause", "stop"])
-def test_user_action_during_definite_sender_failure_is_preserved(db, action):
+@pytest.mark.parametrize("category", ["connection", "policy"])
+def test_user_action_during_definite_sender_failure_is_preserved(db, action, category):
     settings = settings_with_key()
     add_sender(db, settings, "one@mail.ru")
     add_company(db, 1, email="lead@example.ru")
@@ -603,12 +670,17 @@ def test_user_action_during_definite_sender_failure_is_preserved(db, action):
             with factory() as other_db:
                 active = other_db.get(OutreachCampaign, campaign.id)
                 (pause_outreach_campaign if action == "pause" else stop_outreach_campaign)(other_db, active)
-            raise SMTPDeliveryError("Временная ошибка", category="connection")
+            raise SMTPDeliveryError("SMTP-попытка отклонена", category=category)
 
     tick_at_schedule(db, settings, PauseOrStopDuringSend, datetime.now(timezone.utc))
     assert campaign.status == ("paused" if action == "pause" else "stopped")
     assert campaign.deliveries[0].status == ("queued" if action == "pause" else "cancelled")
     assert campaign.worker_claim_token is None
+    if category == "policy":
+        assert campaign.next_send_at is None
+        assert campaign.round_rest_until is None
+        assert campaign.sender_position == 0
+        assert not db.query(EmailSuppression).count()
 
 
 def test_permanent_recipient_bounce_is_suppressed_and_campaign_continues(db):

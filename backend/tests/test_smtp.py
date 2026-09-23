@@ -199,13 +199,14 @@ def test_wire_message_is_crlf_and_7bit_safe_with_russian_body():
     assert BytesParser(policy=policy.default).parsebytes(payload).get_content().replace("\r\n", "\n") == "Первая строка\n.Вторая строка\n"
 
 
-@pytest.mark.parametrize("code,reply", [(550, b"spam message rejected"), (554, b"5.7.1 policy refusal"), (450, b"4.2.0 try later")])
-def test_rcpt_policy_and_temporary_refusals_do_not_suppress_recipient(code, reply):
+@pytest.mark.parametrize("code,reply,category", [(550, b"spam message rejected", "provider"), (554, b"5.7.1 policy refusal", "provider"), (450, b"4.2.0 try later", "recipient")])
+def test_rcpt_policy_and_temporary_refusals_do_not_suppress_recipient(code, reply, category):
     class RefusingSMTP(FakeSMTP):
         def rcpt(self, recipient): return code, reply
     with pytest.raises(SMTPDeliveryError) as caught:
         MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@example.ru", "Subject", "Body")
     assert caught.value.permanent_recipient_failure is False
+    assert caught.value.category == category
     assert caught.value.smtp_response == reply.decode()
     assert "RCPT" in caught.value.safe_message
 
@@ -218,10 +219,50 @@ def test_data_refusal_preserves_safe_provider_reason(raised):
             return 550, b"spam message rejected password=secret"
     with pytest.raises(SMTPDeliveryError) as caught:
         MailruSMTPClient(account(), "secret", smtp_factory=RefusingSMTP).send("lead@example.ru", "Subject", "Body")
-    assert caught.value.category == "provider"
+    assert caught.value.category == "policy"
     assert caught.value.uncertain is False
+    assert caught.value.permanent_recipient_failure is False
     assert "spam message rejected" in caught.value.smtp_response
     assert "secret" not in caught.value.safe_message
+
+
+@pytest.mark.parametrize("code,response", [
+    (550, b"spam message rejected. Please contact support"),
+    (550, b"Spam message discarded"),
+    (554, b"5.7.1 spam message rejected"),
+    (550, b"5.7.1 Message rejected as spam"),
+])
+def test_confirmed_data_spam_refusal_is_policy_not_recipient_failure(code, response):
+    from app.services.smtp import _rejection
+
+    error = _rejection(code, response, stage="DATA", password="secret", recipient="lead@example.ru")
+
+    assert error.category == "policy"
+    assert not error.permanent_recipient_failure
+    assert not error.uncertain
+    assert error.smtp_response == response.decode()
+    assert "отклонил письмо как спам" in error.safe_message
+
+
+@pytest.mark.parametrize("stage,code,response,category,permanent", [
+    ("RCPT", 550, b"spam message rejected", "provider", False),
+    ("MAIL FROM", 550, b"spam message rejected", "provider", False),
+    ("AUTH", 550, b"spam message rejected", "provider", False),
+    ("DATA", 451, b"4.7.1 spam message rejected", "temporary", False),
+    ("DATA", 450, b"spam message rejected", "temporary", False),
+    ("DATA", 535, b"5.7.8 spam message rejected", "auth", False),
+    ("DATA", 550, b"5.7.8 spam message rejected", "provider", False),
+    ("DATA", 550, b"5.1.1 spam message rejected", "recipient", True),
+    ("DATA", 550, b"5.7.1 policy refusal", "provider", False),
+    ("DATA", 550, b"unknown error; see spam documentation", "provider", False),
+])
+def test_spam_policy_match_preserves_other_stages_statuses_and_unknown_reasons(stage, code, response, category, permanent):
+    from app.services.smtp import _rejection
+
+    error = _rejection(code, response, stage=stage, password="secret", recipient="lead@example.ru")
+
+    assert error.category == category
+    assert error.permanent_recipient_failure is permanent
 
 
 def test_temporary_auth_error_is_retried_and_not_reported_as_bad_password():

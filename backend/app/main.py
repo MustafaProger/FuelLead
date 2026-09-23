@@ -89,7 +89,7 @@ from app.services.provider import normalize_email
 from app.services.sender_accounts import (
     SenderAccountError,
     create_sender_account,
-    send_test_message,
+    send_test_message_and_reconcile,
     sender_account_to_dict,
     sender_used_by_active_campaign,
     update_sender_account,
@@ -336,7 +336,7 @@ def send_mailbox_test_email(
         )
     try:
         content = {key: value for key, value in {"subject": request.subject, "body": request.body}.items() if value is not None}
-        result = send_test_message(account, request.recipient, settings, **content)
+        result = send_test_message_and_reconcile(db, account, request.recipient, settings, **content)
     except (SenderAccountError, CredentialEncryptionError, SMTPDeliveryError) as exc:
         detail = exc.safe_message if isinstance(exc, SMTPDeliveryError) else str(exc)
         raise HTTPException(status_code=502, detail=detail) from exc

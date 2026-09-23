@@ -737,6 +737,25 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
         mark_company_send_failed(db, delivery.company_id, delivery.recipient, error.safe_message, campaign_id=campaign.id, occurred_at=now)
         _advance_sender(campaign)
         campaign.next_send_at = now
+    elif error.category == "policy":
+        # Keep the unaccepted message and its evidence for review. Rotating
+        # senders would repeat the same rejected content and spread the hold.
+        delivery.status = "cancelled" if was_stopped else "queued"
+        if update_account_health:
+            account.blocked_until_round = campaign.current_round + 3
+            account.block_reason = error.safe_message
+            account.verification_status = "failed"
+            account.verification_error = error.safe_message
+            account.verification_error_category = "policy"
+            account.verification_retry_at = None
+        if not was_stopped:
+            campaign.status = "paused"
+            campaign.pause_reason = (
+                "Почтовый сервис отклонил письмо как спам. Повторная рассылка остановлена. "
+                "Проверьте письмо и ограничения отправителя в почтовом сервисе перед продолжением"
+            )
+        campaign.next_send_at = None
+        campaign.round_rest_until = None
     else:
         # The server definitely did not accept this message. A mailbox failure
         # must not consume a lead; another healthy sender can use this row.

@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.mail_providers import MAIL_PROVIDERS, SMTP_SENDER_PROVIDERS
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.models import EmailReplyAttempt, OutreachCampaign, OutreachDelivery, SenderAccount
 from app.schemas import SenderAccountCreate, SenderAccountUpdate
 from app.services.credentials import CredentialCipher, CredentialEncryptionError
@@ -16,6 +16,7 @@ from app.services.smtp import MailruSMTPClient, SMTPAccepted, SMTPDeliveryError
 
 
 ACTIVE_CAMPAIGN_STATUSES = ("running", "paused", "cooldown", "interrupted")
+_SMTP_HEALTH_FIELDS = ("verification_status", "verification_error", "verification_error_category", "verification_checked_at", "verification_retry_at", "blocked_until_round", "block_reason", "last_sent_at")
 logger = logging.getLogger("fuellead.mail_health")
 
 
@@ -27,7 +28,14 @@ def batch_size_for_successes(successful_full_batches: int) -> int:
     return min(12, 5 + max(0, successful_full_batches) // 2)
 
 
-def sender_account_to_dict(account: SenderAccount) -> dict:
+def sender_account_to_dict(account: SenderAccount, *, settings: Settings | None = None, now: datetime | None = None) -> dict:
+    timestamp = now or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    today = timestamp.astimezone((settings or get_settings()).timezone).date()
+    # Sending resets the stored counter lazily. A read must still show today's
+    # usage while leaving accounting intact; undated legacy counts stay intact.
+    sent_today = 0 if account.sent_today_date is not None and account.sent_today_date < today else account.sent_today
     return {
         "id": account.id,
         "provider": account.provider,
@@ -52,7 +60,7 @@ def sender_account_to_dict(account: SenderAccount) -> dict:
         if account.verification_checked_at
         else None,
         "daily_limit": account.daily_limit,
-        "sent_today": account.sent_today,
+        "sent_today": sent_today,
         "successful_full_batches": account.successful_full_batches,
         "current_batch_size": account.current_batch_size,
         "blocked_until_round": account.blocked_until_round,
@@ -155,7 +163,7 @@ def verify_sender_account(
     preserve_round_block: bool = False,
 ) -> SenderAccount:
     connection_fields = ("encrypted_password", "email", "smtp_host", "smtp_port", "imap_host", "imap_port", "smtp_enabled", "imap_enabled", "is_active")
-    smtp_fields = ("verification_status", "verification_error", "verification_error_category", "verification_checked_at", "verification_retry_at", "blocked_until_round", "block_reason", "last_sent_at")
+    smtp_fields = _SMTP_HEALTH_FIELDS
     imap_fields = ("imap_verification_status", "imap_verification_error", "imap_verification_checked_at")
     original_connection = _revision(account, connection_fields)
     original_smtp = _revision(account, smtp_fields)
@@ -195,13 +203,21 @@ def verify_sender_account(
         return account
     timestamp = datetime.now(timezone.utc)
     if _revision(account, smtp_fields) == original_smtp:
-        account.verification_status = status
-        account.verification_error = error
-        account.verification_error_category = category
-        account.verification_retry_at = timestamp + timedelta(minutes=5) if status == "temporary_error" else None
-        if status == "verified" and not preserve_round_block:
-            account.blocked_until_round = None
-            account.block_reason = None
+        previous_error = " ".join((account.verification_error or "", account.block_reason or "")).lower()
+        policy_refusal = account.verification_error_category == "policy" or (
+            account.verification_error_category == "provider"
+            and any(reason in previous_error for reason in ("spam message rejected", "spam message discarded"))
+        )
+        # AUTH does not submit a message and cannot prove that a prior DATA
+        # policy refusal has been lifted, including pre-policy legacy rows.
+        if status != "verified" or not policy_refusal:
+            account.verification_status = status
+            account.verification_error = error
+            account.verification_error_category = category
+            account.verification_retry_at = timestamp + timedelta(minutes=5) if status == "temporary_error" else None
+            if status == "verified" and not preserve_round_block:
+                account.blocked_until_round = None
+                account.block_reason = None
         account.verification_checked_at = timestamp
     if _revision(account, imap_fields) == original_imap:
         account.imap_verification_status = imap_status
@@ -264,6 +280,41 @@ def send_test_message(
         subject or "FuelLead — проверка почты SMTP",
         body or "Это одиночное тестовое письмо FuelLead. Рассылка компаниям не запускалась.",
     )
+
+
+def send_test_message_and_reconcile(
+    db: Session,
+    account: SenderAccount,
+    recipient: str,
+    settings: Settings,
+    *,
+    smtp_client_factory: Callable = MailruSMTPClient,
+    subject: str | None = None,
+    body: str | None = None,
+) -> SMTPAccepted:
+    connection_fields = ("encrypted_password", "provider", "email", "smtp_host", "smtp_port", "smtp_enabled", "is_active")
+    original_connection = _revision(account, connection_fields)
+    original_smtp = _revision(account, _SMTP_HEALTH_FIELDS)
+    result = send_test_message(
+        account, recipient, settings, smtp_client_factory=smtp_client_factory,
+        subject=subject, body=body,
+    )
+    # Only actual DATA acceptance can clear an earlier policy refusal. Hold a
+    # lock only while persisting; newer credentials/SMTP outcomes take priority,
+    # while independent IMAP activity cannot discard this SMTP result.
+    db.refresh(account, with_for_update=True)
+    if _revision(account, connection_fields) == original_connection and _revision(account, _SMTP_HEALTH_FIELDS) == original_smtp:
+        timestamp = datetime.now(timezone.utc)
+        account.verification_status = "verified"
+        account.verification_error = None
+        account.verification_error_category = None
+        account.verification_retry_at = None
+        account.verification_checked_at = timestamp
+        account.blocked_until_round = None
+        account.block_reason = None
+        account.updated_at = timestamp
+    db.commit()
+    return result
 
 
 def sender_used_by_active_campaign(db: Session, account_id: int) -> bool:

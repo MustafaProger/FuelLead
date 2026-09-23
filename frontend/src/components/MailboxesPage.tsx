@@ -40,7 +40,16 @@ const verificationLabels: Record<SenderAccount["verification_status"], string> =
   temporary_error: "Временная ошибка",
 };
 
+function hasSpamRefusal(account: SenderAccount) {
+  return account.verification_error_category === "policy"
+    || (account.verification_error_category === "provider"
+      && /spam message (rejected|discarded)/i.test(account.verification_error || ""));
+}
+
 function verificationHint(category: string | null, provider: SenderAccount["provider"]) {
+  if (category === "policy") {
+    return "Сервис отклонил письмо как спам. Успешная проверка входа не снимает этот отказ. Обратитесь в поддержку почтового сервиса по ссылке из ошибки.";
+  }
   if (category === "timeout" || category === "connection") {
     return "Проверьте сеть и VPN на сервере FuelLead. Замена пароля не устраняет ошибку соединения.";
   }
@@ -119,6 +128,10 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
       onChanged();
       if (result && typeof result === "object" && "verification_status" in result) {
         const checked = result as SenderAccount;
+        if (hasSpamRefusal(checked)) {
+          setNotice("Для ящика сохранён прежний антиспам-отказ. Он относится к отправке письма и не снимается проверкой входа. Подробности — в карточке ящика.");
+          return true;
+        }
         if (checked.verification_status !== "verified") {
           setError(checked.verification_error || "Настройки сохранены, но SMTP ещё не подключён. Выполните проверку.");
           return false;
@@ -195,7 +208,7 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
           <article className={`mailbox-card ${account.is_active ? "" : "mailbox-card--paused"}`} key={account.id}>
             <header>
               <div><strong>{account.display_name || account.email}</strong><span>{providerLabel(account.provider)} · {account.email}</span></div>
-              <span className={`verification-badge verification-badge--${account.verification_status}`}>{verificationLabels[account.verification_status]}</span>
+              <span className={`verification-badge verification-badge--${account.verification_status}`}>{hasSpamRefusal(account) ? "Письмо отклонено как спам" : verificationLabels[account.verification_status]}</span>
             </header>
             <div className="mailbox-metrics">
               <span><small>Сегодня</small><strong>{account.sent_today} / {account.daily_limit}</strong></span>
@@ -208,11 +221,11 @@ export function MailboxesPage({ encryptionConfigured, onChanged }: { encryptionC
               <button type="button" className={account.imap_enabled ? "flag flag--on" : "flag"} onClick={() => act(account.id, () => api.updateSenderAccount(account.id, { imap_enabled: !account.imap_enabled }))}>IMAP {account.imap_enabled ? "включён" : "выключен"}</button>
               <span className="flag flag--saved"><KeyRound size={13} /> {account.password_saved ? "Пароль сохранён" : "Пароль отсутствует"}</span>
             </div>
-            {account.verification_error ? <p className="mailbox-error">{account.verification_error} {verificationHint(account.verification_error_category, account.provider)}</p> : null}
+            {account.verification_error ? <p className="mailbox-error">{account.verification_error} {verificationHint(hasSpamRefusal(account) ? "policy" : account.verification_error_category, account.provider)}</p> : null}
             {account.imap_enabled ? <p className="mailbox-checked">IMAP: {account.imap_verification_status === "disabled" ? "Выключен" : account.imap_verification_status === "verified" ? "Подключён" : verificationLabels[account.imap_verification_status] || "Не проверен"} · {formatDateTime(account.imap_verification_checked_at)}</p> : null}
             {account.imap_verification_error ? <p className="mailbox-error">{account.imap_verification_error}. Состояние отправки определяется проверкой SMTP.</p> : null}
             {account.verification_retry_at ? <p className="mailbox-checked">Автопроверка входа без отправки письма после {formatDateTime(account.verification_retry_at)}, в том числе во время кампании. Перерыв ящика по кругам сохраняется.</p> : null}
-            {account.blocked_until_round ? <p className="mailbox-block">Пропуск до конца круга {account.blocked_until_round}: {account.block_reason || "ошибка ящика"}</p> : null}
+            {hasSpamRefusal(account) ? <p className="mailbox-block">Отправка этим ящиком приостановлена до устранения антиспам-отказа.</p> : account.blocked_until_round ? <p className="mailbox-block">Пропуск до конца круга {account.blocked_until_round}: {account.block_reason || "ошибка ящика"}</p> : null}
             <p className="mailbox-checked">Проверка SMTP: {formatDateTime(account.verification_checked_at)}{actingId === account.id ? " · Проверяем, дождитесь результата…" : ""}</p>
             <div className="mailbox-actions" inert={actingId !== null || creating}>
               <button className="button button--secondary" type="button" disabled={actingId !== null || creating} onClick={() => act(account.id, () => api.verifySenderAccount(account.id), "Проверка завершена без отправки письма.")}><RefreshCw size={15} /> Проверить</button>
