@@ -1,4 +1,4 @@
-"""Client correspondence, with automatic replies excluded from status changes."""
+"""Client correspondence, with automatic notices kept separate from refusals."""
 import hashlib
 import re
 from dataclasses import dataclass
@@ -77,6 +77,7 @@ class ClientReply:
     reply_to: str | None = None
     attachments: tuple[str, ...] = ()
     is_automatic: bool = False
+    is_bulk: bool = False
 
 
 def parse_client_reply(raw: bytes) -> ClientReply | None:
@@ -84,17 +85,20 @@ def parse_client_reply(raw: bytes) -> ClientReply | None:
     if message.get_content_type() in ("multipart/report", "message/delivery-status"):
         return None
     auto_submitted = str(message.get("Auto-Submitted", "no")).split(";", 1)[0].strip().lower()
-    if auto_submitted not in ("no", "auto-replied") or message.get("List-Id") or message.get("List-Unsubscribe"):
-        return None
-    is_automatic = auto_submitted == "auto-replied"
+    # Providers also use auto-generated (including Outlook vacation replies
+    # and Gmail unsubscribe requests). These are correspondence when they
+    # relate to a message we sent; matching below enforces that relationship.
+    is_automatic = auto_submitted != "no"
+    is_bulk = bool(message.get("List-Id") or message.get("List-Unsubscribe"))
     addresses = getaddresses(message.get_all("From", []))
     if len(addresses) != 1 or not (sender := normalize_email(addresses[0][1])):
         return None
     if sender.split("@")[0] in ("mailer-daemon", "postmaster"):
         return None
+    subject = re.sub(r"^(?:(?:re|fw|fwd|ответ)\s*:\s*)+", "", str(message.get("Subject", "")), flags=re.I).strip()
     part = message.get_body(preferencelist=("plain", "html"))
     attachments = tuple(str(p.get_filename() or "Вложение")[:255] for p in message.iter_attachments())
-    if part is None and not attachments:
+    if part is None and not attachments and not subject:
         return None
     try:
         body = part.get_content() if part else ""
@@ -116,18 +120,23 @@ def parse_client_reply(raw: bytes) -> ClientReply | None:
             break
         lines.append(line)
     text = "\n".join(lines).strip()[:12000]
-    subject = re.sub(r"^(?:(?:re|fw|fwd|ответ)\s*:\s*)+", "", str(message.get("Subject", "")), flags=re.I).strip()
     # Clients sometimes put the entire request in the subject and only quote
     # our offer in the body (a real Mail.ru case). Require a short direct subject.
     if len(subject) <= 120 and REFUSAL_RE.match(subject):
         text = subject + ("\n" + text if text else "")
     detection_text = text
     if not text:
-        text = "Вложения: " + ", ".join(attachments) if attachments else full_body.strip()[:12000]
+        text = "Вложения: " + ", ".join(attachments) if attachments else (full_body.strip() or subject)[:12000]
         if not text:
             return None
     normalized = " ".join(detection_text.lower().replace("ё", "е").split())
-    match = None if is_automatic else REFUSAL_RE.search(normalized)
+    # A provider-generated unsubscribe is still an explicit recipient action.
+    # Require the direct subject or entire unquoted response, rather than an
+    # opt-out footer or a word mentioned in a vacation notice.
+    explicit_unsubscribe = subject.casefold() == "unsubscribe" or normalized == "unsubscribe"
+    match = REFUSAL_RE.search("unsubscribe") if is_automatic and explicit_unsubscribe else (
+        None if is_automatic else REFUSAL_RE.search(normalized)
+    )
     # A quoted opt-out instruction or negation is not the client's request.
     if match and re.search(r"(?:фраз\w*|слов\w*|ответьте|если|почему)\s.{0,45}$", normalized[:match.start()]):
         match = None
@@ -147,7 +156,7 @@ def parse_client_reply(raw: bytes) -> ClientReply | None:
     return ClientReply(sender, message_id, references, text, match.group() if match else None,
                        hashlib.sha256((sender + "\n" + message_id).encode() if message_id else raw).hexdigest(),
                        str(message.get("Subject", ""))[:998], full_body.strip()[:200000], sent_at,
-                       reply_to, attachments, is_automatic)
+                       reply_to, attachments, is_automatic, is_bulk)
 
 
 def match_reply(db: Session, reply: ClientReply, account_id: int) -> tuple[list[Company], OutreachDelivery | None]:
@@ -160,17 +169,23 @@ def match_reply(db: Session, reply: ClientReply, account_id: int) -> tuple[list[
         if delivery and delivery.company_id:
             company_ids.add(delivery.company_id)
             break
-        # Single-company sends are stored in activity_history, not deliveries.
-        histories = db.scalars(select(ActivityHistory).where(ActivityHistory.event_type == "email_sent",
+        # A reply may refer to a previous incoming message rather than the
+        # original offer, especially when another employee joins the thread.
+        histories = db.scalars(select(ActivityHistory).where(
+            ActivityHistory.event_type.in_(("email_sent", "email_reply")),
+            ActivityHistory.event_data["sender_account_id"].as_integer() == account_id,
             ActivityHistory.event_data["message_id"].as_string() == reference))
         for history in histories:
-            if (history.event_data or {}).get("sender_account_id") == account_id:
-                company_ids.add(history.company_id)
+            company_ids.add(history.company_id)
         if company_ids:
             break
-    if not company_ids and reply.is_automatic:
-        # An automatic message without references must correspond to an actual
-        # outgoing message on this mailbox, not merely an imported contact.
+    if not company_ids and reply.is_bulk:
+        # List headers do not invalidate a real conversation, but an unrelated
+        # newsletter must not become a client answer through its sender alone.
+        return [], None
+    if not company_ids:
+        # Use the actual recipient snapshot even if the contact was since
+        # edited or removed. Automatic messages require this outgoing evidence.
         deliveries = list(db.scalars(select(OutreachDelivery).where(
             OutreachDelivery.sender_account_id == account_id,
             func.lower(OutreachDelivery.recipient) == reply.sender,
@@ -183,7 +198,7 @@ def match_reply(db: Session, reply: ClientReply, account_id: int) -> tuple[list[
             ActivityHistory.event_data["sender_account_id"].as_integer() == account_id,
             func.lower(ActivityHistory.event_data["recipient"].as_string()) == reply.sender,
         )))
-    elif not company_ids:
+    if not company_ids and not reply.is_automatic:
         company_ids.update(db.scalars(select(CompanyEmail.company_id).where(
             func.lower(CompanyEmail.email) == reply.sender)))
         if company_ids:
@@ -254,12 +269,12 @@ def apply_client_reply(db: Session, account_id: int, raw: bytes, *, now: datetim
             company.status = "answered"
             company.last_updated_at = timestamp
         db.add(ActivityHistory(company_id=company.id, event_type="email_reply",
-            description=("Получен автоматический ответ" if reply.is_automatic else
-                         "Получен отказ клиента" if reply.refusal else "Получен ответ клиента") + f" от {reply.sender}",
+            description=("Получен отказ клиента" if reply.refusal else
+                         "Получен автоматический ответ" if reply.is_automatic else "Получен ответ клиента") + f" от {reply.sender}",
             from_status=previous, to_status=company.status, created_at=timestamp,
             event_data={"reply_key": reply.key, "message_id": reply.message_id,
                         "sender_account_id": account_id, "sender": reply.sender,
                         "mailbox": mailbox, "uid": uid, **message_data,
                         "refusal": reply.refusal, "delivery_id": delivery.id if delivery else None}))
         db.flush()
-    return ("automatic_reply" if reply.is_automatic else "rejected" if reply.refusal else "answered"), delivery.id if delivery else None
+    return ("rejected" if reply.refusal else "automatic_reply" if reply.is_automatic else "answered"), delivery.id if delivery else None
