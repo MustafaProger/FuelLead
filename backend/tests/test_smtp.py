@@ -94,6 +94,60 @@ def test_recipient_verification_match_does_not_hide_sender_or_other_stage_errors
     assert not error.permanent_recipient_failure
 
 
+@pytest.mark.parametrize("response", [
+    b"invalid mailbox specification",
+    b"Invalid mailbox specification.",
+])
+def test_invalid_rcpt_mailbox_specification_does_not_fail_sender(response):
+    class InvalidRecipient(FakeSMTP):
+        def rcpt(self, recipient):
+            return 550, response
+
+        def data(self, payload):
+            pytest.fail("A rejected recipient must never reach DATA")
+
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), "secret", smtp_factory=InvalidRecipient).send(
+            "%20office@example.ru", "Subject", "Body"
+        )
+    error = caught.value
+    assert error.category == "recipient"
+    assert error.smtp_code == "550"
+    assert error.smtp_response == response.decode()
+    assert not error.permanent_recipient_failure
+    assert not error.uncertain
+    assert error.safe_message.startswith("RCPT:")
+    assert error.smtp_response in error.safe_message
+    assert str(error) == error.safe_message
+
+
+@pytest.mark.parametrize("stage,code,response,category,permanent", [
+    ("MAIL FROM", 550, b"invalid mailbox specification", "provider", False),
+    ("DATA", 550, b"invalid mailbox specification", "provider", False),
+    ("RCPT", 450, b"invalid mailbox specification", "temporary", False),
+    ("RCPT", 421, b"invalid mailbox specification", "temporary", False),
+    ("RCPT", 530, b"invalid mailbox specification", "auth", False),
+    ("RCPT", 535, b"invalid mailbox specification", "auth", False),
+    ("RCPT", 554, b"invalid mailbox specification", "provider", False),
+    ("RCPT", 550, b"5.1.7 invalid mailbox specification", "provider", False),
+    ("RCPT", 550, b"5.7.1 invalid mailbox specification", "provider", False),
+    ("RCPT", 550, b"5.7.8 invalid mailbox specification", "provider", False),
+    ("RCPT", 550, b"4.7.0 invalid mailbox specification", "provider", False),
+    ("RCPT", 550, b"5.2.3 invalid mailbox specification", "content", False),
+    ("RCPT", 550, b"5.1.1 invalid mailbox specification", "recipient", True),
+    ("RCPT", 550, b"invalid mailbox specification: sender blocked", "provider", False),
+    ("RCPT", 550, b"sender invalid mailbox specification", "provider", False),
+])
+def test_invalid_mailbox_wording_preserves_other_stage_status_and_sender_failures(stage, code, response, category, permanent):
+    from app.services.smtp import _rejection
+
+    error = _rejection(code, response, stage=stage, password="secret", recipient="lead@example.ru")
+
+    assert error.category == category
+    assert error.permanent_recipient_failure is permanent
+    assert error.smtp_response == response.decode()
+
+
 def test_smtp_send_captures_data_acceptance_and_technical_headers():
     FakeSMTP.instances = []
     result = MailruSMTPClient(account(), "secret", smtp_factory=FakeSMTP).send(

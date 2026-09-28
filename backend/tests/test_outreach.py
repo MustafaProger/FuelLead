@@ -607,6 +607,54 @@ def test_recipient_or_content_error_keeps_sender_healthy_and_address_unsuppresse
     assert campaign.status == "completed"
 
 
+def test_invalid_rcpt_mailbox_is_not_retried_across_healthy_senders(db):
+    from app.services.smtp import _rejection
+
+    RecordingSMTP.sent = []
+    settings = settings_with_key()
+    accounts = [add_sender(db, settings, f"sender{index}@mail.ru") for index in range(6)]
+    add_company(db, 1, email="%20office@example.ru")
+    add_company(db, 2, email="good@example.ru")
+    campaign = confirmed_campaign(db, settings)
+    now = datetime.now(timezone.utc)
+    attempts = []
+
+    class InvalidRecipient(RecordingSMTP):
+        def send(self, recipient, *args, **kwargs):
+            attempts.append((self.account.email, recipient))
+            if recipient == "%20office@example.ru":
+                raise _rejection(
+                    550, b"invalid mailbox specification", stage="RCPT",
+                    password="app-password", recipient=recipient,
+                )
+            return super().send(recipient, *args, **kwargs)
+
+    tick_at_schedule(db, settings, InvalidRecipient, now)
+
+    failed = campaign.deliveries[0]
+    assert failed.status == "failed"
+    assert failed.smtp_code == "550"
+    assert failed.smtp_response == "invalid mailbox specification"
+    assert failed.error_message.startswith("RCPT:")
+    assert campaign.deliveries[1].status == "queued"
+    assert campaign.status == "running"
+    assert campaign.pause_reason is None
+    assert not db.query(EmailSuppression).count()
+    for sender in accounts:
+        assert sender.verification_status == "verified"
+        assert sender.verification_error is None
+        assert sender.verification_error_category is None
+        assert sender.blocked_until_round is None
+        assert sender.block_reason is None
+
+    tick_at_schedule(db, settings, InvalidRecipient, now)
+
+    assert attempts == [("sender0@mail.ru", "%20office@example.ru"), ("sender1@mail.ru", "good@example.ru")]
+    assert RecordingSMTP.sent == [("sender1@mail.ru", "good@example.ru")]
+    assert campaign.deliveries[1].status == "accepted"
+    assert campaign.status == "completed"
+
+
 @pytest.mark.parametrize("changed_field", ["password", "verification"])
 @pytest.mark.parametrize("category", ["auth", "policy"])
 def test_late_sender_error_does_not_overwrite_repaired_account(db, changed_field, category):

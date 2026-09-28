@@ -211,6 +211,19 @@ def _rejection(code: int, response: bytes, *, stage: str, password: str, recipie
             f"Адрес получателя {recipient} сейчас недоступен (SMTP {code}): "
             f"{mapped.smtp_response}. Письмо пропущено; адрес не добавлен в постоянные исключения"
         )
+    elif (
+        stage == "RCPT" and code == 550 and enhanced == str(code)
+        and re.fullmatch(r"invalid mailbox specification[.!]?", safe_smtp_text(response), re.IGNORECASE)
+    ):
+        # Mail.ru rejects malformed RCPT addresses with this plain reply.
+        # It says nothing about sender health or whether the intended mailbox
+        # exists. Skip this recipient without permanently suppressing it;
+        # explicit enhanced statuses and other SMTP stages keep their meaning.
+        mapped.category = "recipient"
+        mapped.safe_message = (
+            f"Почтовый сервер отклонил адрес получателя (SMTP {code}): "
+            f"{mapped.smtp_response}. Проверьте написание адреса получателя"
+        )
     elif stage == "RCPT" and code == 550 and re.fullmatch(
         r"(?:5\.\d{1,3}\.\d{1,3}\s+)?non-local recipient verification failed[.!]?",
         safe_smtp_text(response),
