@@ -209,8 +209,13 @@ class CheckoClient:
                         if all_daily_limits
                         else "Все настроенные API-ключи Checko недоступны. Проверьте лимиты и ключи."
                     )
+                    labels = {"daily_limit": "суточный лимит", "invalid_key": "ключ отклонён"}
+                    details = "; ".join(
+                        f"№{index + 1} — {labels.get(reason, 'недоступен')}"
+                        for index, reason in sorted(unavailable_reasons.items())
+                    )
                     raise CheckoAPIError(
-                        message, stop_discovery=True,
+                        f"{message} Ключи: {details}.", stop_discovery=True,
                         reason="daily_limit" if all_daily_limits else "keys_unavailable",
                     )
                 raise error

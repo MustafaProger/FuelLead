@@ -54,6 +54,7 @@ def test_dadata_filters_and_fixed_batch_dont_fake_pagination():
         page = client.search_by_okved("49.41", region_code="50", limit=1, page=9)
         card = client.get_company(page.records[0]["ИНН"])
     assert page.current_page == page.total_pages == 1
+    assert page.results_limited
     assert card.region_code == "50"
     assert len(calls) == 2
 
@@ -105,6 +106,15 @@ def test_okvedo_card_uses_address_when_top_level_region_missing():
     assert card.emails == ["info@example.ru"]
 
 
+@pytest.mark.parametrize("raw,expected", [(11100, "01.11.00"), ("14100", "01.41.00"), ("49411", "49.41.1")])
+def test_okvedo_compact_agricultural_codes_keep_the_leading_zero(raw, expected):
+    from app.services.discovery import classify_activity
+
+    card = parse_okvedo_company_payload({"inn": "7701000001", "primary_okved": raw})
+    assert card.primary_okved.code == expected
+    assert classify_activity(card) == ("agriculture" if expected.startswith("01.") else "freight")
+
+
 @pytest.mark.parametrize("data,region", [
     ({"region": "Московская область"}, "50"),
     ({"addresses": [{"region_code": "50"}]}, "50"),
@@ -129,6 +139,31 @@ def test_okvedo_search_passes_filters_pagination_and_skips_non_legal_inns():
         page = client.search_by_okved("49.41", region_code="50", limit=2, page=3)
     assert page.records == [{"ИНН": "5001000001", "РегионКод": "50"}]
     assert (page.current_page, page.total_pages) == (3, 12)
+    assert not page.results_limited
+
+
+def test_okvedo_expands_agriculture_without_broadening_other_selected_codes():
+    codes = OkvedoClient.expand_okved_codes(["49.41.1", "01", "01.11", "01"])
+    assert codes[0] == "49.41.1"
+    assert "49.41" not in codes
+    assert {"01", "01.11", "01.13", "01.41", "01.61", "01.70"} <= set(codes)
+    assert len(codes) == len(set(codes)) == 33
+    assert all(code == "49.41.1" or code == "01" or code.startswith("01.") for code in codes)
+    assert OkvedoClient.expand_okved_codes(["01.11", "42.11"]) == ["01.11", "42.11"]
+
+
+def test_okvedo_capped_count_does_not_claim_complete_coverage_or_shorten_pagination():
+    def handler(request):
+        return httpx.Response(200, json={
+            "data": [{"inn": "7701000001", "region": "Москва"}],
+            "meta": {"page": 23, "pages": 241, "total_exact": False, "total_capped": True},
+        })
+
+    with OkvedoClient("secret", transport=httpx.MockTransport(handler)) as client:
+        page = client.search_by_okved("41.20", region_code="77", page=23)
+    assert page.results_limited
+    assert page.current_page == 23 and page.total_pages == 241
+    assert page.records == [{"ИНН": "7701000001", "РегионКод": "77"}]
 
 
 @pytest.mark.parametrize("list_data,card_data,expected", [
@@ -199,6 +234,9 @@ def test_checko_reports_daily_limit_only_if_every_key_is_exhausted(all_exhausted
         with pytest.raises(DiscoveryAPIError) as caught:
             client.search_by_okved("49.41", region_code="77")
     assert caught.value.reason == ("daily_limit" if all_exhausted else "keys_unavailable")
+    assert "№1 — суточный лимит" in str(caught.value)
+    assert ("№2 — суточный лимит" if all_exhausted else "№2 — ключ отклонён") in str(caught.value)
+    assert "first" not in str(caught.value) and "second" not in str(caught.value)
 
 
 def test_checko_search_and_card_quotas_can_use_different_keys():

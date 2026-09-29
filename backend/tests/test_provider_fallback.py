@@ -11,7 +11,7 @@ from app.services.provider import CompanyPayload, DiscoveryAPIError, OkvedItem, 
 
 
 @pytest.mark.parametrize("states", list(product(["ok", "daily_limit", "timeout"], repeat=3)))
-def test_fns_requires_confirmed_exhaustion_of_every_primary(db, monkeypatch, states):
+def test_fns_runs_last_after_every_primary_outcome(db, monkeypatch, states):
     run = SearchRun(status="pending", requested_okved_codes=["49.41"])
     db.add(run)
     db.commit()
@@ -28,11 +28,11 @@ def test_fns_requires_confirmed_exhaustion_of_every_primary(db, monkeypatch, sta
     monkeypatch.setattr("app.services.discovery.SessionLocal", sessionmaker(bind=db.get_bind(), expire_on_commit=False))
     settings = Settings(_env_file=None, discovery_provider="combined", checko_api_key="c", okvedo_api_key="o", dadata_api_key="d", api_fns_key="f")
     run_discovery(run.id, settings, 1)
-    assert calls == ["checko", "okvedo", "dadata"] + (["api_fns"] if states == ("daily_limit",) * 3 else [])
+    assert calls == ["checko", "okvedo", "dadata", "api_fns"]
 
 
 @pytest.mark.parametrize("reason", ["rate_limit", "access_denied", "invalid_key", "invalid_response", "connection_error", "keys_unavailable"])
-def test_unknown_or_temporary_failure_never_spends_fns(db, monkeypatch, reason):
+def test_unknown_or_temporary_primary_failure_allows_fns(db, monkeypatch, reason):
     run = SearchRun(status="pending", requested_okved_codes=["49.41"])
     db.add(run)
     db.commit()
@@ -40,12 +40,17 @@ def test_unknown_or_temporary_failure_never_spends_fns(db, monkeypatch, reason):
 
     def stage(db, run, settings, limit, provider):
         calls.append(provider)
-        raise DiscoveryAPIError("Stopped", stop_discovery=True, reason=reason)
+        if provider != "api_fns":
+            raise DiscoveryAPIError("Stopped", stop_discovery=True, reason=reason)
+        return False
 
     monkeypatch.setattr("app.services.discovery._run_provider_discovery", stage)
     monkeypatch.setattr("app.services.discovery.SessionLocal", sessionmaker(bind=db.get_bind(), expire_on_commit=False))
     run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="c", api_fns_key="f"), 1)
-    assert calls == ["checko"]
+    db.refresh(run)
+    assert calls == ["checko", "api_fns"]
+    assert run.provider_results == {"checko": reason, "api_fns": "results_exhausted"}
+    assert run.errors_count == 1
 
 
 def test_partial_results_survive_exhaustion_and_all_four_stages_run_in_order(db, monkeypatch):
@@ -91,14 +96,14 @@ def test_partial_results_survive_exhaustion_and_all_four_stages_run_in_order(db,
     assert set(db.scalars(select(DiscoveryCursor.provider))) == set(providers)
 
 
-def test_per_run_budget_does_not_unlock_fns(db, monkeypatch):
+def test_primary_deferral_allows_fns_without_losing_partial_reason(db, monkeypatch):
     calls = []
 
     def stage(db, run, settings, limit, provider):
         calls.append(provider)
-        run.errors_count += 1
-        run.error_message = "Per-run cap reached"
-        return True
+        if provider == "okvedo":
+            run.provider_results = {provider: "known_results_deferred"}
+        return False
 
     monkeypatch.setattr("app.services.discovery._run_provider_discovery", stage)
     monkeypatch.setattr("app.services.discovery.SessionLocal", sessionmaker(bind=db.get_bind(), expire_on_commit=False))
@@ -106,7 +111,55 @@ def test_per_run_budget_does_not_unlock_fns(db, monkeypatch):
     db.add(run)
     db.commit()
     run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", okvedo_api_key="o", api_fns_key="f"), 1)
-    assert calls == ["okvedo"]
+    db.refresh(run)
+    assert calls == ["okvedo", "api_fns"]
+    assert run.provider_results == {"okvedo": "known_results_deferred", "api_fns": "results_exhausted"}
+    assert "частично" in run.progress_message
+    assert "Доступная выдача пройдена" not in run.progress_message
+
+
+@pytest.mark.parametrize("primary_state", ["empty", "keys_unavailable", "rate_limit", "timeout"])
+def test_empty_or_failed_primaries_still_allow_fns_to_add_a_company(db, monkeypatch, primary_state):
+    calls = []
+
+    class Client:
+        fixed_page_size = 100
+
+        def __init__(self, provider):
+            self.provider = provider
+
+        def __enter__(self):
+            calls.append(self.provider)
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def search_by_okved(self, code, *, region_code, limit, page):
+            if self.provider == "checko" and primary_state != "empty":
+                raise DiscoveryAPIError("Source unavailable", stop_discovery=True, reason=primary_state)
+            records = [{"ИНН": "7701000001"}] if self.provider == "api_fns" and region_code == "77" else []
+            return SearchPage(records, page, page)
+
+        def get_company(self, inn):
+            return CompanyPayload("Новая", inn, None, OkvedItem("49.41"), region_code="77")
+
+    for attribute, provider in (("CheckoClient", "checko"), ("OkvedoClient", "okvedo"), ("ApiFnsClient", "api_fns")):
+        monkeypatch.setattr(f"app.services.discovery.{attribute}", lambda *a, p=provider, **k: Client(p))
+    monkeypatch.setattr("app.services.discovery._wait_for_provider", lambda *a: None)
+    monkeypatch.setattr("app.services.discovery.SessionLocal", sessionmaker(bind=db.get_bind(), expire_on_commit=False))
+    run = SearchRun(status="pending", search_scope="full", requested_okved_codes=["49.41"])
+    db.add(run)
+    db.commit()
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="c", okvedo_api_key="o", api_fns_key="f"), 1)
+    db.refresh(run)
+    assert calls == ["checko", "okvedo", "api_fns"]
+    assert run.companies_created == 1
+    assert run.company_requests == 1
+    # Primary attempts, including retries, must not consume the FNS stage budget.
+    assert run.search_requests == {"empty": 6, "keys_unavailable": 5, "rate_limit": 8, "timeout": 12}[primary_state]
+    assert run.provider_results["api_fns"] == "results_exhausted"
+    assert run.errors_count == (0 if primary_state == "empty" else 2 if primary_state == "timeout" else 1)
 
 
 def test_company_quota_preserves_retry_cursor_and_partial_success(db, monkeypatch):

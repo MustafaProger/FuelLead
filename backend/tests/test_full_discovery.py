@@ -68,14 +68,23 @@ def test_full_search_collects_350_companies_beyond_two_pages_and_ten_candidates(
     assert len(set(client.cards)) == 350
 
 
-def test_full_search_passes_known_pages_and_exclusions_without_fetching_cards(db):
+def test_full_search_defers_known_pages_and_resumes_late_candidates_without_loss(db):
     run = full_run(db)
     client = Pages(305)
     db.add_all([ExcludedCompany(inn=inn, name="Удалена") for inn in client.inns[:300]])
     db.commit()
     discover_new_companies(db, run, client, 1)
+    assert run.companies_created == 0
+    assert client.cards == []
+    assert run.provider_results == {"checko": "known_results_deferred"}
+    cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
+    assert (cursor.next_page, cursor.next_record_index) == (4, 0)
+    second = full_run(db)
+    discover_new_companies(db, second, client, 1)
     assert client.cards == client.inns[300:]
-    assert run.companies_created == 5
+    assert second.companies_created == 5
+    assert second.provider_results == {}
+    assert (cursor.next_page, cursor.next_record_index, cursor.completed_cycles) == (1, 0, 1)
 
 
 def test_okvedo_passes_existing_pages_adds_empty_region_cards_and_skips_them_next_run(db):
@@ -143,17 +152,34 @@ def test_full_search_reports_reasons_for_skipping_candidates(db):
         assert result[key] == 1
 
 
-def test_full_fns_ignores_legacy_five_request_batch_caps(db, monkeypatch):
+def test_full_fns_respects_card_budget_and_preserves_exact_resume_position(db, monkeypatch):
     use_session(db, monkeypatch)
-    client = Pages(650)
+    client = Pages(12)
     monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test")
     run = full_run(db)
-    run_discovery(run.id, Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test"), 1)
+    run_discovery(run.id, settings, 1)
     db.refresh(run)
     assert run.status == "completed"
-    assert run.companies_created == 650
-    assert run.search_requests == 8
-    assert run.provider_results == {"api_fns": "results_exhausted"}
+    assert run.companies_created == run.company_requests == 5
+    assert run.search_requests == 1
+    assert run.errors_count == 0
+    assert run.provider_results == {"api_fns": "budget_reached"}
+    assert "частично" in run.progress_message
+    cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
+    assert (cursor.next_page, cursor.next_record_index) == (1, 5)
+    second = full_run(db)
+    run_discovery(second.id, settings, 1)
+    db.refresh(second)
+    db.refresh(cursor)
+    assert second.companies_created == second.company_requests == 5
+    assert (cursor.next_page, cursor.next_record_index) == (1, 10)
+    third = full_run(db)
+    run_discovery(third.id, settings, 1)
+    db.refresh(third)
+    assert third.companies_created == 2
+    assert third.provider_results == {"api_fns": "results_exhausted"}
+    assert client.cards == client.inns
 
 
 def test_quota_stops_full_run_and_resume_keeps_exact_unprocessed_record(db, monkeypatch):
@@ -200,7 +226,8 @@ def test_stop_during_request_saves_response_and_does_not_call_next_provider(db, 
     client.get_company = get_company
     monkeypatch.setattr("app.services.discovery.CheckoClient", lambda *a, **k: client)
     monkeypatch.setattr("app.services.discovery.OkvedoClient", lambda *a, **k: pytest.fail("Next provider called after stop"))
-    run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", okvedo_api_key="test"), 10)
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: pytest.fail("Reserve called after stop"))
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", okvedo_api_key="test", api_fns_key="test"), 10)
     db.refresh(run)
     assert run.status == "cancelled"
     assert run.companies_created == 1
@@ -432,3 +459,201 @@ def test_cancel_during_transient_retry_does_not_make_another_request(db, monkeyp
     with pytest.raises(SearchCancelled):
         discover_new_companies(db, run, client, 1)
     assert len(calls) == 1
+
+
+def test_full_fns_search_budget_stops_before_next_page_and_can_resume(db, monkeypatch):
+    use_session(db, monkeypatch)
+    client = Pages(3)
+    client.fixed_page_size = 1
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+                        api_fns_max_search_requests_per_run=2, api_fns_max_egr_requests_per_run=10)
+    for expected_inn in client.inns:
+        run = full_run(db)
+        run_discovery(run.id, settings, 1)
+        db.refresh(run)
+        assert run.search_requests == 2
+        assert run.companies_created == 1
+        assert client.cards[-1] == expected_inn
+        assert run.errors_count == 0
+        assert run.provider_results == {"api_fns": (
+            "results_exhausted" if expected_inn == client.inns[-1] else "budget_reached"
+        )}
+    assert client.cards == client.inns
+
+
+@pytest.mark.parametrize("existing_cursors", [False, True])
+def test_search_budget_does_not_touch_unattempted_queries_or_starve_pending_candidates(db, monkeypatch, existing_cursors):
+    from datetime import datetime, timezone
+
+    use_session(db, monkeypatch)
+    client = Pages(2)
+    client.fixed_page_size = 1
+    regional_inns = {"77": client.inns, "50": ["5001000001", "5001000002"]}
+
+    def search(code, *, region_code, limit, page):
+        client.searches.append((region_code, page, limit))
+        return SearchPage([{"ИНН": regional_inns[region_code][page - 1]}], page, 2)
+
+    client.search_by_okved = search
+    if existing_cursors:
+        for day, region in enumerate(("77", "50"), start=1):
+            db.add(DiscoveryCursor(provider="api_fns", okved_code="49.41", region_code=region,
+                                   page_size=1, updated_at=datetime(2026, 1, day, tzinfo=timezone.utc)))
+        db.commit()
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+                        api_fns_max_search_requests_per_run=1, api_fns_max_egr_requests_per_run=10)
+    for index, region in enumerate(("77", "50", "77", "50")):
+        run = full_run(db)
+        run_discovery(run.id, settings, 1)
+        db.refresh(run)
+        assert client.searches[-1] == (region, index // 2 + 1, 1)
+        assert run.search_requests == run.company_requests == run.companies_created == 1
+        if index == 0:
+            unattempted = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "50"))
+            if existing_cursors:
+                assert unattempted.updated_at.replace(tzinfo=timezone.utc) == datetime(2026, 1, 2, tzinfo=timezone.utc)
+            else:
+                assert unattempted is None
+    assert set(client.cards) == {inn for inns in regional_inns.values() for inn in inns}
+
+
+def test_card_budget_preserves_query_priority_after_repeated_inactive_candidate(db, monkeypatch):
+    use_session(db, monkeypatch)
+    client = Pages(0)
+    regional_inns = {"77": "7701000001", "50": "5001000001"}
+
+    def search(code, *, region_code, limit, page):
+        client.searches.append((region_code, page, limit))
+        return SearchPage([{"ИНН": regional_inns[region_code]}], page, 1)
+
+    def card(inn):
+        client.cards.append(inn)
+        return CompanyPayload("Тест", inn, None, OkvedItem("49.41"),
+                              region_code=inn[:2], is_active=inn != regional_inns["77"])
+
+    client.search_by_okved = search
+    client.get_company = card
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+                        api_fns_max_search_requests_per_run=5, api_fns_max_egr_requests_per_run=1)
+    for index, region in enumerate(("77", "50", "77")):
+        run = full_run(db)
+        run_discovery(run.id, settings, 1)
+        db.refresh(run)
+        assert run.search_requests == run.company_requests == 1
+        assert client.cards[-1] == regional_inns[region]
+        assert client.searches[-1][0] == region
+        assert run.provider_results == {"api_fns": "budget_reached"}
+        assert run.companies_created == (1 if region == "50" else 0)
+        if index == 0:
+            assert db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "50")) is None
+    assert client.cards == [regional_inns[region] for region in ("77", "50", "77")]
+    assert set(db.scalars(select(Company.inn))) == {regional_inns["50"]}
+
+
+@pytest.mark.parametrize("operation", ["search_by_okved", "get_company"])
+def test_full_fns_budgets_include_transient_request_retries(db, monkeypatch, operation):
+    use_session(db, monkeypatch)
+    client = Pages(1)
+    attempts = []
+
+    def unavailable(*args, **kwargs):
+        attempts.append((args, kwargs))
+        raise DiscoveryAPIError("Temporary failure", stop_discovery=True, reason="timeout")
+
+    setattr(client, operation, unavailable)
+    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    run = full_run(db)
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+                                 api_fns_max_search_requests_per_run=2, api_fns_max_egr_requests_per_run=2), 1)
+    db.refresh(run)
+    assert len(attempts) == 2
+    assert attempts[0] == attempts[1]
+    assert run.provider_results == {"api_fns": "budget_reached"}
+    cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
+    assert (cursor.next_page, cursor.next_record_index) == (1, 0)
+
+
+def test_unknown_page_resets_known_streak_and_other_queries_still_progress(db):
+    client = Pages(800)
+    # Unknown candidates on pages three and eight must reset the streak and
+    # survive a deferral after pages four through six.
+    missing = {client.inns[200], client.inns[700]}
+    db.add_all(Company(inn=inn, name="Известная") for inn in client.inns if inn not in missing)
+    db.commit()
+    original_search = client.search_by_okved
+    other_inn = "5001000001"
+
+    def search(code, *, region_code, limit, page):
+        if region_code == "50":
+            return SearchPage([{"ИНН": other_inn}], page, page)
+        return original_search(code, region_code=region_code, limit=limit, page=page)
+
+    client.search_by_okved = search
+    run = full_run(db)
+    discover_new_companies(db, run, client, 1)
+    assert run.companies_created == 2
+    assert set(client.cards) == {client.inns[200], other_inn}
+    cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
+    assert (cursor.next_page, cursor.next_record_index) == (7, 0)
+    assert run.provider_results == {"checko": "known_results_deferred"}
+    second = full_run(db)
+    discover_new_companies(db, second, client, 1)
+    assert second.companies_created == 1
+    assert client.cards[-1] == client.inns[700]
+    assert len(client.cards) == len(set(client.cards)) == 3
+
+
+def test_known_streak_on_last_page_is_exhausted_without_deferral(db, monkeypatch):
+    use_session(db, monkeypatch)
+    client = Pages(300)
+    db.add_all(ExcludedCompany(inn=inn, name="Исключена") for inn in client.inns)
+    db.commit()
+    monkeypatch.setattr("app.services.discovery.CheckoClient", lambda *a, **k: client)
+    run = full_run(db)
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="checko", checko_api_key="test"), 1)
+    db.refresh(run)
+    assert run.provider_results == {"checko": "results_exhausted"}
+    assert run.skipped_known == 300
+    assert run.company_requests == 0
+
+
+def test_limited_provider_results_are_reported_as_partial(db, monkeypatch):
+    from types import SimpleNamespace
+
+    use_session(db, monkeypatch)
+    client = Pages(0)
+    client.search_by_okved = lambda *a, **k: SimpleNamespace(
+        records=[], current_page=1, total_pages=1, results_limited=True,
+    )
+    monkeypatch.setattr("app.services.discovery.OkvedoClient", lambda *a, **k: client)
+    run = full_run(db)
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="okvedo", okvedo_api_key="test"), 1)
+    db.refresh(run)
+    assert run.provider_results == {"okvedo": "results_limited"}
+    assert run.errors_count == 0
+    assert "частично" in run.progress_message
+    assert "полнота охвата источника не подтверждена" in run.progress_message
+
+
+def test_provider_expanded_codes_are_deduplicated_and_use_separate_cursors(db):
+    client = Pages(0)
+    client.expand_okved_codes = lambda codes: [*codes, "01.11", "01.11"]
+    searches = []
+
+    def search(code, *, region_code, limit, page):
+        searches.append((code, region_code))
+        records = [{"ИНН": "7701000001"}] if code == "01.11" and region_code == "77" else []
+        return SearchPage(records, page, page)
+
+    client.search_by_okved = search
+    run = full_run(db)
+    run.requested_okved_codes = ["01"]
+    db.commit()
+    discover_new_companies(db, run, client, 1, provider="okvedo")
+    assert searches == [("01", "77"), ("01", "50"), ("01.11", "77"), ("01.11", "50")]
+    assert run.companies_created == 1
+    assert set(db.scalars(select(DiscoveryCursor.okved_code))) == {"01", "01.11"}
+    assert run.requested_okved_codes == ["01"]

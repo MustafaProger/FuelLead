@@ -483,11 +483,12 @@ def test_api_fns_request_budget_stops_before_second_egr(db):
     assert stopped is True
     assert client.company_calls == ["7701000001"]
     assert run.companies_created == 1
-    assert run.errors_count == 1
-    assert "Лимит egr на один запуск: 1" in run.error_message
+    assert run.errors_count == 0
+    assert run.provider_results == {"api_fns": "budget_reached"}
+    assert "Лимит egr на один запуск: 1" in run.progress_message
 
 
-def test_combined_run_keeps_api_fns_unused_while_checko_has_quota(db, monkeypatch):
+def test_combined_run_tries_api_fns_after_checko_results(db, monkeypatch):
     run = SearchRun(status="pending", requested_okved_codes=["49.41"])
     db.add(run)
     db.commit()
@@ -525,10 +526,15 @@ def test_combined_run_keeps_api_fns_unused_while_checko_has_quota(db, monkeypatc
         "checko_get_7701000001",
         "checko_search_50",
         "checko_exit",
+        "api_fns_enter",
+        "api_fns_search_77",
+        "api_fns_get_7701000002",
+        "api_fns_search_50",
+        "api_fns_exit",
     ]
     assert stored_run.mode == "combined"
     assert stored_run.status == "completed"
-    assert stored_run.companies_created == 1
+    assert stored_run.companies_created == 2
     assert stored_run.errors_count == 0
 
 

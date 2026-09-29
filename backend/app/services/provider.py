@@ -45,6 +45,8 @@ class SearchPage:
     records: list[dict[str, Any]]
     current_page: int
     total_pages: int
+    # A suggestion sample or capped provider count cannot establish full coverage.
+    results_limited: bool = False
 
 
 class DiscoveryClient(Protocol):

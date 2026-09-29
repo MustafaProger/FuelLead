@@ -65,15 +65,14 @@ def test_parser_marks_non_active_status_inactive_and_pads_region_code():
     assert payload.region_code == "05"
 
 
-def test_search_uses_primary_okved_region_contact_filters_and_page():
+def test_search_uses_primary_okved_group_region_contact_filters_and_page():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/search"
         assert request.url.params["key"] == "secret-key"
         assert request.url.params["q"] == "any"
         assert request.url.params["page"] == "2"
         search_filter = request.url.params["filter"]
-        assert search_filter == "active+onlyul+okved49.41+region77+withphone+withemail"
-        assert "okvedgroup" not in search_filter
+        assert search_filter == "active+onlyul+okvedgroup49.41+region77+withphone+withemail"
         return httpx.Response(
             200,
             json={
@@ -97,6 +96,46 @@ def test_search_uses_primary_okved_region_contact_filters_and_page():
     assert page.current_page == 2
     assert page.total_pages == 3
     assert page.records == [{"ИНН": "7701234567", "ОГРН": "1267700000000", "РегионКод": ""}]
+
+
+@pytest.mark.parametrize(
+    ("selected_code", "filter_token", "primary_code"),
+    [
+        ("01", "okvedgroup01", "01.11.1"),
+        ("49.4", "okvedgroup49.4", "49.41.1"),
+        ("49.41", "okvedgroup49.41", "49.41.1"),
+        ("52.21.2", "okvedgroup52.21.2", "52.21.21"),
+        ("52.21.21", "okved52.21.21", "52.21.21"),
+    ],
+)
+def test_search_covers_selected_primary_activity_and_descendants(
+    selected_code: str, filter_token: str, primary_code: str,
+):
+    data = company_data()
+    data["ОснВидДеят"] = {"Код": primary_code, "Текст": "Выбранная деятельность"}
+    data["Адрес"]["КодРегион"] = "50"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/search":
+            assert request.url.params["filter"] == f"active+onlyul+{filter_token}+region50"
+            # The documented search response contains an activity name only;
+            # descendants must survive discovery until the full card is read.
+            return httpx.Response(200, json={"items": [{"ЮЛ": {
+                "ИНН": data["ИНН"],
+                "ОснВидДеят": "Выбранная деятельность",
+            }}]})
+        assert request.url.path == "/api/egr"
+        assert request.url.params["req"] == data["ИНН"]
+        return httpx.Response(200, json={"items": [{"ЮЛ": data}]})
+
+    with ApiFnsClient("secret-key", transport=httpx.MockTransport(handler)) as client:
+        page = client.search_by_okved(selected_code, region_code="50")
+        assert len(page.records) == 1
+        company = client.get_company(page.records[0]["ИНН"])
+
+    assert company.primary_okved.code == primary_code
+    assert company.is_active is True
+    assert company.region_code == "50"
 
 
 def test_search_uses_nextpage_when_total_count_is_absent():
@@ -177,6 +216,22 @@ def test_timeout_stops_discovery_without_exposing_request_url():
     assert caught.value.reason == "timeout"
     assert "secret-key" not in str(caught.value)
     assert "https://" not in str(caught.value)
+
+
+def test_plain_text_ip_denial_with_json_content_type_is_actionable_and_secret_safe():
+    with ApiFnsClient(
+        "secret-key",
+        transport=httpx.MockTransport(lambda _: httpx.Response(
+            403,
+            text="Ошибка: Доступ с данного ip-адреса запрещен. key=secret-key",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )),
+    ) as client:
+        with pytest.raises(ApiFnsAPIError) as caught:
+            client.get_statistics()
+    assert caught.value.reason == "ip_restriction"
+    assert "Разрешите IP сервера" in str(caught.value)
+    assert "secret-key" not in str(caught.value)
 
 
 def test_non_json_unauthorized_response_is_reported_as_invalid_key():

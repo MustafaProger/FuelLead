@@ -9,9 +9,27 @@ from app.services.provider import CompanyPayload, DiscoveryAPIError, OkvedItem, 
 
 REGION_NAMES = {"77": "Москва", "50": "Московская область"}
 
+# OKVED2 class 01 groups. Okvedo does not expand the class query into these
+# groups (verified 2026-09-29), although e.g. 01.11 has companies.
+# Keep the original query as well; do not infer coverage of descendants from
+# an empty parent query or silently broaden the user's selected activities.
+AGRICULTURE_GROUP_CODES = (
+    "01.11", "01.12", "01.13", "01.14", "01.15", "01.16", "01.19",
+    "01.21", "01.22", "01.23", "01.24", "01.25", "01.26", "01.27", "01.28", "01.29",
+    "01.30", "01.41", "01.42", "01.43", "01.44", "01.45", "01.46", "01.47", "01.49",
+    "01.50", "01.61", "01.62", "01.63", "01.64", "01.70",
+)
+
 
 def normalize_okved(value: Any) -> str:
     code = str(value or "").strip()
+    # Some Okvedo rows store the six-digit agricultural code as a number:
+    # 011100 becomes 11100. Restore only evidenced class-01 groups, leaving
+    # ordinary five-digit codes such as 49411 unchanged.
+    if code.isdigit() and len(code) == 5:
+        padded = code.zfill(6)
+        if f"{padded[:2]}.{padded[2:4]}" in AGRICULTURE_GROUP_CODES:
+            code = padded
     if code.isdigit() and len(code) > 2:
         return ".".join(code[i:i + 2] for i in range(0, len(code), 2))
     return code
@@ -79,6 +97,15 @@ def parse_okvedo_company_payload(data: dict[str, Any]) -> CompanyPayload:
 class OkvedoClient:
     fixed_page_size = None
 
+    @staticmethod
+    def expand_okved_codes(codes: list[str]) -> list[str]:
+        expanded = []
+        for code in codes:
+            expanded.append(code)
+            if code == "01":
+                expanded.extend(AGRICULTURE_GROUP_CODES)
+        return list(dict.fromkeys(expanded))
+
     def __init__(self, api_key: str, base_url: str = "https://okvedo.ru/api/v1", timeout_seconds: float = 30.0,
                  *, transport: httpx.BaseTransport | None = None):
         if not api_key.strip():
@@ -144,7 +171,12 @@ class OkvedoClient:
                 self._search_regions[inn] = _region(item)
                 records.append({"ИНН": inn, "РегионКод": actual_region or ""})
         meta = payload.get("meta") or {}
-        return SearchPage(records, max(int(meta.get("page") or page), 1), max(int(meta.get("pages") or page), 1))
+        return SearchPage(
+            records,
+            max(int(meta.get("page") or page), 1),
+            max(int(meta.get("pages") or page), 1),
+            results_limited=meta.get("total_capped") is True,
+        )
 
     def get_company(self, inn: str) -> CompanyPayload:
         if not re.fullmatch(r"\d{10}", inn):

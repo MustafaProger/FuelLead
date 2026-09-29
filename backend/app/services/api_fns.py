@@ -184,6 +184,19 @@ class ApiFnsClient:
         try:
             payload = response.json()
         except ValueError as exc:
+            # The live service also returns plain-text IP denials with a JSON
+            # Content-Type. Classify them without exposing its response/key.
+            if response.status_code == 403 and any(
+                marker in response.text.casefold()
+                for marker in ("ip-адрес", "ip адрес", "ip-address", "ip address", "айпи")
+            ):
+                raise ApiFnsAPIError(
+                    "API-ФНС отклонил запрос из-за ограничения IP. "
+                    "Разрешите IP сервера в личном кабинете API-ФНС.",
+                    stop_discovery=True,
+                    key_unavailable=True,
+                    reason="ip_restriction",
+                ) from exc
             if response.status_code == 401:
                 raise ApiFnsAPIError(
                     "API-ФНС отклонил ключ. Проверьте API_FNS_KEY в локальном .env.",
@@ -315,7 +328,13 @@ class ApiFnsClient:
         if not re.fullmatch(r"\d{2}", region_code):
             raise ValueError("API-ФНС region code must contain exactly two digits")
         page = max(page, 1)
-        filters = ["active", "onlyul", f"okved{code}", f"region{region_code}"]
+        # https://api-fns.ru/api_help: okved matches an exact primary code;
+        # okvedgroup also includes its descendants, still by primary activity.
+        # Keep the selected prefix (49.41 must not become 49); six-digit codes
+        # are leaves. Search rows expose the activity name, not its code, so
+        # this filter must provide coverage before /egr loads the full card.
+        okved_filter = "okved" if len(code.replace(".", "")) == 6 else "okvedgroup"
+        filters = ["active", "onlyul", f"{okved_filter}{code}", f"region{region_code}"]
         if self.require_phone:
             filters.append("withphone")
         if self.require_email:

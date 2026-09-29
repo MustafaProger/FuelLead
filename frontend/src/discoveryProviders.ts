@@ -5,6 +5,6 @@ export const discoveryProviderLabels: Record<DiscoveryProvider, string> = {
   okvedo: "Okvedo",
   dadata: "DaData",
   api_fns: "API-ФНС",
-  combined: "Несколько API · ФНС в резерве",
+  combined: "Несколько источников",
   demo: "Демо-режим",
 };

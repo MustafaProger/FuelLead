@@ -122,7 +122,7 @@ class DaDataClient:
                 continue
             company = parse_dadata_company_payload(item)
             records.append({"ИНН": company.inn, "РегионКод": company.region_code or ""})
-        return SearchPage(records, current_page=1, total_pages=1)
+        return SearchPage(records, current_page=1, total_pages=1, results_limited=True)
 
     def get_company(self, inn: str) -> CompanyPayload:
         if not re.fullmatch(r"\d{10}", inn):

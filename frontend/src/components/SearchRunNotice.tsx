@@ -27,9 +27,12 @@ function providerName(run: SearchRun) {
 
 const resultLabels: Record<string, string> = {
   results_exhausted: "доступная выдача пройдена",
+  results_limited: "доступная выборка пройдена; источник не подтверждает полноту результатов",
+  known_results_deferred: "обход знакомой выдачи отложен; следующий запуск продолжит с сохранённой позиции",
+  budget_reached: "достигнут лимит запросов этого запуска; позиция сохранена",
   daily_limit: "суточный лимит исчерпан",
   quota_exhausted: "лимит исчерпан",
-  reserve_not_needed: "резерв не использован: не все основные квоты исчерпаны",
+  reserve_not_needed: "в этом запуске действовало прежнее правило: резерв не использован, поскольку не все основные квоты были исчерпаны",
   partial: "частичный результат, есть ошибки",
   rate_limit: "ограничение частоты после повторных попыток",
   timeout: "не ответил вовремя",
@@ -38,6 +41,7 @@ const resultLabels: Record<string, string> = {
   invalid_key: "ключ отклонён",
   keys_unavailable: "настроенные ключи недоступны: проверьте доступ и лимиты",
   access_denied: "источник отклонил доступ",
+  ip_restriction: "доступ с IP сервера запрещён",
   pagination_stalled: "провайдер повторяет страницу",
 };
 
@@ -75,7 +79,7 @@ function progressDescription(run: SearchRun) {
 
   if (!run.candidates_found) {
     const stage = run.mode === "combined"
-      ? "Проверяем Checko, Okvedo и DaData. API-ФНС подключится только после исчерпания суточных лимитов всех настроенных источников."
+      ? "Проверяем настроенные источники по очереди. API-ФНС подключается последним."
       : `Проверяем целевые ОКВЭД и доступность данных в ${providerName(run)}.`;
     return `${stage}${errors}`;
   }
@@ -84,7 +88,12 @@ function progressDescription(run: SearchRun) {
 }
 
 function completedDescription(run: SearchRun) {
-  const summary = `Кандидатов ${run.candidates_found}, добавлено ${run.companies_created}, обновлено ${run.companies_updated}. ${skippedSummary(run)} ${stageSummary(run)}`;
+  const summary = [
+    run.progress_message?.trim(),
+    `Кандидатов ${run.candidates_found}, добавлено ${run.companies_created}, обновлено ${run.companies_updated}.`,
+    skippedSummary(run),
+    stageSummary(run),
+  ].filter(Boolean).join(" ");
   if (!run.errors_count) return summary;
 
   const errorDetails = run.error_message ? ` Последняя ошибка ${providerName(run)}: ${run.error_message}` : "";
@@ -94,6 +103,9 @@ function completedDescription(run: SearchRun) {
 export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, stopping }: SearchRunNoticeProps) {
   const searching = run?.status === "pending" || run?.status === "running";
   const failedResult = run?.error_message ? splitMessage(run.error_message) : null;
+  const limitedResult = Object.values(run?.provider_results ?? {}).some((reason) =>
+    ["known_results_deferred", "budget_reached", "results_limited"].includes(reason),
+  );
 
   return (
     <>
@@ -112,7 +124,7 @@ export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, 
               <span className="search-run-provider">{run.search_scope === "full" ? "Полный поиск" : "Поиск"} · {providerName(run)}</span>
               <strong>{run.status === "pending" ? "Готовим поиск компаний" : "Ищем и проверяем компании"}</strong>
               <p>{progressDescription(run)}</p>
-              <small>До лимита API или конца выдачи. Можно закрыть вкладку — поиск продолжится, пока работает сервер.</small>
+              <small>Позиция поиска сохраняется для следующего запуска. Можно закрыть вкладку — поиск продолжится, пока работает сервер.</small>
               <button className="button button--secondary" type="button" onClick={onStop} disabled={stopping || run.cancel_requested}>
                 {stopping || run.cancel_requested ? "Останавливаем…" : "Остановить поиск"}
               </button>
@@ -138,8 +150,8 @@ export function SearchRunNotice({ error, run, onCloseError, onCloseRun, onStop, 
         {run && !searching ? (
           run.status === "completed" || run.status === "cancelled" ? (
             <Notice
-              tone={run.errors_count ? "warning" : "success"}
-              title={run.status === "cancelled" ? "Поиск остановлен, результат сохранён" : run.errors_count ? "Поиск выполнен частично, результат сохранён" : "Поиск завершён"}
+              tone={run.errors_count || limitedResult ? "warning" : "success"}
+              title={run.status === "cancelled" ? "Поиск остановлен, результат сохранён" : run.errors_count ? "Поиск выполнен частично, результат сохранён" : limitedResult ? "Поиск завершён с ограничениями" : "Поиск завершён"}
               description={completedDescription(run)}
               onClose={onCloseRun}
             />
