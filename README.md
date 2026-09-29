@@ -393,7 +393,8 @@ docker compose exec -T backend python -m app.commands.check_mailboxes --network
 Команда показывает этап DNS/TCP/TLS/приветствие. Если TCP доступен, а TLS зависает,
 нужно проверять маршрут/фильтрацию сети и VPN; замена пароля такой сбой не исправляет.
 Для проверки входа и сохранения статусов используется `--verify` вместо `--network`.
-Подробный разбор повторного сбоя: [аудит 11 сентября](docs/MAIL_RELIABILITY_AUDIT_2026-09-11.md).
+Правила работы с почтой и актуальные эксплуатационные ограничения:
+[состояние проекта](PROJECT_STATUS.md).
 
 Перед каждым SMTP-вызовом повторно проверяются компания, её адрес и статус, отсутствие
 предыдущей отправки и глобального исключения. Нарушение переводит запись в `suppressed`
@@ -465,6 +466,7 @@ cd backend
 .venv/bin/python -m pytest
 
 cd ../frontend
+node --test tests/conversation-http.test.mjs
 npm run build
 ```
 
@@ -506,10 +508,18 @@ npm run build
 FuelLead/
 ├── backend/       FastAPI, SQLAlchemy, API-ФНС, Checko, PostgreSQL, Excel
 ├── frontend/      React, TypeScript, Vite
+├── docs/USER_GUIDE.md  Инструкция, встроенная в приложение
 ├── docker-compose.yml
+├── compose.production.yml
 ├── .env.example
+├── PROJECT_STATUS.md  Краткое состояние и правила эксплуатации
 └── README.md
 ```
+
+В репозитории хранятся исходники, тесты, конфигурация и действующие инструкции.
+Разовые отчёты о ремонтах, журналы, резервные копии и исходные изображения для
+генерации иконок храните вне каталога проекта. Старые отчёты доступны в истории Git.
+Зависимости `.venv/` и `node_modules/`, результаты сборки и кэши исключены из Git.
 
 Основные таблицы базы: `companies`, `company_emails`, `company_contacts`, `company_okveds`,
 `activity_history`, `excluded_companies`, `search_runs`, `discovery_cursors`,
