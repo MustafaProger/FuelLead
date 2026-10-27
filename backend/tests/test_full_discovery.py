@@ -152,11 +152,11 @@ def test_full_search_reports_reasons_for_skipping_candidates(db):
         assert result[key] == 1
 
 
-def test_full_fns_respects_card_budget_and_preserves_exact_resume_position(db, monkeypatch):
+def test_full_provider_respects_card_budget_and_preserves_exact_resume_position(db, monkeypatch):
     use_session(db, monkeypatch)
     client = Pages(12)
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
-    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test")
+    use_budgeted_client(monkeypatch, client)
+    settings = Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", api_fns_key="test")
     run = full_run(db)
     run_discovery(run.id, settings, 1)
     db.refresh(run)
@@ -164,7 +164,7 @@ def test_full_fns_respects_card_budget_and_preserves_exact_resume_position(db, m
     assert run.companies_created == run.company_requests == 5
     assert run.search_requests == 1
     assert run.errors_count == 0
-    assert run.provider_results == {"api_fns": "budget_reached"}
+    assert run.provider_results == {"checko": "budget_reached"}
     assert "частично" in run.progress_message
     cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
     assert (cursor.next_page, cursor.next_record_index) == (1, 5)
@@ -178,7 +178,7 @@ def test_full_fns_respects_card_budget_and_preserves_exact_resume_position(db, m
     run_discovery(third.id, settings, 1)
     db.refresh(third)
     assert third.companies_created == 2
-    assert third.provider_results == {"api_fns": "results_exhausted"}
+    assert third.provider_results == {"checko": "results_exhausted"}
     assert client.cards == client.inns
 
 
@@ -226,7 +226,6 @@ def test_stop_during_request_saves_response_and_does_not_call_next_provider(db, 
     client.get_company = get_company
     monkeypatch.setattr("app.services.discovery.CheckoClient", lambda *a, **k: client)
     monkeypatch.setattr("app.services.discovery.OkvedoClient", lambda *a, **k: pytest.fail("Next provider called after stop"))
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: pytest.fail("Reserve called after stop"))
     run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", okvedo_api_key="test", api_fns_key="test"), 10)
     db.refresh(run)
     assert run.status == "cancelled"
@@ -461,12 +460,12 @@ def test_cancel_during_transient_retry_does_not_make_another_request(db, monkeyp
     assert len(calls) == 1
 
 
-def test_full_fns_search_budget_stops_before_next_page_and_can_resume(db, monkeypatch):
+def test_full_provider_search_budget_stops_before_next_page_and_can_resume(db, monkeypatch):
     use_session(db, monkeypatch)
     client = Pages(3)
     client.fixed_page_size = 1
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
-    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+    use_budgeted_client(monkeypatch, client)
+    settings = Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", api_fns_key="test",
                         api_fns_max_search_requests_per_run=2, api_fns_max_egr_requests_per_run=10)
     for expected_inn in client.inns:
         run = full_run(db)
@@ -476,7 +475,7 @@ def test_full_fns_search_budget_stops_before_next_page_and_can_resume(db, monkey
         assert run.companies_created == 1
         assert client.cards[-1] == expected_inn
         assert run.errors_count == 0
-        assert run.provider_results == {"api_fns": (
+        assert run.provider_results == {"checko": (
             "results_exhausted" if expected_inn == client.inns[-1] else "budget_reached"
         )}
     assert client.cards == client.inns
@@ -498,11 +497,11 @@ def test_search_budget_does_not_touch_unattempted_queries_or_starve_pending_cand
     client.search_by_okved = search
     if existing_cursors:
         for day, region in enumerate(("77", "50"), start=1):
-            db.add(DiscoveryCursor(provider="api_fns", okved_code="49.41", region_code=region,
+            db.add(DiscoveryCursor(provider="checko", okved_code="49.41", region_code=region,
                                    page_size=1, updated_at=datetime(2026, 1, day, tzinfo=timezone.utc)))
         db.commit()
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
-    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+    use_budgeted_client(monkeypatch, client)
+    settings = Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", api_fns_key="test",
                         api_fns_max_search_requests_per_run=1, api_fns_max_egr_requests_per_run=10)
     for index, region in enumerate(("77", "50", "77", "50")):
         run = full_run(db)
@@ -535,8 +534,8 @@ def test_card_budget_preserves_query_priority_after_repeated_inactive_candidate(
 
     client.search_by_okved = search
     client.get_company = card
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
-    settings = Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+    use_budgeted_client(monkeypatch, client)
+    settings = Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", api_fns_key="test",
                         api_fns_max_search_requests_per_run=5, api_fns_max_egr_requests_per_run=1)
     for index, region in enumerate(("77", "50", "77")):
         run = full_run(db)
@@ -545,7 +544,7 @@ def test_card_budget_preserves_query_priority_after_repeated_inactive_candidate(
         assert run.search_requests == run.company_requests == 1
         assert client.cards[-1] == regional_inns[region]
         assert client.searches[-1][0] == region
-        assert run.provider_results == {"api_fns": "budget_reached"}
+        assert run.provider_results == {"checko": "budget_reached"}
         assert run.companies_created == (1 if region == "50" else 0)
         if index == 0:
             assert db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "50")) is None
@@ -554,7 +553,7 @@ def test_card_budget_preserves_query_priority_after_repeated_inactive_candidate(
 
 
 @pytest.mark.parametrize("operation", ["search_by_okved", "get_company"])
-def test_full_fns_budgets_include_transient_request_retries(db, monkeypatch, operation):
+def test_full_provider_budgets_include_transient_request_retries(db, monkeypatch, operation):
     use_session(db, monkeypatch)
     client = Pages(1)
     attempts = []
@@ -564,14 +563,14 @@ def test_full_fns_budgets_include_transient_request_retries(db, monkeypatch, ope
         raise DiscoveryAPIError("Temporary failure", stop_discovery=True, reason="timeout")
 
     setattr(client, operation, unavailable)
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", lambda *a, **k: client)
+    use_budgeted_client(monkeypatch, client)
     run = full_run(db)
-    run_discovery(run.id, Settings(_env_file=None, discovery_provider="api_fns", api_fns_key="test",
+    run_discovery(run.id, Settings(_env_file=None, discovery_provider="combined", checko_api_key="test", api_fns_key="test",
                                  api_fns_max_search_requests_per_run=2, api_fns_max_egr_requests_per_run=2), 1)
     db.refresh(run)
     assert len(attempts) == 2
     assert attempts[0] == attempts[1]
-    assert run.provider_results == {"api_fns": "budget_reached"}
+    assert run.provider_results == {"checko": "budget_reached"}
     cursor = db.scalar(select(DiscoveryCursor).where(DiscoveryCursor.region_code == "77"))
     assert (cursor.next_page, cursor.next_record_index) == (1, 0)
 
@@ -657,3 +656,15 @@ def test_provider_expanded_codes_are_deduplicated_and_use_separate_cursors(db):
     assert run.companies_created == 1
     assert set(db.scalars(select(DiscoveryCursor.okved_code))) == {"01", "01.11"}
     assert run.requested_okved_codes == ["01"]
+
+
+def use_budgeted_client(monkeypatch, client):
+    """Exercise generic request budgets without a retired external provider."""
+    def stage(db, run, settings, limit, provider):
+        return discover_new_companies(
+            db, run, client, limit, provider=provider, source="Test provider",
+            max_search_requests=settings.api_fns_max_search_requests_per_run,
+            max_company_requests=settings.api_fns_max_egr_requests_per_run,
+            propagate_stop_errors=True,
+        )
+    monkeypatch.setattr("app.services.discovery._run_provider_discovery", stage)

@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     outreach_campaign_size: int = Field(default=500, ge=1, le=500)
     outreach_daily_limit: int = Field(default=500, ge=1, le=500)
     outreach_hourly_limit: int = Field(default=0, ge=0, le=500)
+    # Application safety budgets, NOT advertised provider allowances.
+    outreach_sender_hourly_limit: int = Field(default=5, ge=1, le=500)
+    outreach_sender_rolling_day_limit: int = Field(default=20, ge=1, le=500)
     outreach_min_interval_seconds: int = Field(default=10, ge=10, le=86_400)
     # Zero disables the per-domain cap. Global daily and interval limits still apply.
     outreach_max_per_domain_per_day: int = Field(default=0, ge=0, le=500)
@@ -117,14 +120,14 @@ class Settings(BaseSettings):
 
     @property
     def resolved_discovery_provider(self) -> str:
-        # API-FNS must not bypass configured primary providers, even in auto mode.
+        # Retired api_fns selections use the remaining configured sources.
         if self.discovery_provider in ("auto", "api_fns"):
             primary = self.primary_discovery_providers
             if primary:
-                if len(primary) > 1 or self.api_fns_configured:
+                if len(primary) > 1:
                     return "combined"
                 return primary[0]
-            return "api_fns" if self.api_fns_configured or self.discovery_provider == "api_fns" else "demo"
+            return "combined" if self.discovery_provider == "api_fns" or self.api_fns_configured else "demo"
         return self.discovery_provider
 
     @property

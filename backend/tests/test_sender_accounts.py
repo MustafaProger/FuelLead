@@ -157,6 +157,8 @@ def test_successful_verification_clears_round_block_and_preserves_accounting(db,
 
 @pytest.mark.parametrize("category,reason", [
     ("policy", "DATA: SMTP 550 policy refusal"),
+    ("rate_limit", "MAIL: SMTP 451 Ratelimit exceeded for mailbox"),
+    ("sender_blocked", "MAIL: SMTP 550 message sending for this account is disabled"),
     ("provider", "DATA: SMTP 550 spam message rejected"),
     ("provider", "DATA: SMTP 550 Spam Message Discarded"),
 ])

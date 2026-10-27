@@ -24,15 +24,13 @@ def test_health_reports_selected_provider_without_exposing_secrets():
 
     assert payload["selected_discovery_provider"] == "combined"
     assert payload["mode"] == "combined"
-    assert payload["api_fns_configured"] is True
-    assert payload["api_fns_request_budget_per_run"] == {"search": 5, "egr": 5}
+    assert not any(key.startswith("api_fns") for key in payload)
     assert payload["checko_configured"] is True
     assert payload["checko_api_key_count"] == 1
     assert payload["checko_state"] == "selected"
     assert payload["okvedo_configured"] is True
     assert payload["dadata_configured"] is True
-    assert payload["discovery_provider_order"] == ["checko", "okvedo", "dadata", "api_fns"]
-    assert payload["api_fns_fallback_policy"] == "only_after_primary_daily_limits"
+    assert payload["discovery_provider_order"] == ["checko", "okvedo", "dadata"]
     for secret in ("okvedo-secret", "dadata-secret", "dadata-private"):
         assert secret not in str(payload)
     assert payload["target_region_codes"] == ("77", "50")

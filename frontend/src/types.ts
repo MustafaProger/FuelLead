@@ -83,9 +83,6 @@ export interface Health {
   okvedo_configured: boolean;
   dadata_configured: boolean;
   discovery_provider_order: DiscoveryProvider[];
-  api_fns_fallback_policy: "only_after_primary_daily_limits";
-  api_fns_configured: boolean;
-  api_fns_request_budget_per_run: { search: number; egr: number };
   selected_discovery_provider: DiscoveryProvider;
   mode: DiscoveryProvider;
   default_okved_codes: string[];

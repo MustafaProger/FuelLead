@@ -204,7 +204,7 @@ def verify_sender_account(
     timestamp = datetime.now(timezone.utc)
     if _revision(account, smtp_fields) == original_smtp:
         previous_error = " ".join((account.verification_error or "", account.block_reason or "")).lower()
-        policy_refusal = account.verification_error_category == "policy" or (
+        policy_refusal = account.verification_error_category in ("policy", "rate_limit", "sender_blocked") or (
             account.verification_error_category == "provider"
             and any(reason in previous_error for reason in ("spam message rejected", "spam message discarded"))
         )

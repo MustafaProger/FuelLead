@@ -85,7 +85,6 @@ def test_external_recipient_verification_failure_does_not_blame_sender(response)
     ("MAIL", b"non-local recipient verification failed"),
     ("DATA", b"non-local recipient verification failed"),
     ("RCPT", b"non-local sender verification failed"),
-    ("RCPT", b"message sending for this account is disabled"),
 ])
 def test_recipient_verification_match_does_not_hide_sender_or_other_stage_errors(stage, response):
     from app.services.smtp import _rejection
@@ -319,7 +318,7 @@ def test_spam_policy_match_preserves_other_stages_statuses_and_unknown_reasons(s
     assert error.permanent_recipient_failure is permanent
 
 
-def test_temporary_auth_error_is_retried_and_not_reported_as_bad_password():
+def test_temporary_auth_error_is_not_retried_immediately_or_reported_as_bad_password():
     class TemporaryAuth(FakeSMTP):
         count = 0
         def login(self, email, password):
@@ -327,7 +326,7 @@ def test_temporary_auth_error_is_retried_and_not_reported_as_bad_password():
             raise smtplib.SMTPAuthenticationError(454, b"4.7.0 temporary auth failure")
     with pytest.raises(SMTPDeliveryError) as caught:
         MailruSMTPClient(account(), "secret", smtp_factory=TemporaryAuth, sleep_func=lambda _: None).verify()
-    assert TemporaryAuth.count == 3
+    assert TemporaryAuth.count == 1
     assert caught.value.category == "temporary"
 
 
@@ -402,7 +401,6 @@ def test_mailru_data_missing_recipient_does_not_fail_sender(recipient, reason, r
     b"Local mailbox prefixlead@mail.ru is unavailable: user not found",
     b"Local mailbox prefixlead@mail.ru is unavailable: account is disabled",
     b"Local mailbox lead@mail.ru.invalid is unavailable: account is disabled",
-    b"Message sending for this account is disabled",
 ])
 def test_mailru_data_refusal_requires_specific_missing_target_evidence(reply):
     class RefusingSMTP(FakeSMTP):
@@ -621,7 +619,7 @@ def test_auth_provider_detail_redacts_plain_payload_even_without_auth_prefix():
     assert "Invalid credentials" in caught.value.smtp_response
 
 
-@pytest.mark.parametrize("code,category,attempts", [(421, "temporary", 3), (550, "provider", 1)])
+@pytest.mark.parametrize("code,category,attempts", [(421, "temporary", 1), (550, "provider", 1)])
 def test_rejected_ehlo_stops_before_sending_credentials(code, category, attempts):
     class BadGreeting(FakeSMTP):
         instances = []
@@ -722,3 +720,48 @@ def test_reply_header_injection_is_rejected_before_connect():
     with pytest.raises(SMTPDeliveryError):
         MailruSMTPClient(account(), "secret", smtp_factory=FakeSMTP).send(
             "client@example.ru", "Тема", "Ответ", in_reply_to="<id>\r\nBcc: other@example.ru")
+
+
+@pytest.mark.parametrize('code,response,category', [
+    (451, b'Ratelimit exceeded for mailbox sender@mail.ru. Try again later.', 'rate_limit'),
+    (421, b'Try again later (IP)', 'rate_limit'),
+    (454, b'4.7.0 Too many login attempts', 'rate_limit'),
+    (550, b'Message sending for this account is disabled', 'sender_blocked'),
+    (535, b'Currently unable to sign in to account due to suspicious activity detected', 'sender_blocked'),
+])
+def test_provider_limits_never_retry_login(code, response, category):
+    class Limited(FakeSMTP):
+        count = 0
+        def login(self, email, password):
+            self.__class__.count += 1
+            raise smtplib.SMTPAuthenticationError(code, response)
+    with pytest.raises(SMTPDeliveryError) as caught:
+        MailruSMTPClient(account(), 'secret', smtp_factory=Limited,
+                         sleep_func=lambda _: pytest.fail('Must not retry')).verify()
+    assert Limited.count == 1
+    assert caught.value.category == category
+    assert not caught.value.uncertain
+    assert not caught.value.permanent_recipient_failure
+
+
+@pytest.mark.parametrize('stage', ['MAIL', 'RCPT', 'DATA'])
+@pytest.mark.parametrize('code,response,category', [
+    (451, b'4.7.0 Ratelimit exceeded for mailbox sender@mail.ru', 'rate_limit'),
+    (550, b'Message sending for this account is disabled', 'sender_blocked'),
+])
+def test_provider_limit_stage_is_preserved(stage, code, response, category):
+    from app.services.smtp import _rejection
+    error = _rejection(code, response, stage=stage, password='secret', recipient='lead@example.ru')
+    assert error.category == category
+    assert error.safe_message.startswith(stage + ':')
+    assert not error.permanent_recipient_failure
+
+
+def test_recipient_scope_wins_over_security_words_in_recipient_reason():
+    from app.services.smtp import _rejection
+    for code, response in [
+        (550, b'5.2.1 recipient mailbox disabled due to suspicious activity'),
+        (550, b'Local mailbox lead@example.ru is unavailable: suspicious activity'),
+    ]:
+        error = _rejection(code, response, stage='RCPT', password='secret', recipient='lead@example.ru')
+        assert error.category == 'recipient'

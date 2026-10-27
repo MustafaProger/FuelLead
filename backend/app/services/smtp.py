@@ -109,6 +109,26 @@ class SMTPAccepted:
 
 
 def _map_connect_error(exc: BaseException, *, password: str = "") -> SMTPDeliveryError:
+    if isinstance(exc, smtplib.SMTPResponseException):
+        response = safe_smtp_text(exc.smtp_error, secret=password)
+        lowered = response.lower()
+        category = None
+        if any(text in lowered for text in (
+            "ratelimit exceeded", "rate limit exceeded", "too many messages",
+            "too many login attempts", "too many authentication attempts",
+            "sending quota exceeded", "daily sending limit", "try again later (ip)",
+        )):
+            category = "rate_limit"
+        elif any(text in lowered for text in (
+            "message sending for this account is disabled", "suspicious activity",
+        )):
+            category = "sender_blocked"
+        if category:
+            return SMTPDeliveryError(
+                "Почтовый сервис ограничил отправителя. Автоматические попытки остановлены: " + response,
+                category=category, smtp_code=smtp_status_code(exc.smtp_code, exc.smtp_error),
+                smtp_response=response,
+            )
     if isinstance(exc, smtplib.SMTPAuthenticationError):
         numeric_code = int(exc.smtp_code)
         code = smtp_status_code(numeric_code, exc.smtp_error)
@@ -319,7 +339,9 @@ class MailruSMTPClient:
                     except Exception:
                         pass
                 last_error = _map_connect_error(exc, password=self.password)
-                retryable = last_error.category in ("connection", "timeout", "temporary")
+                # A server refusal (including temporary AUTH) is not a broken
+                # connection. Respect it instead of repeating login in seconds.
+                retryable = last_error.category in ("connection", "timeout")
                 if not retryable or attempt >= self.connect_attempts:
                     raise last_error from exc
                 logger.warning(

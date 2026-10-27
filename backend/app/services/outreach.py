@@ -31,6 +31,7 @@ from app.services.email_attachments import attachment_metadata, get_attachments,
 from app.services.mail_dispatch import mail_dispatch_slot
 from app.services.provider import normalize_email
 from app.services.sender_accounts import batch_size_for_successes
+from app.services.sending_budget import sender_budget_retry_at
 from app.services.smtp import MailruSMTPClient, SMTPAccepted, SMTPDeliveryError
 from app.services.suppressions import active_suppressed_addresses
 
@@ -194,6 +195,8 @@ def select_outreach_candidates(db: Session, filters: CompanyFilters, settings: S
 def outreach_policy_dict(settings: Settings) -> dict:
     return {
         "campaign_limit": settings.outreach_batch_limit,
+        "sender_hourly_limit": settings.outreach_sender_hourly_limit,
+        "sender_rolling_day_limit": settings.outreach_sender_rolling_day_limit,
         "message_interval_seconds": [settings.outreach_message_interval_min_seconds, settings.outreach_message_interval_max_seconds],
         "round_rest_minutes": [settings.outreach_round_rest_min_minutes, settings.outreach_round_rest_max_minutes],
         "snapshot_ttl_seconds": settings.outreach_snapshot_ttl_seconds,
@@ -454,6 +457,14 @@ def _snapshot_sender_limit(campaign: OutreachCampaign, account: SenderAccount) -
     return max(1, min(account.daily_limit, snapshotted))
 
 
+def _safety_limit(campaign: OutreachCampaign, key: str, current: int) -> int:
+    try:
+        saved = int((campaign.scheduler_settings or {}).get(key, current))
+    except (TypeError, ValueError):
+        saved = current
+    return max(1, min(current, saved))
+
+
 def _snapshot_range(
     campaign: OutreachCampaign,
     key: str,
@@ -630,6 +641,20 @@ def _claim_next_delivery(db: Session, campaign: OutreachCampaign, settings: Sett
             _wait_for_senders(db, campaign, now, settings, random_int)
             db.commit()
             return None
+        retry_at = sender_budget_retry_at(
+            db, account, now,
+            hourly_limit=_safety_limit(campaign, "sender_hourly_limit", settings.outreach_sender_hourly_limit),
+            daily_limit=min(_snapshot_sender_limit(campaign, account),
+                _safety_limit(campaign, "sender_rolling_day_limit", settings.outreach_sender_rolling_day_limit)),
+        )
+        if retry_at:
+            # Wait on this sender; do not rotate accounts to work around a
+            # safety budget. This timestamp survives worker restarts.
+            campaign.next_send_at = retry_at
+            campaign.pause_reason = "Защитный лимит ящика за скользящий час или 24 часа. Ожидание"
+            db.commit()
+            return None
+        campaign.pause_reason = None
         queued_count = db.scalar(select(func.count(OutreachDelivery.id)).where(OutreachDelivery.campaign_id == campaign.id, OutreachDelivery.status == "queued")) or 0
         remaining_daily = _snapshot_sender_limit(campaign, account) - account.sent_today
         if campaign.current_batch_sender_id != account.id or campaign.current_batch_target <= 0:
@@ -737,7 +762,7 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
         mark_company_send_failed(db, delivery.company_id, delivery.recipient, error.safe_message, campaign_id=campaign.id, occurred_at=now)
         _advance_sender(campaign)
         campaign.next_send_at = now
-    elif error.category == "policy":
+    elif error.category in ("policy", "rate_limit", "sender_blocked"):
         # Keep the unaccepted message and its evidence for review. Rotating
         # senders would repeat the same rejected content and spread the hold.
         delivery.status = "cancelled" if was_stopped else "queued"
@@ -746,7 +771,7 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
             account.block_reason = error.safe_message
             account.verification_status = "failed"
             account.verification_error = error.safe_message
-            account.verification_error_category = "policy"
+            account.verification_error_category = error.category
             account.verification_retry_at = None
         if not was_stopped:
             campaign.status = "paused"
@@ -754,6 +779,12 @@ def _apply_smtp_error(db: Session, delivery: OutreachDelivery, campaign: Outreac
                 "Почтовый сервис отклонил письмо как спам. Повторная рассылка остановлена. "
                 "Проверьте письмо и ограничения отправителя в почтовом сервисе перед продолжением"
             )
+            if error.category != "policy":
+                campaign.pause_reason = (
+                    "Почтовый сервис ограничил или заблокировал отправителя. "
+                    "Рассылка остановлена без переключения на другой ящик. "
+                    "Проверьте ограничения в почтовом сервисе перед продолжением"
+                )
         campaign.next_send_at = None
         campaign.round_rest_until = None
     else:
@@ -802,6 +833,23 @@ def _process_outreach_tick(settings: Settings, *, sender_factory: Callable, sess
             return float(settings.outreach_worker_poll_seconds)
         campaign = db.scalar(select(OutreachCampaign).where(OutreachCampaign.status.in_(("running", "cooldown"))).order_by(OutreachCampaign.id.asc()).with_for_update(skip_locked=True))
         if campaign is None or campaign.worker_claim_token:
+            return float(settings.outreach_worker_poll_seconds)
+        # Check fresh DB state, including late DSNs recorded by the IMAP worker.
+        attempted = db.scalar(select(func.count(OutreachDelivery.id)).where(
+            OutreachDelivery.campaign_id == campaign.id,
+            OutreachDelivery.status.in_(("accepted", "bounced", "failed", "uncertain")),
+        )) or 0
+        bounced = db.scalar(select(func.count(OutreachDelivery.id)).where(
+            OutreachDelivery.campaign_id == campaign.id, OutreachDelivery.status == "bounced",
+        )) or 0
+        if attempted >= 20 and bounced / attempted > 0.05:
+            campaign.status = "paused"
+            campaign.next_send_at = None
+            campaign.pause_reason = (
+                f"Защита репутации: {bounced} недействительных адресов из {attempted} попыток "
+                "(более 5%). Проверьте базу получателей и создайте новый снимок после очистки"
+            )
+            db.commit()
             return float(settings.outreach_worker_poll_seconds)
         scheduled_at = _aware(campaign.next_send_at)
         if scheduled_at and scheduled_at > effective_now:

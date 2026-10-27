@@ -141,36 +141,6 @@ class FakeCombinedCheckoClient:
         return payload
 
 
-class FakeCombinedApiFnsClient:
-    fixed_page_size = 100
-
-    def __init__(self, events: list[str], *_: object, **__: object):
-        self.events = events
-
-    def __enter__(self):
-        self.events.append("api_fns_enter")
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.events.append("api_fns_exit")
-
-    def search_by_okved(self, code, *, region_code, limit, page):
-        del code, limit, page
-        self.events.append(f"api_fns_search_{region_code}")
-        return SearchPage(
-            records=[{"ИНН": "7701000002", "РегионКод": "77"}],
-            current_page=1,
-            total_pages=1,
-        )
-
-    def get_company(self, inn):
-        self.events.append(f"api_fns_get_{inn}")
-        payload = make_payload([])
-        payload.inn = inn
-        payload.region_code = "77"
-        return payload
-
-
 def test_category_uses_additional_okved():
     payload = make_payload([])
     payload.primary_okved = OkvedItem("46.90", "Оптовая торговля")
@@ -356,45 +326,6 @@ def test_demo_discovery_also_skips_excluded_inn(db, monkeypatch):
     assert db.scalar(select(Company.inn)) != excluded_inn
 
 
-def test_api_fns_run_persists_provider_contacts_and_reuses_cursor_table(db, monkeypatch):
-    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
-    db.add(run)
-    db.commit()
-    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
-    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
-    monkeypatch.setattr("app.services.discovery.ApiFnsClient", FakeApiFnsClient)
-
-    run_discovery(
-        run.id,
-        Settings(
-            _env_file=None,
-            discovery_provider="api_fns",
-            api_fns_key="secret",
-        ),
-        limit_per_code=1,
-    )
-
-    db.expire_all()
-    stored_run = db.get(SearchRun, run.id)
-    company = db.scalar(select(Company).where(Company.inn == "7701000099"))
-    cursor = db.scalar(
-        select(DiscoveryCursor).where(
-            DiscoveryCursor.okved_code == "49.41",
-            DiscoveryCursor.region_code == "77",
-        )
-    )
-    assert stored_run.status == "completed"
-    assert stored_run.mode == "api_fns"
-    assert company.provider == "api_fns"
-    assert [(item.email, item.source) for item in company.emails] == [
-        ("lead@example.ru", "API-ФНС")
-    ]
-    assert [(item.value, item.source) for item in company.contacts] == [
-        ("+74951234567", "API-ФНС")
-    ]
-    assert cursor.page_size == 100
-
-
 def test_api_fns_fixed_page_size_translates_existing_checko_cursor(db):
     db.add(
         DiscoveryCursor(
@@ -438,29 +369,6 @@ def test_api_fns_fixed_page_size_translates_existing_checko_cursor(db):
     assert client.company_calls == ["7701000003"]
 
 
-def test_selected_api_fns_without_key_fails_with_actionable_message(db, monkeypatch):
-    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
-    db.add(run)
-    db.commit()
-    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
-    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
-
-    run_discovery(
-        run.id,
-        Settings(_env_file=None, discovery_provider="api_fns", api_fns_key=""),
-        limit_per_code=1,
-    )
-
-    db.expire_all()
-    stored_run = db.get(SearchRun, run.id)
-    assert stored_run.status == "failed"
-    assert stored_run.mode == "api_fns"
-    assert stored_run.errors_count == 1
-    assert stored_run.error_message == (
-        "Выбран провайдер API-ФНС, но API_FNS_KEY не настроен в локальном .env."
-    )
-
-
 def test_api_fns_request_budget_stops_before_second_egr(db):
     run = SearchRun(status="running", requested_okved_codes=["49.41"])
     db.add(run)
@@ -486,85 +394,3 @@ def test_api_fns_request_budget_stops_before_second_egr(db):
     assert run.errors_count == 0
     assert run.provider_results == {"api_fns": "budget_reached"}
     assert "Лимит egr на один запуск: 1" in run.progress_message
-
-
-def test_combined_run_tries_api_fns_after_checko_results(db, monkeypatch):
-    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
-    db.add(run)
-    db.commit()
-    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
-    events: list[str] = []
-
-    monkeypatch.setattr(
-        "app.services.discovery.SessionLocal", session_factory
-    )
-    monkeypatch.setattr(
-        "app.services.discovery.CheckoClient",
-        lambda *_args, **_kwargs: FakeCombinedCheckoClient(events),
-    )
-    monkeypatch.setattr(
-        "app.services.discovery.ApiFnsClient",
-        lambda *_args, **_kwargs: FakeCombinedApiFnsClient(events),
-    )
-
-    run_discovery(
-        run.id,
-        Settings(
-            _env_file=None,
-            discovery_provider="combined",
-            checko_api_key="checko-key",
-            api_fns_key="api-fns-key",
-        ),
-        limit_per_code=1,
-    )
-
-    db.expire_all()
-    stored_run = db.get(SearchRun, run.id)
-    assert events == [
-        "checko_enter",
-        "checko_search_77",
-        "checko_get_7701000001",
-        "checko_search_50",
-        "checko_exit",
-        "api_fns_enter",
-        "api_fns_search_77",
-        "api_fns_get_7701000002",
-        "api_fns_search_50",
-        "api_fns_exit",
-    ]
-    assert stored_run.mode == "combined"
-    assert stored_run.status == "completed"
-    assert stored_run.companies_created == 2
-    assert stored_run.errors_count == 0
-
-
-def test_combined_run_continues_with_api_fns_when_checko_key_is_missing(db, monkeypatch):
-    run = SearchRun(status="pending", requested_okved_codes=["49.41"])
-    db.add(run)
-    db.commit()
-    session_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
-    events: list[str] = []
-    monkeypatch.setattr("app.services.discovery.SessionLocal", session_factory)
-    monkeypatch.setattr(
-        "app.services.discovery.ApiFnsClient",
-        lambda *_args, **_kwargs: FakeCombinedApiFnsClient(events),
-    )
-
-    run_discovery(
-        run.id,
-        Settings(
-            _env_file=None,
-            discovery_provider="combined",
-            checko_api_key="",
-            api_fns_key="api-fns-key",
-        ),
-        limit_per_code=1,
-    )
-
-    db.expire_all()
-    stored_run = db.get(SearchRun, run.id)
-    assert events[:2] == ["api_fns_enter", "api_fns_search_77"]
-    assert stored_run.status == "completed"
-    assert stored_run.companies_created == 1
-    assert stored_run.errors_count == 0
-    assert stored_run.error_message is None

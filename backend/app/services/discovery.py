@@ -20,7 +20,6 @@ from app.models import (
     ExcludedCompany,
     SearchRun,
 )
-from app.services.api_fns import ApiFnsClient
 from app.services.checko import CheckoClient
 from app.services.demo_data import DEMO_COMPANIES
 from app.services.okvedo import OkvedoClient
@@ -125,7 +124,7 @@ def _record_partial_provider_result(db: Session, run: SearchRun, provider: str, 
 
 def _budget_message(operation: str, limit: int | None) -> str:
     return (
-        "Достигнут безопасный лимит API-ФНС. "
+        "Достигнут лимит запросов источника. "
         f"Лимит {operation} на один запуск: {limit}. "
         "Курсор сохранён для продолжения."
     )
@@ -705,31 +704,6 @@ def _run_provider_discovery(
                 provider=provider, source=f"{label} API", propagate_stop_errors=True,
             )
 
-    if provider == "api_fns":
-        if not settings.api_fns_configured:
-            raise DiscoveryAPIError(
-                "Выбран провайдер API-ФНС, но API_FNS_KEY не настроен в локальном .env.",
-                stop_discovery=True,
-            )
-        with ApiFnsClient(
-            settings.api_fns_key,
-            settings.api_fns_base_url,
-            settings.api_fns_timeout_seconds,
-            require_phone=settings.api_fns_require_phone,
-            require_email=settings.api_fns_require_email,
-        ) as client:
-            return discover_new_companies(
-                db,
-                run,
-                client,
-                limit_per_code,
-                provider="api_fns",
-                source="API-ФНС",
-                max_search_requests=settings.api_fns_max_search_requests_per_run,
-                max_company_requests=settings.api_fns_max_egr_requests_per_run,
-                propagate_stop_errors=True,
-            )
-
     raise ValueError(f"Unsupported discovery provider: {provider}")
 
 
@@ -739,13 +713,11 @@ def _run_combined_discovery(
     settings: Settings,
     limit_per_code: int,
 ) -> bool:
-    """Try all configured sources in order, with API-FNS last and budgeted."""
-    labels = {"checko": "Checko", "okvedo": "Okvedo", "dadata": "DaData", "api_fns": "API-ФНС"}
+    """Try the configured Checko, Okvedo and DaData sources in order."""
+    labels = {provider: PROVIDER_LABELS[provider] for provider in settings.primary_discovery_providers}
     error_messages: list[str] = []
     successful_stages = 0
     providers = list(settings.primary_discovery_providers)
-    if settings.api_fns_configured:
-        providers.append("api_fns")
     if not providers:
         raise DiscoveryAPIError("Не настроен ни один API. Добавьте ключи в локальный .env.")
 
@@ -853,7 +825,7 @@ def run_discovery(run_id: int, settings: Settings, limit_per_code: int) -> None:
                 partial_reasons.append("есть ошибки источников")
             outcomes = set(run.provider_results.values())
             if "budget_reached" in outcomes:
-                partial_reasons.append("достигнут лимит запросов API-ФНС на запуск")
+                partial_reasons.append("достигнут лимит запросов источника на запуск")
             if "known_results_deferred" in outcomes:
                 partial_reasons.append("направления с повторяющимися известными компаниями отложены")
             if "results_limited" in outcomes:

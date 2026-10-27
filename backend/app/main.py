@@ -241,16 +241,10 @@ def health(settings: Settings = Depends(get_settings)) -> dict:
         "checko_state": checko_state,
         "okvedo_configured": settings.okvedo_configured,
         "dadata_configured": settings.dadata_configured,
-        "api_fns_configured": settings.api_fns_configured,
         "discovery_provider_order": (
-            [*settings.primary_discovery_providers, *(["api_fns"] if settings.api_fns_configured else [])]
+            list(settings.primary_discovery_providers)
             if selected_provider == "combined" else [selected_provider]
         ),
-        "api_fns_fallback_policy": "only_after_primary_daily_limits",
-        "api_fns_request_budget_per_run": {
-            "search": settings.api_fns_max_search_requests_per_run,
-            "egr": settings.api_fns_max_egr_requests_per_run,
-        },
         "selected_discovery_provider": selected_provider,
         "mode": selected_provider,
         "default_okved_codes": DEFAULT_OKVED_CODES,

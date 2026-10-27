@@ -79,7 +79,7 @@ function progressDescription(run: SearchRun) {
 
   if (!run.candidates_found) {
     const stage = run.mode === "combined"
-      ? "Проверяем настроенные источники по очереди. API-ФНС подключается последним."
+      ? "Проверяем настроенные источники по очереди: Checko, Okvedo, DaData."
       : `Проверяем целевые ОКВЭД и доступность данных в ${providerName(run)}.`;
     return `${stage}${errors}`;
   }

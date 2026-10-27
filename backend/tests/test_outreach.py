@@ -264,7 +264,8 @@ def test_new_campaign_clears_only_snapshotted_sender_blocks_and_preserves_accoun
 @pytest.mark.parametrize("stale_blocks", [False, True])
 def test_three_senders_rotate_all_batches_before_rest_across_rounds(db, stale_blocks):
     RecordingSMTP.sent = []
-    settings = settings_with_key()
+    # Exercise batch growth independently of the production hourly safety cap.
+    settings = settings_with_key(outreach_sender_hourly_limit=12)
     emails = ("one@mail.ru", "two@mail.ru", "three@mail.ru")
     for index, email in enumerate(emails):
         account = add_sender(db, settings, email)
@@ -904,3 +905,93 @@ def test_stop_wins_if_attempt_finishes_uncertain(db):
     current = db.get(OutreachCampaign, campaign.id)
     assert current.status == "stopped"
     assert [item.status for item in current.deliveries] == ["uncertain", "cancelled"]
+
+
+@pytest.mark.parametrize('category', ['rate_limit', 'sender_blocked'])
+def test_provider_limit_pauses_without_rotating_and_survives_restart(db, category):
+    settings = settings_with_key()
+    first = add_sender(db, settings, 'one@mail.ru')
+    second = add_sender(db, settings, 'two@mail.ru')
+    add_company(db, 1, email='lead@example.ru')
+    campaign = confirmed_campaign(db, settings)
+    calls = []
+    class Limited(RecordingSMTP):
+        def send(self, *args, **kwargs):
+            calls.append(self.account.id)
+            raise SMTPDeliveryError('Provider hold', category=category)
+    now = datetime.now(timezone.utc)
+    tick_at_schedule(db, settings, Limited, now)
+    recover_interrupted_outreach(db)
+    tick_at_schedule(db, settings, Limited, now + timedelta(days=1))
+    assert calls == [first.id]
+    assert campaign.status == 'paused'
+    assert first.verification_error_category == category
+    assert first.verification_retry_at is None
+    assert second.verification_status == 'verified'
+    assert campaign.deliveries[0].status == 'queued'
+
+
+def test_rolling_budget_waits_across_campaign_and_midnight(db):
+    from app.models import OutreachDelivery
+    from app.services.sending_budget import sender_budget_retry_at
+    settings = settings_with_key(outreach_sender_hourly_limit=2, outreach_sender_rolling_day_limit=3)
+    account = add_sender(db, settings, 'one@mail.ru')
+    for index in range(4):
+        add_company(db, index + 1, email=f'lead{index}@example.ru')
+    campaign = confirmed_campaign(db, settings)
+    now = datetime(2026, 10, 12, 21, 5, tzinfo=timezone.utc)  # after midnight Moscow
+    campaign.next_send_at = now
+    for index, minutes in enumerate((90, 30, 10)):
+        delivery = campaign.deliveries[index]
+        delivery.status = 'accepted' if index != 1 else 'uncertain'
+        delivery.sender_account_id = account.id
+        delivery.started_at = now - timedelta(minutes=minutes)
+        delivery.message_id = f'<budget{index}@example.ru>'
+    db.commit()
+    retry = sender_budget_retry_at(db, account, now, hourly_limit=2, daily_limit=3)
+    assert retry == now - timedelta(minutes=90) + timedelta(days=1)
+    # A new worker/session sees the same historical budget, even with zero today's counter.
+    assert account.sent_today == 0
+    factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    process_outreach_tick(settings, sender_factory=lambda *_a, **_k: pytest.fail('Budget must prevent SMTP'),
+                          session_factory=factory, now=now)
+    db.expire_all()
+    assert campaign.next_send_at.replace(tzinfo=timezone.utc) == retry
+    assert campaign.deliveries[3].status == 'queued'
+
+
+def test_hourly_budget_counts_manual_replies_and_deduplicates_history(db):
+    from app.models import EmailReplyAttempt
+    from app.services.sending_budget import sender_budget_retry_at
+    settings = settings_with_key()
+    account = add_sender(db, settings, 'one@mail.ru')
+    company = add_company(db, 1, email='lead@example.ru')
+    now = datetime.now(timezone.utc)
+    at = now - timedelta(minutes=10)
+    db.add(EmailReplyAttempt(id='budget-reply',company_id=company.id,reply_id=1,
+        sender_account_id=account.id,sender_email=account.email,recipient='lead@example.ru',
+        subject='Re',body='Reply',message_id='<reply@example.ru>',status='accepted',created_at=at))
+    db.add(ActivityHistory(company_id=company.id,event_type='email_sent',description='Reply',
+        event_data={'sender_account_id':account.id,'message_id':'<reply@example.ru>'},created_at=at))
+    db.commit()
+    assert sender_budget_retry_at(db,account,now,hourly_limit=2,daily_limit=20) is None
+    assert sender_budget_retry_at(db,account,now,hourly_limit=1,daily_limit=20) == at + timedelta(hours=1)
+    assert sender_budget_retry_at(db,account,at+timedelta(hours=1),hourly_limit=1,daily_limit=20) is None
+
+
+def test_high_bounce_rate_pauses_before_next_smtp_including_late_bounces(db):
+    settings = settings_with_key()
+    account = add_sender(db, settings, 'one@mail.ru')
+    for index in range(21):
+        add_company(db, index + 1, email=f'lead{index}@example.ru')
+    campaign = confirmed_campaign(db, settings)
+    for index, delivery in enumerate(campaign.deliveries[:20]):
+        delivery.status = 'bounced' if index < 2 else 'accepted'
+        delivery.sender_account_id = account.id
+    db.commit()
+    process_outreach_tick(settings,sender_factory=lambda *_a,**_k: pytest.fail('High bounce rate must stop SMTP'),
+                          session_factory=sessionmaker(bind=db.get_bind()),now=datetime.now(timezone.utc))
+    db.expire_all()
+    assert campaign.status == 'paused'
+    assert '2 недействительных адресов из 20' in campaign.pause_reason
+    assert campaign.deliveries[-1].status == 'queued'
